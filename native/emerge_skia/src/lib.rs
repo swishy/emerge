@@ -28,7 +28,8 @@ use std::{
 
 #[cfg(any(
     all(feature = "wayland", target_os = "linux"),
-    all(feature = "drm", target_os = "linux")
+    all(feature = "drm", target_os = "linux"),
+    all(feature = "ios", target_os = "ios")
 ))]
 use crossbeam_channel::unbounded;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
@@ -77,7 +78,8 @@ use native_log::NativeLogRelay;
 use renderer::clear_global_caches;
 #[cfg(any(
     all(feature = "wayland", target_os = "linux"),
-    all(feature = "drm", target_os = "linux")
+    all(feature = "drm", target_os = "linux"),
+    all(feature = "ios", target_os = "ios")
 ))]
 use renderer::set_render_log_enabled;
 use runtime::tree_actor::{TreeActorConfig, spawn_tree_actor_with_initial_tree};
@@ -108,6 +110,8 @@ mod atoms {
 enum BackendKind {
     #[cfg(feature = "macos")]
     Macos,
+    #[cfg(all(feature = "ios", target_os = "ios"))]
+    Ios,
     #[cfg(all(feature = "wayland", target_os = "linux"))]
     Wayland,
     #[cfg(all(feature = "drm", target_os = "linux"))]
@@ -416,6 +420,8 @@ fn backend_stats_label(backend: BackendKind) -> &'static str {
     match backend {
         #[cfg(feature = "macos")]
         BackendKind::Macos => "macos",
+        #[cfg(all(feature = "ios", target_os = "ios"))]
+        BackendKind::Ios => "ios",
         #[cfg(all(feature = "wayland", target_os = "linux"))]
         BackendKind::Wayland => "wayland",
         #[cfg(all(feature = "drm", target_os = "linux"))]
@@ -426,7 +432,8 @@ fn backend_stats_label(backend: BackendKind) -> &'static str {
 #[cfg_attr(
     not(any(
         all(feature = "wayland", target_os = "linux"),
-        all(feature = "drm", target_os = "linux")
+        all(feature = "drm", target_os = "linux"),
+        all(feature = "ios", target_os = "ios")
     )),
     allow(dead_code)
 )]
@@ -651,7 +658,8 @@ fn start_with_config(
 
 #[cfg(any(
     all(feature = "wayland", target_os = "linux"),
-    all(feature = "drm", target_os = "linux")
+    all(feature = "drm", target_os = "linux"),
+    all(feature = "ios", target_os = "ios")
 ))]
 fn start_native_renderer_with_config(
     config: StartConfig,
@@ -713,13 +721,15 @@ fn start_native_renderer_with_config(
     let video_registry = Arc::new(VideoRegistry::new(release_tx));
     #[cfg(any(
         all(feature = "wayland", target_os = "linux"),
-        all(feature = "drm", target_os = "linux")
+        all(feature = "drm", target_os = "linux"),
+        all(feature = "ios", target_os = "ios")
     ))]
     #[allow(unused_assignments)]
     let mut backend_wake = BackendWakeHandle::noop();
     #[cfg(not(any(
         all(feature = "wayland", target_os = "linux"),
-        all(feature = "drm", target_os = "linux")
+        all(feature = "drm", target_os = "linux"),
+        all(feature = "ios", target_os = "ios")
     )))]
     let backend_wake = BackendWakeHandle::noop();
 
@@ -810,6 +820,7 @@ fn start_native_renderer_with_config(
                     window_wake: startup.wake.clone(),
                     initial_width,
                     initial_height,
+                    initial_scale: 1.0,
                 },
             ));
 
@@ -952,10 +963,100 @@ fn start_native_renderer_with_config(
                     window_wake: backend_wake.clone(),
                     initial_width,
                     initial_height,
+                    initial_scale: 1.0,
                 },
             ));
 
             (BackendKind::Drm, true)
+        }
+        #[cfg(all(feature = "ios", target_os = "ios"))]
+        BackendKind::Ios => {
+            eprintln!("iOS backend starting...");
+            let (proxy_tx, proxy_rx) = std::sync::mpsc::channel();
+            let ios_config = crate::backend::ios::IosConfig {
+                title: config.title.clone(),
+                width: config.width,
+                height: config.height,
+            };
+            let running_flag_clone = Arc::clone(&running_flag);
+            let tree_tx_clone = tree_tx.clone();
+            let event_tx_clone = event_tx.clone();
+            let renderer_stats_clone = renderer_stats.clone();
+
+            handles.backend_handle = Some(thread::spawn(move || {
+                crate::backend::ios::run(crate::backend::ios::IosRunArgs {
+                    config: ios_config,
+                    running_flag: running_flag_clone,
+                    tree_tx: tree_tx_clone,
+                    event_tx: event_tx_clone,
+                    render_rx,
+                    close_signal_log,
+                    stats: renderer_stats_clone,
+                    proxy_tx,
+                });
+            }));
+
+            let startup = match proxy_rx.recv() {
+                Ok(Ok(info)) => info,
+                Ok(Err(reason)) => {
+                    eprintln!("iOS backend startup failed: {}", reason);
+                    shutdown_renderer_runtime(
+                        ShutdownRuntimeContext {
+                            running_flag: Arc::clone(&running_flag),
+                            backend_wake: backend_wake.clone(),
+                            stop_flag: Arc::clone(&stop_flag),
+                            tree_tx: tree_tx.clone(),
+                            event_tx: event_tx.clone(),
+                            render_tx: render_sender.clone(),
+                            close_signal_log,
+                            log_render,
+                            log_input,
+                        },
+                        std::mem::take(&mut handles),
+                    );
+                    return Err(rustler::Error::Term(Box::new(reason)));
+                }
+                Err(_) => {
+                    eprintln!("iOS backend startup recv failed");
+                    shutdown_renderer_runtime(
+                        ShutdownRuntimeContext {
+                            running_flag: Arc::clone(&running_flag),
+                            backend_wake: backend_wake.clone(),
+                            stop_flag: Arc::clone(&stop_flag),
+                            tree_tx: tree_tx.clone(),
+                            event_tx: event_tx.clone(),
+                            render_tx: render_sender.clone(),
+                            close_signal_log,
+                            log_render,
+                            log_input,
+                        },
+                        std::mem::take(&mut handles),
+                    );
+                    return Err(rustler::Error::Term(Box::new(
+                        "iOS backend startup recv failed",
+                    )));
+                }
+            };
+
+            eprintln!("iOS backend started successfully");
+            backend_wake = startup.wake.clone();
+
+            handles.tree_handle = Some(runtime::tree_actor::spawn_tree_actor(
+                tree_rx,
+                TreeActorConfig {
+                    render_sender: render_sender.clone(),
+                    event_tx: event_tx.clone(),
+                    render_counter: Arc::clone(&render_counter),
+                    stats: renderer_stats.clone(),
+                    log_input: false,
+                    window_wake: backend_wake.clone(),
+                    initial_width: startup.width,
+                    initial_height: startup.height,
+                    initial_scale: startup.scale,
+                },
+            ));
+
+            (BackendKind::Ios, startup.prime_video_supported)
         }
         #[cfg(feature = "macos")]
         BackendKind::Macos => unreachable!("macOS backend should return before runtime startup"),
@@ -1013,7 +1114,8 @@ fn start_native_renderer_with_config(
 
 #[cfg(not(any(
     all(feature = "wayland", target_os = "linux"),
-    all(feature = "drm", target_os = "linux")
+    all(feature = "drm", target_os = "linux"),
+    all(feature = "ios", target_os = "ios")
 )))]
 fn start_native_renderer_with_config(
     config: StartConfig,
@@ -1534,6 +1636,7 @@ fn test_harness_new(width: u32, height: u32) -> Result<ResourceArc<TestHarnessRe
             window_wake: BackendWakeHandle::noop(),
             initial_width: width,
             initial_height: height,
+            initial_scale: 1.0,
         },
         ElementTree::new(),
     );
@@ -1753,6 +1856,7 @@ mod tests {
                     window_wake: BackendWakeHandle::noop(),
                     initial_width: width,
                     initial_height: height,
+                    initial_scale: 1.0,
                 },
                 initial_tree,
             );
@@ -2238,6 +2342,13 @@ fn parse_backend_name(value: &str) -> Result<BackendKind, String> {
         #[cfg(not(all(feature = "wayland", target_os = "linux")))]
         "wayland" => Err(
             "Wayland backend not compiled; add :wayland to config :emerge, compiled_backends: [...]"
+                .to_string(),
+        ),
+        #[cfg(all(feature = "ios", target_os = "ios"))]
+        "ios" => Ok(BackendKind::Ios),
+        #[cfg(not(all(feature = "ios", target_os = "ios")))]
+        "ios" => Err(
+            "iOS backend not compiled; add :ios to config :emerge, compiled_backends: [...]"
                 .to_string(),
         ),
         "wayland_legacy" => {

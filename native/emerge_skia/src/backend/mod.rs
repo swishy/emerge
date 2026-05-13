@@ -4,6 +4,8 @@
 
 #[cfg(all(feature = "drm", target_os = "linux"))]
 pub mod drm;
+#[cfg(all(feature = "ios", target_os = "ios"))]
+pub mod ios;
 pub mod raster;
 pub mod skia_gpu;
 pub mod wake;

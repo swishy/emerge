@@ -35,6 +35,7 @@ pub(crate) struct TreeActorConfig {
     pub(crate) window_wake: BackendWakeHandle,
     pub(crate) initial_width: u32,
     pub(crate) initial_height: u32,
+    pub(crate) initial_scale: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,7 +48,8 @@ enum RefreshDecision {
 #[cfg_attr(
     not(any(
         all(feature = "wayland", target_os = "linux"),
-        all(feature = "drm", target_os = "linux")
+        all(feature = "drm", target_os = "linux"),
+        all(feature = "ios", target_os = "ios")
     )),
     allow(dead_code)
 )]
@@ -73,12 +75,14 @@ pub(crate) fn spawn_tree_actor_with_initial_tree(
             window_wake,
             initial_width,
             initial_height,
+            initial_scale,
         } = config;
 
         let mut tree = initial_tree;
         let mut width = (initial_width as f32).max(1.0);
         let mut height = (initial_height as f32).max(1.0);
-        let mut scale = 1.0f32;
+        let mut scale = initial_scale.max(0.1);
+        eprintln!("[emerge_skia] tree_actor: initial width={} height={} scale={}", width, height, scale);
         let mut cached_rebuild: Option<RegistryRebuildPayload> = None;
         let mut animation_runtime = AnimationRuntime::default();
         let mut latest_animation_sample_time: Option<Instant> = None;

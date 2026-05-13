@@ -1,0 +1,50 @@
+import UIKit
+
+@main
+class AppDelegate: UIResponder, UIApplicationDelegate {
+
+    var window: UIWindow?
+
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+    ) -> Bool {
+        guard let erlangPath = Bundle.main.path(forResource: "erlang", ofType: nil) else {
+            print("Erlang runtime not found in bundle")
+            return false
+        }
+
+        let eval =
+          """
+          begin
+            io:format("--- boot starting ---~n"),
+            {ok,_} = application:ensure_all_started(elixir),
+            io:format("elixir started~n"),
+            'Elixir.Emerge.HostResolver':start_link(),
+            io:format("host resolver started~n"),
+            {ok, IFAddrs} = inet:getifaddrs(),
+            _ = lists:foreach(fun({_Iface, Opts}) ->
+              case lists:keyfind(addr, 1, Opts) of
+                {addr, {A,B,C,D}} when is_integer(A), A =/= 127 ->
+                  io:format("setting inet_dist_use_interface to ~p~n", [{A,B,C,D}]),
+                  application:set_env(kernel, inet_dist_use_interface, {A,B,C,D});
+                _ -> ok
+              end
+            end, IFAddrs),
+            case application:ensure_all_started('<%= @otp_app %>') of
+              {ok,_} -> io:format("app started~n");
+              {error,R} -> io:format("app start error: ~p~n",[R])
+            end,
+            io:format("--- boot complete, waiting ---~n"),
+            receive after infinity -> ok end
+          end
+          """
+
+        DispatchQueue.global(qos: .default).async {
+            let result = beam_init(erlangPath, eval)
+            print("BEAM exit: \(result)")
+        }
+
+        return true
+    }
+}

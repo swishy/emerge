@@ -68,12 +68,12 @@ pub struct TreeUpdateEngine {
 }
 
 impl TreeUpdateEngine {
-    pub fn new(initial_tree: ElementTree, initial_width: u32, initial_height: u32) -> Self {
+    pub fn new(initial_tree: ElementTree, initial_width: u32, initial_height: u32, initial_scale: f32) -> Self {
         Self {
             tree: initial_tree,
             width: (initial_width as f32).max(1.0),
             height: (initial_height as f32).max(1.0),
-            scale: 1.0,
+            scale: initial_scale.max(0.1),
             cached_rebuild: None,
             animation_runtime: AnimationRuntime::default(),
             latest_animation_sample_time: None,

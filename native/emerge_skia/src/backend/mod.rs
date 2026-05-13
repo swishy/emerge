@@ -7,6 +7,8 @@ pub mod drm;
 #[cfg(feature = "macos")]
 pub mod macos;
 pub mod present;
+#[cfg(all(feature = "ios", target_os = "ios"))]
+pub mod ios;
 pub mod raster;
 pub mod skia_gpu;
 pub mod wake;

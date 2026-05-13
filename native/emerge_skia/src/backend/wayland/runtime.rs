@@ -1558,6 +1558,9 @@ pub(crate) fn run(args: WaylandRunArgs) {
     let _ = proxy_tx.send(Ok(WindowBackendStartupInfo {
         wake,
         prime_video_supported: true,
+        width: config.width,
+        height: config.height,
+        scale: 1.0,
     }));
 
     while !app.exit {

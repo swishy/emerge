@@ -58,6 +58,14 @@ wayland = [
     "dep:arboard",
 ]
 drm = ["dep:drm", "dep:gbm", "dep:evdev"]
+ios = [
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-ui-kit",
+    "dep:objc2-metal",
+    "dep:objc2-quartz-core",
+    "skia-safe/metal",
+]
 
 [dependencies]
 rustler = "0.37"
@@ -68,6 +76,7 @@ objc2-core-foundation = { version = "0.3", optional = true }
 objc2-core-graphics = { version = "0.3", optional = true }
 objc2-metal = { version = "0.3", optional = true }
 objc2-quartz-core = { version = "0.3", features = ["CALayer", "CAMetalLayer", "objc2-metal", "objc2-core-foundation"], optional = true }
+objc2-ui-kit = { version = "0.3", optional = true }
 gl = "0.14"
 libloading = "0.9"
 libc = "0.2"

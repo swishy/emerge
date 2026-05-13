@@ -1982,6 +1982,7 @@ mod app {
                     Default::default(),
                     metrics.render_size.0,
                     metrics.render_size.1,
+                    1.0,
                 ),
                 render_state: RenderState::default(),
                 logical_size: metrics.render_size,

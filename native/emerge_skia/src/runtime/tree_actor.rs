@@ -35,12 +35,14 @@ pub(crate) struct TreeActorConfig {
     pub(crate) window_wake: BackendWakeHandle,
     pub(crate) initial_width: u32,
     pub(crate) initial_height: u32,
+    pub(crate) initial_scale: f32,
 }
 
 #[cfg_attr(
     not(any(
         all(feature = "wayland", target_os = "linux"),
-        all(feature = "drm", target_os = "linux")
+        all(feature = "drm", target_os = "linux"),
+        all(feature = "ios", target_os = "ios")
     )),
     allow(dead_code)
 )]
@@ -66,9 +68,11 @@ pub(crate) fn spawn_tree_actor_with_initial_tree(
             window_wake,
             initial_width,
             initial_height,
+            initial_scale,
         } = config;
 
-        let mut engine = TreeUpdateEngine::new(initial_tree, initial_width, initial_height);
+        let mut engine = TreeUpdateEngine::new(initial_tree, initial_width, initial_height, initial_scale);
+        eprintln!("[emerge_skia] tree_actor: initial width={} height={} scale={}", initial_width, initial_height, initial_scale);
 
         loop {
             let msg = match tree_rx.recv() {

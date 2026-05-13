@@ -2493,6 +2493,9 @@ pub(crate) fn run(args: WaylandRunArgs) {
     let _ = proxy_tx.send(Ok(WindowBackendStartupInfo {
         wake,
         prime_video_supported: true,
+        width: config.width,
+        height: config.height,
+        scale: 1.0,
     }));
     app.log_render_diagnostic(format!(
         "startup complete\n  geometry: {}\n  env_ready: {}\n  {}",

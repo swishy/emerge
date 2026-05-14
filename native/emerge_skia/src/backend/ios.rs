@@ -31,10 +31,11 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 
 use crate::actors::{EventMsg, TreeMsg};
 use crate::events::{ElementEventKind, HostEventSink};
+use crate::events::registry_builder::ElixirEventPayload;
 use crate::input::InputEvent;
 use crate::renderer::{RenderFrame, RenderState, SceneRenderer};
 use crate::stats::RendererStatsCollector;
-use crate::tree::element::ElementId;
+use crate::tree::element::NodeId;
 use crate::backend::wake::{BackendWake, BackendWakeHandle, WindowBackendStartupInfo};
 
 use objc2::{
@@ -42,7 +43,7 @@ use objc2::{
     rc::{Allocated, Retained},
     runtime::{AnyObject, NSObjectProtocol, ProtocolObject},
 };
-use objc2_foundation::{NSString, NSRect, NSSize};
+use objc2_foundation::{NSString, NSRect};
 use objc2_ui_kit::{
     UIEvent, UIScreen, UITextField, UITextFieldDelegate,
     UITouch, UIView, UIViewController, UIWindow,
@@ -69,9 +70,9 @@ struct SyncJob<F, R> {
     done: Arc<AtomicBool>,
 }
 
-/// `_dispatch_main_q` is a struct (dispatch_queue_s), not a pointer.
-/// In C: `#define dispatch_main_q (&_dispatch_main_q)`.
-/// We must take its address to get the queue pointer.
+// `_dispatch_main_q` is a struct (dispatch_queue_s), not a pointer.
+// In C: `#define dispatch_main_q (&_dispatch_main_q)`.
+// We must take its address to get the queue pointer.
 unsafe extern "C" {
     static _dispatch_main_q: c_void;
     fn dispatch_async_f(queue: *mut c_void, context: *mut c_void, work: extern "C" fn(*mut c_void));
@@ -661,5 +662,5 @@ impl HostEventSink for IosHostEventSink {
         send_event(EventMsg::InputEvent(event.clone()));
     }
 
-    fn send_element_event(&self, _id: &ElementId, _kind: ElementEventKind, _payload: Option<&str>) {}
+    fn send_element_event(&self, _id: &NodeId, _kind: ElementEventKind, _payload: Option<&ElixirEventPayload>) {}
 }

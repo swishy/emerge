@@ -66,9 +66,13 @@ defmodule EmergeSkia.Ios.Build do
 
     1. build_rust_staticlib/1  — cargo rustc --crate-type staticlib
     2. clone_or_update_otp/1   — git clone/fetch OTP source
-    3. build_openssl/1         — download + configure + build OpenSSL for iOS
-    4. build_otp/1             — configure + make with --enable-static-nifs + --with-ssl
-    5. create_xcframework/1    — package liberlang.a into xcframework
+    3. build_otp/1             — otp_build configure --without-ssl + boot + make release
+    4. create_xcframework/1    — package liberlang.a into xcframework
+    5. bundle_elixir/1         — copy host Elixir libs into OTP release
+
+  Note: OpenSSL is NOT built for iOS.  Following the mob framework approach,
+  OTP is built with `--without-ssl` and crypto is linked at app-build time.
+  This avoids the public_key/ssl build entirely (id-slh-dsa-shake-256f issue).
   """
   def run(config \\ default_config()) do
     assert_xcode_available!()
@@ -78,7 +82,6 @@ defmodule EmergeSkia.Ios.Build do
 
     with :ok <- build_rust_staticlib(config),
          :ok <- clone_or_update_otp(config),
-         :ok <- build_openssl(config),
          :ok <- build_otp(config),
          :ok <- create_xcframework(config),
          :ok <- bundle_elixir(config) do
@@ -208,80 +211,52 @@ defmodule EmergeSkia.Ios.Build do
   end
 
   def build_otp(config) do
-    step("Configure and build OTP", "--enable-static-nifs=libemerge_skia.a:emerge_skia")
+    step("Configure and build OTP", "otp_build + --without-ssl (mob approach)")
 
     otp_src = Path.join(config.build_dir, "otp_src")
-    native_dir = Path.join(config.emerge_root, "native/emerge_skia")
-    emerge_lib = Path.join(native_dir,
-      "target/aarch64-apple-ios/release/libemerge_skia.a")
-    openssl_install = Path.join(config.build_dir, "openssl")
 
-    # Copy staticlib where OTP configure can find it
-    dest_lib = Path.join(config.build_dir, "libemerge_skia.a")
-    File.cp!(emerge_lib, dest_lib)
-
-    ios_sdk = sdk_path!()
-    cc = clang_path!()
-    cxx = clangpp_path!()
-    arch = "arm64"
-    min_ver = config.ios_min_ver
-    # OTP's socket code guards if_arp.h behind `!defined(__IOS__)`.
-    # Clang doesn't define __IOS__ automatically, so we pass it explicitly.
-    cflags = "-D__IOS__ -O2 -g -arch #{arch} -mios-version-min=#{min_ver} -isysroot #{ios_sdk} -I#{openssl_install}/include"
-    ldflags = "#{cflags} -L#{config.build_dir} -L#{openssl_install}/lib"
-
-    static_nifs_arg = "#{dest_lib}:emerge_skia"
-
-    ios_sdk = sdk_path!()
-    cpus = cpu_count()
-
-    cmd!("/bin/sh", ["-c", """
-    cd "#{otp_src}" && \
-    ERL_TOP="#{otp_src}" \
-    erl_xcomp_sysroot="#{ios_sdk}" \
-    erl_xcomp_isysroot="#{ios_sdk}" \
-    erl_xcomp_bigendian=no \
-    erl_xcomp_kqueue=yes \
-    erl_xcomp_poll=yes \
-    erl_xcomp_getaddrinfo=yes \
-    erl_xcomp_putenv_copy=yes \
-    erl_xcomp_reliable_fpe=yes \
-    ./configure \
-      --host=arm64-apple-darwin \
-      --build=x86_64-apple-darwin \
-      --enable-static-nifs=#{static_nifs_arg} \
-      --without-javac --without-odbc --without-wx \
-      --disable-jit \
-      --with-ssl="#{openssl_install}" \
-      CC="#{cc}" CXX="#{cxx}" \
-      CFLAGS="#{cflags}" \
-      LDFLAGS="#{ldflags}" \
-      LD="#{cc}"
-    """],
-      description: "configure OTP with --enable-static-nifs"
-    )
-
-    # OTP links Carbon + Cocoa for all Darwin targets (macOS-isms). Strip them
-    # since they don't exist on iOS. Also add iOS frameworks required by the
-    # emerge_skia static NIF (UIKit, Metal, CoreGraphics, etc.).
-    emulator_makefile = Path.join(otp_src,
-      "erts/emulator/aarch64-apple-darwin/Makefile")
-    if File.exists?(emulator_makefile) do
-      content = File.read!(emulator_makefile)
-      cleaned = String.replace(content, ~r/-framework (Carbon|Cocoa)[ \t]*/, "")
-      # Add iOS frameworks and system libraries for static NIF linking
-      ios_frameworks = "-framework UIKit -framework Metal -framework MetalKit -framework CoreGraphics -framework CoreText -framework Foundation -framework IOSurface -framework ImageIO -lc++"
-      cleaned = String.replace(cleaned, "ORIG_LIBS:= $(LIBS)",
-        "ORIG_LIBS:= $(LIBS)\nLIBS += #{ios_frameworks}")
-      File.write!(emulator_makefile, cleaned)
-      info("Patched", "stripped Carbon/Cocoa, added iOS frameworks")
+    # OTP's xcomp conf uses `ld` directly which doesn't understand compiler
+    # flags like -fstack-protector-strong.  Switch to `cc` as the linker driver.
+    xcomp_conf = Path.join(otp_src, "xcomp/erl-xcomp-arm64-ios.conf")
+    if File.exists?(xcomp_conf) do
+      content = File.read!(xcomp_conf)
+      if String.contains?(content, ~s(LD="xcrun -sdk $XCOMP_SDK ld $XCOMP_ARCH")) do
+        content = String.replace(content,
+          ~s(LD="xcrun -sdk $XCOMP_SDK ld $XCOMP_ARCH"),
+          ~s(LD="xcrun -sdk $XCOMP_SDK cc $XCOMP_ARCH"))
+        File.write!(xcomp_conf, content)
+        info("Patched", "xcomp conf: ld → cc as linker driver")
+      end
     end
 
-    cmd!("make", ["-j1", "ERL_TOP=#{otp_src}"],
+    # Follow mob's approach: --without-ssl for iOS, otp_build configure/boot,
+    # then make release.  Static NIFs (emerge_skia) are linked at app-build
+    # time, not OTP-build time.  This avoids the public_key/ssl build entirely
+    # which sidesteps the id-slh-dsa-shake-256f macro issue.
+    cmd!("/bin/sh", ["-c", "./otp_build configure --xcomp-conf=./xcomp/erl-xcomp-arm64-ios.conf --without-ssl"],
       cd: otp_src,
-      description: "make OTP (single-threaded to avoid include race conditions)"
+      description: "otp_build configure --without-ssl"
     )
 
+    cmd!("/bin/sh", ["-c", "./otp_build boot"],
+      cd: otp_src,
+      description: "otp_build boot (build bootstrap)"
+    )
+
+    release_root = Path.join(config.output_dir, "otp_release")
+    File.rm_rf!(release_root)
+
+    cmd!("/bin/sh", ["-c", "make release RELEASE_ROOT=#{release_root} RELEASE_LIBBEAM=yes"],
+      cd: otp_src,
+      description: "make release RELEASE_ROOT="
+    )
+
+    # Remove inet_gethost — it would be spawned via fork() on iOS, which
+    # the sandbox forbids.
+    erts_bins = Path.wildcard("#{release_root}/**/erts-*/bin/inet_gethost")
+    for bin <- erts_bins, do: File.rm(bin)
+
+    info("OTP release", release_root)
     :ok
   end
 
@@ -290,24 +265,16 @@ defmodule EmergeSkia.Ios.Build do
 
     otp_src = Path.join(config.build_dir, "otp_src")
     release_dir = Path.join(config.output_dir, "otp_release")
-    File.mkdir_p!(release_dir)
 
-    cmd!("make", ["install", "ERL_TOP=#{otp_src}", "DESTDIR=#{release_dir}",
-                   "RELEASE_LIBBEAM=yes"],
-      cd: otp_src,
-      description: "make install DESTDIR=..."
-    )
-
-    # Remove inet_gethost — it would be spawned via fork() on iOS, which
-    # the sandbox forbids.  Removing it makes any open_port attempt fail
-    # harmlessly with ENOENT rather than triggering a VM crash.
-    erts_bins = Path.wildcard("#{release_dir}/**/erts-*/bin/inet_gethost")
-    for bin <- erts_bins, do: File.rm(bin)
+    # Release was already installed by build_otp via `make release RELEASE_ROOT=`
+    unless File.dir?(release_dir) do
+      error!("OTP release directory not found at #{release_dir}")
+    end
 
     # Ensure the replacement inet_gethost_native.beam is up-to-date
     ensure_replacement_beam(config)
 
-    # Find the ERTS static library (libbeam.a in OTP 28+, was liberlang.a in older OTP)
+    # Find the ERTS static library (libbeam.a)
     erts_libs = Path.wildcard("#{release_dir}/**/libbeam.a")
 
     erts_lib =
@@ -321,7 +288,7 @@ defmodule EmergeSkia.Ios.Build do
     # Gather all ERTS-dependent static libraries from the build tree.
     # libbeam.a references symbols from these, and they must be merged
     # into a single archive so iOS apps can force-load a single library.
-    target = "aarch64-apple-darwin"
+    target = "aarch64-apple-ios"
     variant = "opt"
 
     dep_libs = [
@@ -382,8 +349,8 @@ defmodule EmergeSkia.Ios.Build do
   def bundle_elixir(config) do
     step("Bundle Elixir runtime", "host Elixir -> OTP release")
 
-    release_erl = Path.join(config.output_dir, "otp_release/usr/local/lib/erlang")
-    release_lib = Path.join(release_erl, "lib")
+    release_dir = Path.join(config.output_dir, "otp_release")
+    release_lib = Path.join(release_dir, "lib")
 
     beam_path = :code.where_is_file('Elixir.Kernel.beam')
 

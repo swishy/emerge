@@ -223,18 +223,25 @@ defmodule Mix.Tasks.Ios.Gen do
           File.cp_r!(src, dst)
           # Remove any .so/.dylib files — they're compiled for the host platform.
           # On iOS, crypto and other NIFs are statically linked into liberlang.a.
-          for native_lib <- Path.wildcard("#{dst}/priv/lib/*.{so,dylib}") do
+          for native_lib <- Path.wildcard("#{dst}/priv/lib/*.so") ++ Path.wildcard("#{dst}/priv/lib/*.dylib") do
             File.rm!(native_lib)
           end
         end
       end
     end
 
+    # OTP core apps are already bundled from the release.  Only copy
+    # user-deps and the app itself from _build/dev/lib/.
+    otp_core_apps = ~w(asn1 common_test compiler crypto diameter edoc eldap
+      erts eunit ftp inets jinterface kernel megaco mnesia os_mon parsetools
+      public_key reltool runtime_tools sasl snmp ssh ssl stdlib
+      syntax_tools tftp tools wx xmerl)
+
     Mix.shell().info("Bundling app beams from #{File.cwd!()}/_build/dev/lib/")
     for dir <- Path.wildcard(Path.join(File.cwd!(), "_build/dev/lib/*/")) do
       appname = Path.basename(dir)
       srcebin = Path.join(dir, "ebin")
-      if File.dir?(srcebin) do
+      if File.dir?(srcebin) and appname not in otp_core_apps do
         dstdir = Path.join(lib_dir, appname)
         File.mkdir_p!(Path.join(dstdir, "ebin"))
         for beam <- Path.wildcard(Path.join(srcebin, "*.beam")) do

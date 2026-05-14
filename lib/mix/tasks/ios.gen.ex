@@ -221,6 +221,11 @@ defmodule Mix.Tasks.Ios.Gen do
         dst = Path.join(lib_dir, appdir)
         if not File.dir?(dst) do
           File.cp_r!(src, dst)
+          # Remove any .so/.dylib files — they're compiled for the host platform.
+          # On iOS, crypto and other NIFs are statically linked into liberlang.a.
+          for native_lib <- Path.wildcard("#{dst}/priv/lib/*.{so,dylib}") do
+            File.rm!(native_lib)
+          end
         end
       end
     end

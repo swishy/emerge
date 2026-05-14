@@ -72,8 +72,8 @@ defmodule Mix.Tasks.Ios.Gen do
     end
 
     app_build_output = Path.join(File.cwd!(), "_build/ios_otp_output")
-    app_release_src = Path.join(app_build_output, "otp_release/usr/local/lib/erlang")
-    fallback_release_src = Path.join(fallback, "otp_release/usr/local/lib/erlang")
+    app_release_src = Path.join(app_build_output, "otp_release")
+    fallback_release_src = Path.join(fallback, "otp_release")
     release_dst = Path.join(app_src_dir, "erlang")
 
     release_src =
@@ -199,6 +199,12 @@ defmodule Mix.Tasks.Ios.Gen do
 
     release_lib =
       cond do
+        File.dir?(Path.join(app_build_output, "otp_release/lib")) ->
+          Path.join(app_build_output, "otp_release/lib")
+
+        File.dir?(Path.join(emerge_build_output, "otp_release/lib")) ->
+          Path.join(emerge_build_output, "otp_release/lib")
+
         File.dir?(Path.join(app_build_output, "otp_release/usr/local/lib/erlang/lib")) ->
           Path.join(app_build_output, "otp_release/usr/local/lib/erlang/lib")
 

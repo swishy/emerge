@@ -66,13 +66,16 @@ defmodule EmergeSkia.Ios.Build do
 
     1. build_rust_staticlib/1  — cargo rustc --crate-type staticlib
     2. clone_or_update_otp/1   — git clone/fetch OTP source
-    3. build_otp/1             — otp_build configure --without-ssl + boot + make release
-    4. create_xcframework/1    — package liberlang.a into xcframework
-    5. bundle_elixir/1         — copy host Elixir libs into OTP release
+    3. build_openssl/1         — download + configure + build OpenSSL for iOS
+    4. build_otp/1             — otp_build configure --without-ssl + boot + make release
+    5. build_crypto_nif/1      — compile OTP's crypto NIF as crypto.a (static)
+    6. create_xcframework/1    — package liberlang.a + crypto libs into xcframework
+    7. bundle_elixir/1         — copy host Elixir libs into OTP release
 
-  Note: OpenSSL is NOT built for iOS.  Following the mob framework approach,
-  OTP is built with `--without-ssl` and crypto is linked at app-build time.
-  This avoids the public_key/ssl build entirely (id-slh-dsa-shake-256f issue).
+  OTP is built with `--without-ssl` to avoid the id-slh-dsa-shake-256f macro
+  issue.  The crypto NIF is compiled separately against OpenSSL and statically
+  linked at app-build time, matching the mob framework approach.  This gives
+  full `:crypto`, `:public_key`, and `:ssl` support for the Hex ecosystem.
   """
   def run(config \\ default_config()) do
     assert_xcode_available!()
@@ -82,7 +85,9 @@ defmodule EmergeSkia.Ios.Build do
 
     with :ok <- build_rust_staticlib(config),
          :ok <- clone_or_update_otp(config),
+         :ok <- build_openssl(config),
          :ok <- build_otp(config),
+         :ok <- build_crypto_nif(config),
          :ok <- create_xcframework(config),
          :ok <- bundle_elixir(config) do
       info("Done", """
@@ -211,7 +216,7 @@ defmodule EmergeSkia.Ios.Build do
   end
 
   def build_otp(config) do
-    step("Configure and build OTP", "otp_build + --without-ssl (mob approach)")
+    step("Configure and build OTP", "otp_build + --without-ssl")
 
     otp_src = Path.join(config.build_dir, "otp_src")
 
@@ -229,10 +234,10 @@ defmodule EmergeSkia.Ios.Build do
       end
     end
 
-    # Follow mob's approach: --without-ssl for iOS, otp_build configure/boot,
-    # then make release.  Static NIFs (emerge_skia) are linked at app-build
-    # time, not OTP-build time.  This avoids the public_key/ssl build entirely
-    # which sidesteps the id-slh-dsa-shake-256f macro issue.
+    # Build OTP with --without-ssl.  The crypto NIF is compiled separately
+    # against OpenSSL in build_crypto_nif/1 and statically linked at app-build
+    # time.  This avoids the id-slh-dsa-shake-256f macro issue in public_key
+    # while still shipping full crypto/ssl support.
     cmd!("/bin/sh", ["-c", "./otp_build configure --xcomp-conf=./xcomp/erl-xcomp-arm64-ios.conf --without-ssl"],
       cd: otp_src,
       description: "otp_build configure --without-ssl"
@@ -257,6 +262,120 @@ defmodule EmergeSkia.Ios.Build do
     for bin <- erts_bins, do: File.rm(bin)
 
     info("OTP release", release_root)
+    :ok
+  end
+
+  def build_crypto_nif(config) do
+    step("Build crypto NIF (static)", "-DSTATIC_ERLANG_NIF")
+
+    otp_src = Path.join(config.build_dir, "otp_src")
+    openssl_install = Path.join(config.build_dir, "openssl")
+    release_root = Path.join(config.output_dir, "otp_release")
+
+    arch_dir = "aarch64-apple-ios"
+    ios_sdk = sdk_path!()
+    cc = clang_path!()
+    ar_tool = ar_path!()
+    ranlib_tool = ranlib_path!()
+
+    crypto_src = Path.join(otp_src, "lib/crypto/c_src")
+    obj_dir = Path.join(otp_src, "lib/crypto/priv/obj/#{arch_dir}_static_nif")
+    lib_dir = Path.join(otp_src, "lib/crypto/priv/lib/#{arch_dir}")
+
+    File.mkdir_p!(obj_dir)
+    File.mkdir_p!(lib_dir)
+
+    base_cflags = [
+      "-fno-strict-aliasing",
+      "-fno-delete-null-pointer-checks",
+      "-fno-strict-overflow",
+      "-fexceptions",
+      "-fstack-protector-strong",
+      "-U_FORTIFY_SOURCE",
+      "-D_FORTIFY_SOURCE=3",
+      "-fno-common",
+      "-g",
+      "-Os",
+      "-ffunction-sections",
+      "-fdata-sections",
+      "-fPIC",
+      "-DHAVE_OPENSSL_CRYPTO_MEMCMP",
+      "-DSTATIC_ERLANG_NIF",
+      "-DDISABLE_EVP_DH=0",
+      "-DDISABLE_EVP_HMAC=0",
+      "-Wno-deprecated-declarations",
+      "-arch", "arm64",
+      "-mios-version-min=#{config.ios_min_ver}",
+      "-isysroot", ios_sdk,
+      "-I#{openssl_install}/include",
+      "-I#{otp_src}/erts/emulator/beam",
+      "-I#{otp_src}/erts/include",
+      "-I#{otp_src}/erts/include/#{arch_dir}",
+      "-I#{otp_src}/erts/include/internal",
+      "-I#{otp_src}/erts/include/internal/#{arch_dir}",
+      "-I#{otp_src}/erts/emulator/sys/unix",
+      "-I#{otp_src}/erts/emulator/sys/common"
+    ]
+
+    crypto_sources = [
+      "aead.c", "aes.c", "algorithms.c", "api_ng.c", "atoms.c",
+      "bn.c", "cipher.c", "cmac.c", "common.c", "crypto.c",
+      "crypto_callback.c", "dh.c", "digest.c", "dss.c", "ec.c",
+      "ecdh.c", "eddsa.c", "engine.c", "evp.c", "fips.c",
+      "hash.c", "hash_equals.c", "hmac.c", "info.c", "mac.c",
+      "math.c", "pbkdf2_hmac.c", "pkey.c", "rand.c", "rsa.c", "srp.c"
+    ]
+
+    objects =
+      for src <- crypto_sources do
+        obj = Path.join(obj_dir, String.replace_suffix(src, ".c", ".o"))
+        src_path = Path.join(crypto_src, src)
+
+        cmd!(cc, base_cflags ++ ["-c", "-o", obj, src_path],
+          description: "compile #{src}"
+        )
+
+        obj
+      end
+
+    crypto_a = Path.join(lib_dir, "crypto.a")
+    File.rm(crypto_a)
+
+    cmd!(ar_tool, ["rcs", crypto_a | objects],
+      description: "archive crypto.a"
+    )
+
+    cmd!(ranlib_tool, [crypto_a],
+      description: "ranlib crypto.a"
+    )
+
+    # Copy crypto.a + OpenSSL libs to the release for app-level linking
+    release_erts_lib = Path.join(release_root, "erts-*/lib") |> Path.wildcard() |> List.first()
+    if release_erts_lib do
+      File.cp!(crypto_a, Path.join(release_erts_lib, "crypto.a"))
+      File.cp!(Path.join(openssl_install, "lib/libcrypto.a"), Path.join(release_erts_lib, "libcrypto.a"))
+      File.cp!(Path.join(openssl_install, "lib/libssl.a"), Path.join(release_erts_lib, "libssl.a"))
+      info("Crypto libs", "copied to #{release_erts_lib}")
+    end
+
+    # Copy crypto/public_key/ssl apps into the release from the host OTP.
+    # These are pure BEAM files that work on any OTP 28 system.  The crypto
+    # NIF itself (crypto.a) is platform-specific and was compiled above.
+    release_lib = Path.join(release_root, "lib")
+    host_lib = :code.lib_dir()
+
+    for app <- ["crypto", "public_key", "ssl"] do
+      app_dirs = Path.wildcard(Path.join(host_lib, "#{app}-*"))
+      for app_dir <- app_dirs do
+        app_name = Path.basename(app_dir)
+        dest = Path.join(release_lib, app_name)
+        unless File.exists?(dest) do
+          File.cp_r!(app_dir, dest)
+          info("App", "#{app_name} → release (from host OTP)")
+        end
+      end
+    end
+
     :ok
   end
 
@@ -298,7 +417,11 @@ defmodule EmergeSkia.Ios.Build do
       Path.join(otp_src, "erts/emulator/pcre/obj/#{target}/#{variant}/libepcre.a"),
       Path.join(otp_src, "erts/emulator/zstd/obj/#{target}/#{variant}/libzstd.a"),
       Path.join(otp_src, "erts/emulator/openssl/obj/#{target}/#{variant}/micro-openssl.a"),
-      Path.join(otp_src, "erts/emulator/ryu/obj/#{target}/#{variant}/libryu.a")
+      Path.join(otp_src, "erts/emulator/ryu/obj/#{target}/#{variant}/libryu.a"),
+      # Crypto NIF + OpenSSL (static-linked for iOS)
+      Path.join(release_dir, "erts-*/lib/crypto.a") |> Path.wildcard() |> List.first(),
+      Path.join(release_dir, "erts-*/lib/libcrypto.a") |> Path.wildcard() |> List.first(),
+      Path.join(release_dir, "erts-*/lib/libssl.a") |> Path.wildcard() |> List.first()
     ]
 
     existing_deps = Enum.filter(dep_libs, &File.exists?/1)
@@ -396,6 +519,16 @@ defmodule EmergeSkia.Ios.Build do
 
   defp clangpp_path! do
     {result, 0} = System.cmd("xcrun", ["--sdk", "iphoneos", "-f", "clang++"])
+    String.trim(result)
+  end
+
+  defp ar_path! do
+    {result, 0} = System.cmd("xcrun", ["--sdk", "iphoneos", "-f", "ar"])
+    String.trim(result)
+  end
+
+  defp ranlib_path! do
+    {result, 0} = System.cmd("xcrun", ["--sdk", "iphoneos", "-f", "ranlib"])
     String.trim(result)
   end
 

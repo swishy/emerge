@@ -87,7 +87,6 @@ defmodule EmergeSkia.Ios.Build do
          :ok <- clone_or_update_otp(config),
          :ok <- build_openssl(config),
          :ok <- build_otp(config),
-         :ok <- build_crypto_nif(config),
          :ok <- create_xcframework(config),
          :ok <- bundle_elixir(config) do
       info("Done", """
@@ -219,6 +218,7 @@ defmodule EmergeSkia.Ios.Build do
     step("Configure and build OTP", "otp_build + --without-ssl")
 
     otp_src = Path.join(config.build_dir, "otp_src")
+    openssl_install = Path.join(config.build_dir, "openssl")
 
     # OTP's xcomp conf uses `ld` directly which doesn't understand compiler
     # flags like -fstack-protector-strong.  Switch to `cc` as the linker driver.
@@ -234,20 +234,55 @@ defmodule EmergeSkia.Ios.Build do
       end
     end
 
-    # Build OTP with --without-ssl.  The crypto NIF is compiled separately
-    # against OpenSSL in build_crypto_nif/1 and statically linked at app-build
-    # time.  This avoids the id-slh-dsa-shake-256f macro issue in public_key
-    # while still shipping full crypto/ssl support.
+    # Step 1: Configure OTP with --without-ssl
     cmd!("/bin/sh", ["-c", "./otp_build configure --xcomp-conf=./xcomp/erl-xcomp-arm64-ios.conf --without-ssl"],
       cd: otp_src,
       description: "otp_build configure --without-ssl"
     )
 
+    # Step 2: Build crypto NIF (after OTP configure so headers exist, before boot)
+    build_crypto_nif(config)
+
+    # Step 3: Patch driver_tab.c to register crypto in the static NIF table
+    driver_tab = Path.join(otp_src, "erts/emulator/aarch64-apple-ios/opt/emu/driver_tab.c")
+    if File.exists?(driver_tab) do
+      content = File.read!(driver_tab)
+      unless String.contains?(content, "crypto_nif_init") do
+        content = String.replace(content,
+          "void *asn1rt_nif_nif_init(void);\nErtsStaticNif erts_static_nif_tab[] =\n{",
+          "void *asn1rt_nif_nif_init(void);\nint crypto_nif_init(void);\n" <>
+          "#pragma clang diagnostic push\n" <>
+          "#pragma clang diagnostic ignored \"-Wincompatible-function-pointer-types\"\n" <>
+          "ErtsStaticNif erts_static_nif_tab[] =\n{")
+        content = String.replace(content,
+          "{&asn1rt_nif_nif_init, 1, THE_NON_VALUE, NULL},\n    {NULL}\n};",
+          "{&asn1rt_nif_nif_init, 1, THE_NON_VALUE, NULL},\n    {(ErtsStaticNifInitF*)&crypto_nif_init, 0, THE_NON_VALUE, NULL},\n    {NULL}\n};\n#pragma clang diagnostic pop")
+        File.write!(driver_tab, content)
+        info("Patched", "driver_tab.c: added crypto to static NIF table")
+      end
+    end
+
+    # Step 4: Patch emulator Makefile to link crypto.a into beam.emu
+    emulator_makefile = Path.join(otp_src, "erts/emulator/Makefile")
+    if File.exists?(emulator_makefile) do
+      content = File.read!(emulator_makefile)
+      crypto_a = Path.join(otp_src, "lib/crypto/priv/lib/aarch64-apple-ios/crypto.a")
+      unless String.contains?(content, "crypto.a") do
+        content = String.replace(content,
+          "$(ASN1RT_NIF_LIB)",
+          "$(ASN1RT_NIF_LIB) #{crypto_a}")
+        File.write!(emulator_makefile, content)
+        info("Patched", "emulator Makefile: added crypto.a to link line")
+      end
+    end
+
+    # Step 5: Build OTP bootstrap (compiles beam.emu with crypto.a linked in)
     cmd!("/bin/sh", ["-c", "./otp_build boot"],
       cd: otp_src,
       description: "otp_build boot (build bootstrap)"
     )
 
+    # Step 6: Install release
     release_root = Path.join(config.output_dir, "otp_release")
     File.rm_rf!(release_root)
 
@@ -260,6 +295,33 @@ defmodule EmergeSkia.Ios.Build do
     # the sandbox forbids.
     erts_bins = Path.wildcard("#{release_root}/**/erts-*/bin/inet_gethost")
     for bin <- erts_bins, do: File.rm(bin)
+
+    # Copy crypto.a + OpenSSL libs to the release for app-level linking
+    release_erts_lib = Path.join(release_root, "erts-*/lib") |> Path.wildcard() |> List.first()
+    if release_erts_lib do
+      crypto_a = Path.join(otp_src, "lib/crypto/priv/lib/aarch64-apple-ios/crypto.a")
+      File.cp!(crypto_a, Path.join(release_erts_lib, "crypto.a"))
+      File.cp!(Path.join(openssl_install, "lib/libcrypto.a"), Path.join(release_erts_lib, "libcrypto.a"))
+      File.cp!(Path.join(openssl_install, "lib/libssl.a"), Path.join(release_erts_lib, "libssl.a"))
+      info("Crypto libs", "copied to #{release_erts_lib}")
+    end
+
+    # Copy crypto/public_key/ssl apps into the release from the host OTP.
+    # These are pure BEAM files that work on any OTP 28 system.
+    release_lib = Path.join(release_root, "lib")
+    host_lib = :code.lib_dir()
+
+    for app <- ["crypto", "public_key", "ssl"] do
+      app_dirs = Path.wildcard(Path.join(host_lib, "#{app}-*"))
+      for app_dir <- app_dirs do
+        app_name = Path.basename(app_dir)
+        dest = Path.join(release_lib, app_name)
+        unless File.exists?(dest) do
+          File.cp_r!(app_dir, dest)
+          info("App", "#{app_name} → release (from host OTP)")
+        end
+      end
+    end
 
     info("OTP release", release_root)
     :ok
@@ -348,33 +410,6 @@ defmodule EmergeSkia.Ios.Build do
     cmd!(ranlib_tool, [crypto_a],
       description: "ranlib crypto.a"
     )
-
-    # Copy crypto.a + OpenSSL libs to the release for app-level linking
-    release_erts_lib = Path.join(release_root, "erts-*/lib") |> Path.wildcard() |> List.first()
-    if release_erts_lib do
-      File.cp!(crypto_a, Path.join(release_erts_lib, "crypto.a"))
-      File.cp!(Path.join(openssl_install, "lib/libcrypto.a"), Path.join(release_erts_lib, "libcrypto.a"))
-      File.cp!(Path.join(openssl_install, "lib/libssl.a"), Path.join(release_erts_lib, "libssl.a"))
-      info("Crypto libs", "copied to #{release_erts_lib}")
-    end
-
-    # Copy crypto/public_key/ssl apps into the release from the host OTP.
-    # These are pure BEAM files that work on any OTP 28 system.  The crypto
-    # NIF itself (crypto.a) is platform-specific and was compiled above.
-    release_lib = Path.join(release_root, "lib")
-    host_lib = :code.lib_dir()
-
-    for app <- ["crypto", "public_key", "ssl"] do
-      app_dirs = Path.wildcard(Path.join(host_lib, "#{app}-*"))
-      for app_dir <- app_dirs do
-        app_name = Path.basename(app_dir)
-        dest = Path.join(release_lib, app_name)
-        unless File.exists?(dest) do
-          File.cp_r!(app_dir, dest)
-          info("App", "#{app_name} → release (from host OTP)")
-        end
-      end
-    end
 
     :ok
   end

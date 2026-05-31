@@ -1,19 +1,3 @@
-// The inline Rust tests use mutable fixture builders heavily so each assertion
-// can show only the fields relevant to that case. Keep these shape exceptions
-// test-only; release and benchmark code still run under normal clippy gates.
-#![cfg_attr(
-    test,
-    allow(
-        clippy::cloned_ref_to_slice_refs,
-        clippy::field_reassign_with_default,
-        clippy::needless_borrow,
-        clippy::needless_lifetimes,
-        clippy::nonminimal_bool,
-        clippy::op_ref,
-        clippy::redundant_pattern_matching
-    )
-)]
-
 //! EmergeSkia NIF - Minimal Skia renderer for Elixir.
 //!
 //! This crate provides a Rustler NIF that exposes tree upload, layout,
@@ -52,6 +36,7 @@ pub mod keys;
 #[cfg(all(feature = "drm", target_os = "linux"))]
 mod linux_wait;
 mod native_log;
+pub mod paint_layer_payload_cache;
 pub mod render_scene;
 pub mod renderer;
 pub mod runtime;
@@ -83,7 +68,7 @@ use native_log::NativeLogRelay;
     all(feature = "ios", target_os = "ios")
 ))]
 use renderer::set_render_log_enabled;
-use renderer::{CleanSubtreeCacheConfig, RendererCacheConfig, clear_global_caches};
+use renderer::{RendererCacheConfig, RendererPaintLayerCacheConfig, clear_global_caches};
 use runtime::tree_actor::{TreeActorConfig, spawn_tree_actor_with_initial_tree};
 use stats::{
     LayoutCacheStats, RendererStatsCollector, RendererStatsSnapshot, RendererTimingMetric,
@@ -94,6 +79,9 @@ use video::{VideoMode, VideoRegistry, VideoTargetResource, VideoWake};
 
 type LayoutFrame<'a> = (Binary<'a>, f32, f32, f32, f32);
 type LayoutFrames<'a> = Vec<LayoutFrame<'a>>;
+
+/// Bump whenever the public `EmergeSkia.stats/2` payload shape changes.
+const STATS_SCHEMA_VERSION: u64 = 15;
 
 #[derive(Clone, Copy, Debug, rustler::NifMap)]
 struct StatsConfigureNif {
@@ -182,12 +170,11 @@ struct LayoutCacheStatsNif {
 
 #[derive(Clone, Copy, Debug, rustler::NifMap)]
 struct RendererCacheStatsNif {
-    noop: RendererCacheKindStatsNif,
-    clean_subtree: RendererCacheKindStatsNif,
+    paint_layer: RendererCachePaintLayerStatsNif,
 }
 
 #[derive(Clone, Copy, Debug, rustler::NifMap)]
-struct RendererCacheKindStatsNif {
+struct RendererCachePaintLayerStatsNif {
     candidates: u64,
     visible_candidates: u64,
     suppressed_by_parent: u64,
@@ -204,6 +191,17 @@ struct RendererCacheKindStatsNif {
     current_cpu_payloads: u64,
     evicted_bytes: u64,
     stale_evicted_bytes: u64,
+    gpu_payload_stores: u64,
+    cpu_payload_stores: u64,
+    prepare_successes: u64,
+    prepare_failures: u64,
+    direct_fallbacks_after_admission: u64,
+    rejected_ineligible: u64,
+    rejected_admission: u64,
+    rejected_oversized: u64,
+    rejected_payload_budget: u64,
+    rejected_fractional_placement: u64,
+    rejected_unsupported_transform: u64,
     prepare: DurationStatsNif,
     draw_hit: DurationStatsNif,
 }
@@ -222,7 +220,7 @@ impl StatsSnapshotNif {
         let timing = |metric| DurationStatsNif::from(*snapshot.timing(metric));
 
         Self {
-            version: 9,
+            version: STATS_SCHEMA_VERSION,
             kind: kind.to_string(),
             enabled,
             window: StatsWindowNif {
@@ -295,14 +293,13 @@ impl From<LayoutCacheStats> for LayoutCacheStatsNif {
 impl From<stats::RendererCacheStatsSnapshot> for RendererCacheStatsNif {
     fn from(stats: stats::RendererCacheStatsSnapshot) -> Self {
         Self {
-            noop: RendererCacheKindStatsNif::from(stats.noop),
-            clean_subtree: RendererCacheKindStatsNif::from(stats.clean_subtree),
+            paint_layer: RendererCachePaintLayerStatsNif::from(stats.paint_layer),
         }
     }
 }
 
-impl From<stats::RendererCacheKindStatsSnapshot> for RendererCacheKindStatsNif {
-    fn from(stats: stats::RendererCacheKindStatsSnapshot) -> Self {
+impl From<stats::RendererCachePaintLayerStatsSnapshot> for RendererCachePaintLayerStatsNif {
+    fn from(stats: stats::RendererCachePaintLayerStatsSnapshot) -> Self {
         Self {
             candidates: stats.candidates,
             visible_candidates: stats.visible_candidates,
@@ -320,6 +317,17 @@ impl From<stats::RendererCacheKindStatsSnapshot> for RendererCacheKindStatsNif {
             current_cpu_payloads: stats.current_cpu_payloads,
             evicted_bytes: stats.evicted_bytes,
             stale_evicted_bytes: stats.stale_evicted_bytes,
+            gpu_payload_stores: stats.gpu_payload_stores,
+            cpu_payload_stores: stats.cpu_payload_stores,
+            prepare_successes: stats.prepare_successes,
+            prepare_failures: stats.prepare_failures,
+            direct_fallbacks_after_admission: stats.direct_fallbacks_after_admission,
+            rejected_ineligible: stats.rejected_ineligible,
+            rejected_admission: stats.rejected_admission,
+            rejected_oversized: stats.rejected_oversized,
+            rejected_payload_budget: stats.rejected_payload_budget,
+            rejected_fractional_placement: stats.rejected_fractional_placement,
+            rejected_unsupported_transform: stats.rejected_unsupported_transform,
             prepare: DurationStatsNif::from(stats.prepare),
             draw_hit: DurationStatsNif::from(stats.draw_hit),
         }
@@ -529,7 +537,7 @@ impl rustler::Resource for TestHarnessResource {}
 
 impl Drop for RendererResource {
     fn drop(&mut self) {
-        self.stop_inner();
+        self.stop_inner(false);
     }
 }
 
@@ -566,10 +574,10 @@ impl TestHarnessResource {
 
 impl RendererResource {
     fn stop(&self) {
-        self.stop_inner();
+        self.stop_inner(true);
     }
 
-    fn stop_inner(&self) {
+    fn stop_inner(&self, block_until_joined: bool) {
         let mut handles_guard = match self.handles.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -593,7 +601,7 @@ impl RendererResource {
             log_input: self.log_input,
         };
 
-        if self.running_flag.load(Ordering::Relaxed) {
+        if block_until_joined || self.running_flag.load(Ordering::Relaxed) {
             shutdown_renderer_runtime(ctx, handles);
         } else {
             thread::spawn(move || shutdown_renderer_runtime(ctx, handles));
@@ -884,15 +892,18 @@ struct StartOptsNif {
 
 #[derive(Clone, Copy, Debug, rustler::NifMap)]
 struct RendererCacheConfigNif {
+    enabled: bool,
     max_new_payloads_per_frame: u32,
-    clean_subtree: CleanSubtreeCacheConfigNif,
+    paint_layer: RendererPaintLayerCacheConfigNif,
 }
 
 #[derive(Clone, Copy, Debug, rustler::NifMap)]
-struct CleanSubtreeCacheConfigNif {
+struct RendererPaintLayerCacheConfigNif {
     max_entries: u64,
     max_bytes: u64,
     max_entry_bytes: u64,
+    min_visible_before_store: u64,
+    max_stale_frames: u64,
 }
 
 #[derive(rustler::NifMap)]
@@ -936,16 +947,19 @@ fn start_with_config(
 fn renderer_cache_config_from_nif(
     config: RendererCacheConfigNif,
 ) -> Result<RendererCacheConfig, String> {
-    let max_entries = usize::try_from(config.clean_subtree.max_entries).map_err(|_| {
-        "renderer_cache.clean_subtree.max_entries does not fit this platform".to_string()
+    let max_entries = usize::try_from(config.paint_layer.max_entries).map_err(|_| {
+        "renderer_cache.paint_layer.max_entries does not fit this platform".to_string()
     })?;
 
     Ok(RendererCacheConfig {
+        enabled: config.enabled,
         max_new_payloads_per_frame: config.max_new_payloads_per_frame,
-        clean_subtree: CleanSubtreeCacheConfig {
+        paint_layer: RendererPaintLayerCacheConfig {
             max_entries,
-            max_bytes: config.clean_subtree.max_bytes,
-            max_entry_bytes: config.clean_subtree.max_entry_bytes,
+            max_bytes: config.paint_layer.max_bytes,
+            max_entry_bytes: config.paint_layer.max_entry_bytes,
+            min_visible_before_store: config.paint_layer.min_visible_before_store,
+            max_stale_frames: config.paint_layer.max_stale_frames,
         },
     })
 }
@@ -1059,6 +1073,7 @@ fn start_native_renderer_with_config(
                     event_tx: event_tx_clone,
                     input_target: input_target_clone,
                     close_signal_log,
+                    render_log: log_render,
                     stats: renderer_stats_clone,
                     renderer_stats_log,
                     renderer_animation_log,
@@ -1376,6 +1391,7 @@ fn start_native_renderer_with_config(
         backend_wake: backend_wake.clone(),
         scroll_line_pixels: config.scroll_line_pixels,
         log_render,
+        native_log: Arc::clone(&native_log),
         system_clipboard,
         stats: renderer_stats.clone(),
     }));
@@ -1957,9 +1973,8 @@ fn tree_upload_roundtrip<'a>(
 #[rustler::nif(schedule = "DirtyCpu")]
 fn tree_patch(tree_res: ResourceArc<TreeResource>, data: Binary) -> Result<bool, String> {
     let patches = tree::patch::decode_patches(data.as_slice()).map_err(|e| e.to_string())?;
-    let mut tree = clone_tree_resource(&tree_res)?;
+    let mut tree = tree_res.tree.lock().map_err(|_| tree_lock_error())?;
     tree::patch::apply_patches(&mut tree, patches)?;
-    replace_tree_resource(&tree_res, tree)?;
     Ok(true)
 }
 
@@ -2083,6 +2098,7 @@ fn test_harness_new(width: u32, height: u32) -> Result<ResourceArc<TestHarnessRe
         backend_wake: BackendWakeHandle::noop(),
         scroll_line_pixels: input::SCROLL_LINE_PIXELS,
         log_render: false,
+        native_log: Arc::new(NativeLogRelay::default()),
         system_clipboard: false,
         stats: None,
     });
@@ -2307,6 +2323,7 @@ mod tests {
                 backend_wake: BackendWakeHandle::noop(),
                 scroll_line_pixels: input::SCROLL_LINE_PIXELS,
                 log_render: false,
+                native_log: Arc::new(NativeLogRelay::default()),
                 system_clipboard: false,
                 stats: None,
             });
@@ -2405,6 +2422,7 @@ mod tests {
                 backend_wake: BackendWakeHandle::noop(),
                 scroll_line_pixels: input::SCROLL_LINE_PIXELS,
                 log_render: false,
+                native_log: Arc::new(NativeLogRelay::default()),
                 system_clipboard: false,
                 stats: None,
             });
@@ -2540,7 +2558,123 @@ mod tests {
     }
 
     #[test]
-    fn send_registry_update_does_not_block_when_event_channel_is_full() {
+    fn renderer_resource_stop_blocks_until_threads_join_even_after_running_flag_cleared() {
+        let running_flag = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let backend_wake = BackendWakeHandle::noop();
+
+        let (tree_tx, tree_rx) = bounded(1);
+        let (event_tx, event_rx) = bounded(1);
+        let (render_tx, render_rx) = bounded(1);
+        let render_sender = RenderSender {
+            tx: render_tx,
+            drop_rx: render_rx.clone(),
+            log_render: false,
+        };
+        let (release_tx, _release_rx) = bounded(1);
+
+        let tree_stopped = Arc::new(AtomicBool::new(false));
+        let event_stopped = Arc::new(AtomicBool::new(false));
+        let backend_stopped = Arc::new(AtomicBool::new(false));
+
+        let tree_handle = {
+            let tree_stopped = Arc::clone(&tree_stopped);
+
+            thread::spawn(move || {
+                if matches!(tree_rx.recv(), Ok(TreeMsg::Stop)) {
+                    tree_stopped.store(true, Ordering::Relaxed);
+                }
+            })
+        };
+
+        let event_handle = {
+            let event_stopped = Arc::clone(&event_stopped);
+
+            thread::spawn(move || {
+                if matches!(event_rx.recv(), Ok(EventMsg::Stop)) {
+                    event_stopped.store(true, Ordering::Relaxed);
+                }
+            })
+        };
+
+        let (backend_release_tx, backend_release_rx) = bounded::<()>(1);
+        let (backend_stop_seen_tx, backend_stop_seen_rx) = bounded::<()>(1);
+        let backend_handle = {
+            let backend_stopped = Arc::clone(&backend_stopped);
+
+            thread::spawn(move || {
+                if matches!(render_rx.recv(), Ok(RenderMsg::Stop)) {
+                    let _ = backend_stop_seen_tx.send(());
+                    let _ = backend_release_rx.recv();
+                    backend_stopped.store(true, Ordering::Relaxed);
+                }
+            })
+        };
+
+        let resource = Arc::new(RendererResource {
+            running_flag: Arc::clone(&running_flag),
+            backend_wake: backend_wake.clone(),
+            stop_flag: Arc::clone(&stop_flag),
+            tree_tx,
+            event_tx,
+            input_target: Arc::new(InputTargetRelay::default()),
+            render_tx: render_sender,
+            video_registry: Arc::new(VideoRegistry::new(release_tx)),
+            video_wake: VideoWake::noop(),
+            prime_video_supported: false,
+            native_log: Arc::new(NativeLogRelay::default()),
+            stats: None,
+            close_signal_log: false,
+            log_render: false,
+            log_input: false,
+            handles: Mutex::new(Some(RendererHandles {
+                backend_handle: Some(backend_handle),
+                input_handle: None,
+                tree_handle: Some(tree_handle),
+                event_handle: Some(event_handle),
+                heartbeat_handle: None,
+            })),
+        });
+
+        let (stop_done_tx, stop_done_rx) = bounded::<()>(1);
+        let stop_handle = {
+            let resource = Arc::clone(&resource);
+
+            thread::spawn(move || {
+                resource.stop();
+                let _ = stop_done_tx.send(());
+            })
+        };
+
+        assert_eq!(
+            backend_stop_seen_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(())
+        );
+        assert!(matches!(
+            stop_done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+
+        let _ = backend_release_tx.send(());
+        assert_eq!(stop_done_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+        let _ = stop_handle.join();
+
+        assert!(!running_flag.load(Ordering::Relaxed));
+        assert!(stop_flag.load(Ordering::Relaxed));
+        assert!(tree_stopped.load(Ordering::Relaxed));
+        assert!(event_stopped.load(Ordering::Relaxed));
+        assert!(backend_stopped.load(Ordering::Relaxed));
+        assert!(
+            resource
+                .handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn send_registry_update_waits_for_channel_capacity_instead_of_dropping() {
         let (event_tx, event_rx) = bounded(1);
         event_tx.send(EventMsg::Stop).unwrap();
 
@@ -2554,19 +2688,21 @@ mod tests {
             let _ = done_tx.send(());
         });
 
-        let completed = done_rx.recv_timeout(Duration::from_millis(100)).is_ok();
-
-        if completed {
-            assert!(matches!(event_rx.try_recv(), Ok(EventMsg::Stop)));
-        }
-
-        drop(event_rx);
-        let _ = handle.join();
-
         assert!(
-            completed,
-            "registry update send should not block when event channel is full"
+            done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "registry update send should wait while the event channel is full"
         );
+        assert!(matches!(event_rx.try_recv(), Ok(EventMsg::Stop)));
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_ok(),
+            "registry update send should complete once capacity is available"
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(EventMsg::RegistryUpdate { .. })
+        ));
+
+        let _ = handle.join();
     }
 
     #[test]

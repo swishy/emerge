@@ -65,6 +65,16 @@ defmodule Emerge.Runtime.Viewport do
   end
 
   @impl true
+  def handle_info({:EXIT, _pid, :normal}, state) do
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({:EXIT, _pid, reason}, state) do
+    {:stop, reason, state}
+  end
+
+  @impl true
   def handle_info({:emerge_viewport, :source_reloaded, meta}, state) do
     handle_source_reloaded(meta, state)
   end
@@ -108,6 +118,7 @@ defmodule Emerge.Runtime.Viewport do
       id: Keyword.get(opts, :name, module),
       start: {module, :start_link, [opts]},
       restart: :transient,
+      shutdown: :infinity,
       type: :worker
     }
   end
@@ -116,6 +127,7 @@ defmodule Emerge.Runtime.Viewport do
   @spec init_state(module(), keyword()) ::
           {:ok, t(), {:continue, {:emerge_viewport_mount, keyword()}}}
   def init_state(module, opts) when is_atom(module) and is_list(opts) do
+    Process.flag(:trap_exit, true)
     {:ok, put_runtime(%{}, %State{module: module}), {:continue, {:emerge_viewport_mount, opts}}}
   end
 
@@ -187,6 +199,9 @@ defmodule Emerge.Runtime.Viewport do
 
       renderer_heartbeat_recent?(runtime) ->
         {:noreply, maybe_schedule_renderer_check(state)}
+
+      renderer_running?(runtime) ->
+        {:noreply, state |> note_renderer_heartbeat() |> maybe_schedule_renderer_check()}
 
       true ->
         {:stop, :normal, state}
@@ -413,6 +428,13 @@ defmodule Emerge.Runtime.Viewport do
     end
   end
 
+  defp renderer_running?(%State{renderer_module: renderer_module, renderer: renderer}) do
+    case safe_invoke(fn -> renderer_module.running?(renderer) end) do
+      {:ok, true} -> true
+      _ -> false
+    end
+  end
+
   defp monotonic_ms do
     System.monotonic_time(:millisecond)
   end
@@ -459,8 +481,15 @@ defmodule Emerge.Runtime.Viewport do
   end
 
   defp patch_existing_renderer(state, runtime, tree) do
+    patch_fun =
+      if function_exported?(runtime.renderer_module, :patch_tree_runtime, 3) do
+        :patch_tree_runtime
+      else
+        :patch_tree
+      end
+
     case safe_invoke(fn ->
-           runtime.renderer_module.patch_tree(runtime.renderer, runtime.diff_state, tree)
+           apply(runtime.renderer_module, patch_fun, [runtime.renderer, runtime.diff_state, tree])
          end) do
       {:ok, {diff_state, _assigned}} ->
         {:ok, update_runtime(state, &%{&1 | diff_state: diff_state})}

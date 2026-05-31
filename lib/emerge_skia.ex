@@ -89,7 +89,9 @@ defmodule EmergeSkia do
   - `hw_cursor` - Enable hardware cursor when available (default: true)
   - `drm_cursor` - Optional DRM-only cursor overrides for `default`, `text`, and `pointer`
   - `input_log` - Log DRM input devices on startup (default: false)
-  - `render_log` - Log DRM render/present diagnostics (default: false)
+  - `render_log` - Log native backend render/present diagnostics, including Wayland present
+    and event-runtime traces. On Wayland, also writes an out-of-band watchdog file to
+    `/tmp/emerge-wayland-watchdog-<pid>.log` (default: false)
   - `close_signal_log` - Log detailed Wayland window-close diagnostics to stderr (default: false)
   - `stats` - Enable renderer stats collection without periodic logging (default: false)
   - `renderer_stats_log` - Enable renderer stats collection and log all current stat families every 5 seconds, including frame rate, split render timings, split patch-to-present pipeline timing, layout-cache counters, and renderer-cache counters. Slow Wayland render frames also include a scene primitive summary and per-frame renderer-cache counters. (default: false)
@@ -110,10 +112,13 @@ defmodule EmergeSkia do
   - `fonts` (default: `[]`)
 
   `renderer_cache` options:
-  - `max_new_payloads_per_frame` (default: `1`)
-  - `clean_subtree.max_entries` (default: `128`)
-  - `clean_subtree.max_bytes` (default: `33_554_432`)
-  - `clean_subtree.max_entry_bytes` (default: `4_194_304`)
+  - `enabled` (default: `true`, GPU backends only)
+  - `max_new_payloads_per_frame` (default: `16`)
+  - `paint_layer.max_entries` (default: `512`)
+  - `paint_layer.max_bytes` (default: `671_088_640`)
+  - `paint_layer.max_entry_bytes` (default: `268_435_456`)
+  - `paint_layer.min_visible_before_store` (default: `1`)
+  - `paint_layer.max_stale_frames` (default: `120`)
 
   Set a renderer-cache limit to `0` to prevent new stores for that dimension.
 

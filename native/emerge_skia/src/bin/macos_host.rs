@@ -39,7 +39,8 @@ mod app {
         },
         keys::CanonicalKey,
         renderer::{
-            CleanSubtreeCacheConfig, RenderFrame, RenderState, RendererCacheConfig, SceneRenderer,
+            RenderFrame, RenderState, RendererCacheConfig, RendererPaintLayerCacheConfig,
+            SceneRenderer,
         },
         runtime::tree_update::{
             TreeUpdateDecodePolicy, TreeUpdateEffect, TreeUpdateEngine, TreeUpdateOptions,
@@ -2188,6 +2189,7 @@ mod app {
                     .expect("raster fallback surface should resize");
             }
         }
+        session.renderer.invalidate_visible_frame_fingerprint();
     }
 
     fn draw_metal_surface(
@@ -2303,6 +2305,20 @@ mod app {
 
     fn draw_session(session: &mut HostSession) -> Result<(), String> {
         let draw_started_at = Instant::now();
+        if let SessionSurface::Metal(surface) = &session.surface {
+            let size = surface.metal_layer.drawableSize();
+            let dimensions = (size.width.max(1.0) as u32, size.height.max(1.0) as u32);
+            if session
+                .renderer
+                .can_skip_unchanged_visible_frame(&session.render_state, dimensions)
+            {
+                session.render_state.pipeline_submitted_at = None;
+                session.render_state.pipeline_render_queued_at = None;
+                session.dirty = false;
+                return Ok(());
+            }
+        }
+
         let swap_done_at = match &mut session.surface {
             SessionSurface::Metal(surface) => draw_metal_surface(
                 surface,
@@ -3767,16 +3783,22 @@ mod app {
         cursor: &mut usize,
     ) -> Option<RendererCacheConfig> {
         let max_new_payloads_per_frame = decode_u32(payload, cursor)?;
+        let enabled = decode_u8(payload, cursor)? != 0;
         let max_entries = usize::try_from(decode_u64(payload, cursor)?).ok()?;
         let max_bytes = decode_u64(payload, cursor)?;
         let max_entry_bytes = decode_u64(payload, cursor)?;
+        let min_visible_before_store = decode_u64(payload, cursor)?;
+        let max_stale_frames = decode_u64(payload, cursor)?;
 
         Some(RendererCacheConfig {
+            enabled,
             max_new_payloads_per_frame,
-            clean_subtree: CleanSubtreeCacheConfig {
+            paint_layer: RendererPaintLayerCacheConfig {
                 max_entries,
                 max_bytes,
                 max_entry_bytes,
+                min_visible_before_store,
+                max_stale_frames,
             },
         })
     }

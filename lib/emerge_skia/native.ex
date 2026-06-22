@@ -62,6 +62,17 @@ defmodule EmergeSkia.Native do
             ],
             @rustler_opts
           )
+    else
+      # Static NIF linking (iOS): the ERTS is built with --enable-static-nifs
+      # and calls emerge_skia_nif_init() during VM startup. We just need to
+      # trigger the VM to check its static NIF table.
+      @on_load :load_nif_if_static
+      def load_nif_if_static do
+        case :erlang.load_nif("", 0) do
+          :ok -> :ok
+          {:error, _reason} -> :ok
+        end
+      end
     end
   end
 
@@ -85,6 +96,7 @@ defmodule EmergeSkia.Native do
           required(:width) => non_neg_integer(),
           required(:height) => non_neg_integer(),
           required(:drm_card) => String.t() | nil,
+          required(:fbdev_path) => String.t() | nil,
           required(:drm_startup_retries) => non_neg_integer(),
           required(:drm_retry_interval_ms) => non_neg_integer(),
           required(:asset_sources) => [String.t()],
@@ -169,6 +181,17 @@ defmodule EmergeSkia.Native do
   def load_font_nif(_name, _weight, _italic, _data), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc """
+  Register runtime-supplied SVG bytes under a logical id.
+
+  The parsed asset is referenced from a tree via the `{:id, id}` image source
+  and resolves without filesystem access in both windowed and offscreen paths.
+  Returns the intrinsic `{:ok, {width, height}}` of the SVG.
+  """
+  @spec register_svg_nif(String.t(), binary()) ::
+          {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, String.t()}
+  def register_svg_nif(_id, _data), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
   Configure native asset loading policy and source roots.
   """
   @spec configure_assets_nif(
@@ -211,6 +234,24 @@ defmodule EmergeSkia.Native do
   @spec video_target_submit_prime(reference(), map()) ::
           {:ok, boolean()} | {:error, String.t()}
   def video_target_submit_prime(_target, _desc), do: :erlang.nif_error(:nif_not_loaded)
+
+  # ===========================================================================
+  # Renderer Cache Debug
+  # ===========================================================================
+
+  @doc false
+  @spec debug_renderer_cache(map()) :: {:ok, String.t()} | {:error, String.t()}
+  def debug_renderer_cache(_opts), do: :erlang.nif_error(:nif_not_loaded)
+
+  # ===========================================================================
+  # DNS Resolution
+  # ===========================================================================
+
+  @doc """
+  Resolve a hostname to a list of IP addresses (binary octets).
+  """
+  @spec resolve_host_nif(String.t(), String.t()) :: {:ok, [[byte()]]} | {:error, String.t()}
+  def resolve_host_nif(_name, _family), do: :erlang.nif_error(:nif_not_loaded)
 
   # ===========================================================================
   # Raster Backend

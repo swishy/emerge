@@ -12,11 +12,7 @@
 //!   - Keyboard input uses a hidden UITextField whose delegate callbacks
 //!     forward text changes as InputEvent::TextCommit.
 
-#![allow(
-    deprecated,
-    dead_code,
-    clippy::nonminimal_bool,
-)]
+#![allow(deprecated, dead_code, clippy::nonminimal_bool)]
 
 use std::ffi::c_void;
 use std::sync::{
@@ -30,29 +26,29 @@ use crossbeam_channel::RecvTimeoutError;
 use crossbeam_channel::{Receiver, Sender, bounded};
 
 use crate::actors::{EventMsg, TreeMsg};
-use crate::events::{ElementEventKind, HostEventSink};
+use crate::backend::wake::{BackendWake, BackendWakeHandle, WindowBackendStartupInfo};
 use crate::events::registry_builder::ElixirEventPayload;
+use crate::events::{ElementEventKind, HostEventSink};
 use crate::input::InputEvent;
 use crate::renderer::{RenderFrame, RenderState, SceneRenderer};
 use crate::stats::RendererStatsCollector;
 use crate::tree::element::NodeId;
-use crate::backend::wake::{BackendWake, BackendWakeHandle, WindowBackendStartupInfo};
 
 use objc2::{
     ClassType, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::{Allocated, Retained},
     runtime::{AnyObject, NSObjectProtocol, ProtocolObject},
 };
-use objc2_foundation::{NSString, NSRect};
-use objc2_ui_kit::{
-    UIEvent, UIScreen, UITextField, UITextFieldDelegate,
-    UITouch, UIView, UIViewController, UIWindow,
-};
+use objc2_foundation::{NSRect, NSString};
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLDrawable,
     MTLPixelFormat,
 };
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
+use objc2_ui_kit::{
+    UIEvent, UIScreen, UITextField, UITextFieldDelegate, UITouch, UIView, UIViewController,
+    UIWindow,
+};
 use skia_safe::{
     ColorType,
     gpu::{self, SurfaceOrigin, backend_render_targets, mtl},
@@ -161,15 +157,17 @@ fn set_ios_state(state: IosGlobalState) {
 }
 
 fn with_ios_state<R>(f: impl FnOnce(&IosGlobalState) -> R) -> Option<R> {
-    IOS_STATE.lock().ok().and_then(|guard| {
-        guard.as_ref().map(f)
-    })
+    IOS_STATE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(f))
 }
 
 fn with_ios_state_mut<R>(f: impl FnOnce(&mut IosGlobalState) -> R) -> Option<R> {
-    IOS_STATE.lock().ok().and_then(|mut guard| {
-        guard.as_mut().map(f)
-    })
+    IOS_STATE
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.as_mut().map(f))
 }
 
 // ============================================================================
@@ -187,9 +185,10 @@ fn set_event_tx(tx: Sender<EventMsg>) {
 
 fn send_event(event: EventMsg) {
     if let Ok(guard) = IOS_EVENT_TX.lock()
-        && let Some(ref tx) = *guard {
-            let _ = tx.try_send(event);
-        }
+        && let Some(ref tx) = *guard
+    {
+        let _ = tx.try_send(event);
+    }
 }
 
 // ============================================================================
@@ -246,7 +245,6 @@ define_class!(
 
 #[derive(Default)]
 struct IosContentViewIvars {}
-
 
 impl IosContentView {
     fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
@@ -340,9 +338,15 @@ struct IosBackendWake {
 }
 
 impl BackendWake for IosBackendWake {
-    fn request_stop(&self) { self.stop_flag.store(true, Ordering::Relaxed); }
-    fn request_redraw(&self) { let _ = self.redraw_tx.try_send(()); }
-    fn notify_video_frame(&self) { let _ = self.redraw_tx.try_send(()); }
+    fn request_stop(&self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+    }
+    fn request_redraw(&self) {
+        let _ = self.redraw_tx.try_send(());
+    }
+    fn notify_video_frame(&self) {
+        let _ = self.redraw_tx.try_send(());
+    }
 }
 
 // ============================================================================
@@ -358,7 +362,11 @@ pub struct IosConfig {
 
 impl Default for IosConfig {
     fn default() -> Self {
-        Self { title: "Emerge".to_string(), width: 800, height: 600 }
+        Self {
+            title: "Emerge".to_string(),
+            width: 800,
+            height: 600,
+        }
     }
 }
 
@@ -379,7 +387,10 @@ pub(crate) struct IosRunArgs {
 
 pub(crate) fn run(args: IosRunArgs) {
     eprintln!("[emerge_skia] ios::run: entered");
-    eprintln!("[emerge_skia] ios::run: args.config title={} size={}x{}", args.config.title, args.config.width, args.config.height);
+    eprintln!(
+        "[emerge_skia] ios::run: args.config title={} size={}x{}",
+        args.config.title, args.config.width, args.config.height
+    );
     // Phase 1: set up UIKit on the main thread
     // AppDelegate runs OTP on a background thread. If that background thread is
     // actually the main thread (unlikely), call directly. Otherwise use dispatch_sync_f
@@ -389,8 +400,15 @@ pub(crate) fn run(args: IosRunArgs) {
     let cfg = args.config.clone();
     eprintln!("[emerge_skia] ios::run: calling run_on_main_sync");
     let startup_info = match run_on_main_sync(move || setup_ui(&cfg)) {
-        Ok(info) => { eprintln!("[emerge_skia] ios::run: setup_ui succeeded"); info }
-        Err(reason) => { eprintln!("[emerge_skia] ios::run: setup_ui failed: {}", reason); let _ = args.proxy_tx.send(Err(reason)); return; }
+        Ok(info) => {
+            eprintln!("[emerge_skia] ios::run: setup_ui succeeded");
+            info
+        }
+        Err(reason) => {
+            eprintln!("[emerge_skia] ios::run: setup_ui failed: {}", reason);
+            let _ = args.proxy_tx.send(Err(reason));
+            return;
+        }
     };
 
     // Phase 2: register event channel
@@ -403,11 +421,13 @@ pub(crate) fn run(args: IosRunArgs) {
     let _ = args.proxy_tx.send(Ok(startup_info));
 
     // Phase 3b: send initial resize event so tree actor uses screen dimensions
-    let _ = args.event_tx.send(EventMsg::InputEvent(InputEvent::Resized {
-        width: logical_size.0,
-        height: logical_size.1,
-        scale_factor: startup_scale,
-    }));
+    let _ = args
+        .event_tx
+        .send(EventMsg::InputEvent(InputEvent::Resized {
+            width: logical_size.0,
+            height: logical_size.1,
+            scale_factor: startup_scale,
+        }));
 
     // Phase 4: NIF render thread — receives RenderMsg from tree actor
     let mut session = IosSession {
@@ -434,7 +454,12 @@ pub(crate) fn run(args: IosRunArgs) {
         };
 
         match msg {
-            Some(crate::actors::RenderMsg::Scene { scene, version, animate, .. }) => {
+            Some(crate::actors::RenderMsg::Scene {
+                scene,
+                version,
+                animate,
+                ..
+            }) => {
                 eprintln!("[emerge_skia] scene received (v{version})");
                 session.render_state.scene = *scene;
                 session.render_state.render_version = version;
@@ -454,11 +479,9 @@ pub(crate) fn run(args: IosRunArgs) {
         }
 
         if has_scene {
-            if let Err(e) = render_and_present(
-                logical_size,
-                &mut session.renderer,
-                &session.render_state,
-            ) {
+            if let Err(e) =
+                render_and_present(logical_size, &mut session.renderer, &session.render_state)
+            {
                 eprintln!("[emerge_skia] render error: {e}");
             } else {
                 frame_count += 1;
@@ -519,10 +542,11 @@ fn setup_ui(_config: &IosConfig) -> Result<WindowBackendStartupInfo, String> {
     view_layer.addSublayer(&metal_layer);
     eprintln!("[emerge_skia] setup_ui: added metal layer sublayer");
 
-    let device = MTLCreateSystemDefaultDevice()
-        .ok_or_else(|| "no Metal device available".to_string())?;
+    let device =
+        MTLCreateSystemDefaultDevice().ok_or_else(|| "no Metal device available".to_string())?;
     eprintln!("[emerge_skia] setup_ui: got Metal device");
-    let command_queue = device.newCommandQueue()
+    let command_queue = device
+        .newCommandQueue()
         .ok_or_else(|| "unable to create Metal command queue".to_string())?;
     eprintln!("[emerge_skia] setup_ui: got command queue");
 
@@ -572,10 +596,16 @@ fn setup_ui(_config: &IosConfig) -> Result<WindowBackendStartupInfo, String> {
     let pixel_width = (logical_width as f32 * screen_scale) as u32;
     let pixel_height = (logical_height as f32 * screen_scale) as u32;
 
-    eprintln!("[emerge_skia] setup_ui: screen width={} height={} scale={}", logical_width, logical_height, screen_scale);
+    eprintln!(
+        "[emerge_skia] setup_ui: screen width={} height={} scale={}",
+        logical_width, logical_height, screen_scale
+    );
 
     Ok(WindowBackendStartupInfo {
-        wake: BackendWakeHandle::new(IosBackendWake { redraw_tx, stop_flag }),
+        wake: BackendWakeHandle::new(IosBackendWake {
+            redraw_tx,
+            stop_flag,
+        }),
         prime_video_supported: false,
         width: pixel_width,
         height: pixel_height,
@@ -611,7 +641,6 @@ fn render_and_present(
     state: &RenderState,
 ) -> Result<(), String> {
     with_ios_state_mut(|ios_state| {
-
         let drawable = match ios_state.metal_layer.nextDrawable() {
             Some(d) => d,
             None => return Ok(()),
@@ -621,9 +650,8 @@ fn render_and_present(
         let w = size.width.max(1.0);
         let h = size.height.max(1.0);
 
-        let texture_info = unsafe {
-            mtl::TextureInfo::new(Retained::as_ptr(&drawable.texture()) as mtl::Handle)
-        };
+        let texture_info =
+            unsafe { mtl::TextureInfo::new(Retained::as_ptr(&drawable.texture()) as mtl::Handle) };
 
         let brt = backend_render_targets::make_mtl((w as i32, h as i32), &texture_info);
 
@@ -636,19 +664,23 @@ fn render_and_present(
             ColorType::BGRA8888,
             None,
             None,
-        ).ok_or_else(|| "wrap_backend_render_target failed".to_string())?;
+        )
+        .ok_or_else(|| "wrap_backend_render_target failed".to_string())?;
 
         let mut frame = RenderFrame::new(&mut surface, Some(&mut skia));
         renderer.render(&mut frame, state);
 
-        let cmd_buffer = ios_state.command_queue.commandBuffer()
+        let cmd_buffer = ios_state
+            .command_queue
+            .commandBuffer()
             .ok_or_else(|| "commandBuffer failed".to_string())?;
 
         let drawable_proto: Retained<ProtocolObject<dyn MTLDrawable>> = (&drawable).into();
         cmd_buffer.presentDrawable(&drawable_proto);
         cmd_buffer.commit();
         Ok(())
-    }).unwrap_or(Err("iOS backend not initialized".to_string()))
+    })
+    .unwrap_or(Err("iOS backend not initialized".to_string()))
 }
 
 // ============================================================================
@@ -662,5 +694,11 @@ impl HostEventSink for IosHostEventSink {
         send_event(EventMsg::InputEvent(event.clone()));
     }
 
-    fn send_element_event(&self, _id: &NodeId, _kind: ElementEventKind, _payload: Option<&ElixirEventPayload>) {}
+    fn send_element_event(
+        &self,
+        _id: &NodeId,
+        _kind: ElementEventKind,
+        _payload: Option<&ElixirEventPayload>,
+    ) {
+    }
 }

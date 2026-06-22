@@ -15,7 +15,8 @@ use std::{
 #[cfg(any(
     all(feature = "wayland", target_os = "linux"),
     all(feature = "drm", target_os = "linux"),
-    all(feature = "ios", target_os = "ios")
+    all(feature = "ios", target_os = "ios"),
+    all(feature = "android", target_os = "android")
 ))]
 use crossbeam_channel::unbounded;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
@@ -49,6 +50,8 @@ use actors::{EventMsg, RenderMsg, TreeMsg};
 use assets::AssetConfig;
 #[cfg(all(feature = "drm", target_os = "linux"))]
 use backend::drm;
+#[cfg(feature = "fbdev")]
+use backend::fbdev;
 use backend::wake::BackendWakeHandle;
 #[cfg(all(feature = "wayland", target_os = "linux"))]
 use backend::wayland;
@@ -67,6 +70,8 @@ use native_log::NativeLogRelay;
     all(feature = "drm", target_os = "linux"),
     all(feature = "ios", target_os = "ios")
 ))]
+use renderer::set_render_log_enabled;
+#[cfg(all(feature = "android", target_os = "android"))]
 use renderer::set_render_log_enabled;
 use renderer::{RendererCacheConfig, RendererPaintLayerCacheConfig, clear_global_caches};
 use runtime::tree_actor::{TreeActorConfig, spawn_tree_actor_with_initial_tree};
@@ -355,10 +360,14 @@ enum BackendKind {
     Macos,
     #[cfg(all(feature = "ios", target_os = "ios"))]
     Ios,
+    #[cfg(all(feature = "android", target_os = "android"))]
+    Android,
     #[cfg(all(feature = "wayland", target_os = "linux"))]
     Wayland,
     #[cfg(all(feature = "drm", target_os = "linux"))]
     Drm,
+    #[cfg(feature = "fbdev")]
+    Fbdev,
 }
 
 struct RendererResource {
@@ -670,10 +679,14 @@ fn backend_stats_label(backend: BackendKind) -> &'static str {
         BackendKind::Macos => "macos",
         #[cfg(all(feature = "ios", target_os = "ios"))]
         BackendKind::Ios => "ios",
+        #[cfg(all(feature = "android", target_os = "android"))]
+        BackendKind::Android => "android",
         #[cfg(all(feature = "wayland", target_os = "linux"))]
         BackendKind::Wayland => "wayland",
         #[cfg(all(feature = "drm", target_os = "linux"))]
         BackendKind::Drm => "drm",
+        #[cfg(feature = "fbdev")]
+        BackendKind::Fbdev => "fbdev",
     }
 }
 
@@ -681,7 +694,8 @@ fn backend_stats_label(backend: BackendKind) -> &'static str {
     not(any(
         all(feature = "wayland", target_os = "linux"),
         all(feature = "drm", target_os = "linux"),
-        all(feature = "ios", target_os = "ios")
+        all(feature = "ios", target_os = "ios"),
+        all(feature = "android", target_os = "android")
     )),
     allow(dead_code)
 )]
@@ -804,6 +818,8 @@ struct StartConfig {
     drm_retry_interval_ms: u32,
     #[cfg_attr(not(all(feature = "drm", target_os = "linux")), allow(dead_code))]
     drm_hw_cursor: bool,
+    #[cfg_attr(not(feature = "fbdev"), allow(dead_code))]
+    fbdev_path: Option<String>,
     #[cfg_attr(not(all(feature = "drm", target_os = "linux")), allow(dead_code))]
     drm_cursor_overrides: Vec<DrmCursorOverrideConfig>,
     #[cfg_attr(not(all(feature = "drm", target_os = "linux")), allow(dead_code))]
@@ -877,6 +893,7 @@ struct StartOptsNif {
     asset_follow_symlinks: bool,
     asset_max_file_size: u64,
     asset_extensions: Vec<String>,
+    fbdev_path: Option<String>,
     drm_cursor: Vec<DrmCursorOverrideNif>,
     drm_startup_retries: u32,
     drm_retry_interval_ms: u32,
@@ -967,7 +984,8 @@ fn renderer_cache_config_from_nif(
 #[cfg(any(
     all(feature = "wayland", target_os = "linux"),
     all(feature = "drm", target_os = "linux"),
-    all(feature = "ios", target_os = "ios")
+    all(feature = "ios", target_os = "ios"),
+    all(feature = "android", target_os = "android")
 ))]
 fn start_native_renderer_with_config(
     config: StartConfig,
@@ -998,7 +1016,7 @@ fn start_native_renderer_with_config(
         drop_rx: render_rx.clone(),
         log_render,
     };
-    let (backend_cursor_tx, backend_cursor_rx) = unbounded();
+    let (backend_cursor_tx, _backend_cursor_rx) = unbounded();
     #[cfg(all(feature = "drm", target_os = "linux"))]
     let drm_cursor_state = Arc::new(SharedCursorState::new(CursorState {
         pos: (0.0, 0.0),
@@ -1009,7 +1027,9 @@ fn start_native_renderer_with_config(
 
     #[cfg(all(feature = "wayland", target_os = "linux"))]
     let system_clipboard = matches!(config.backend, BackendKind::Wayland);
-    #[cfg(not(all(feature = "wayland", target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    let system_clipboard = true;
+    #[cfg(not(any(all(feature = "wayland", target_os = "linux"), target_os = "macos")))]
     let system_clipboard = false;
     let heartbeat_stats = if config.renderer_stats_log {
         renderer_stats.clone()
@@ -1027,24 +1047,27 @@ fn start_native_renderer_with_config(
         ..RendererHandles::default()
     };
 
-    let initial_width = config.width;
-    let initial_height = config.height;
+    let _initial_width = config.width;
+    let _initial_height = config.height;
     let release_tx = video::spawn_release_worker();
     let video_registry = Arc::new(VideoRegistry::new(release_tx));
     #[cfg(any(
         all(feature = "wayland", target_os = "linux"),
         all(feature = "drm", target_os = "linux"),
-        all(feature = "ios", target_os = "ios")
+        all(feature = "ios", target_os = "ios"),
+        all(feature = "android", target_os = "android")
     ))]
     #[allow(unused_assignments)]
     let mut backend_wake = BackendWakeHandle::noop();
     #[cfg(not(any(
         all(feature = "wayland", target_os = "linux"),
         all(feature = "drm", target_os = "linux"),
-        all(feature = "ios", target_os = "ios")
+        all(feature = "ios", target_os = "ios"),
+        all(feature = "android", target_os = "android")
     )))]
     let backend_wake = BackendWakeHandle::noop();
 
+    #[allow(unused_variables)]
     let (backend, prime_video_supported): (BackendKind, bool) = match config.backend {
         #[cfg(all(feature = "wayland", target_os = "linux"))]
         BackendKind::Wayland => {
@@ -1291,6 +1314,100 @@ fn start_native_renderer_with_config(
 
             (BackendKind::Drm, true)
         }
+        #[cfg(feature = "fbdev")]
+        BackendKind::Fbdev => {
+            let (startup_tx, startup_rx) = std::sync::mpsc::channel();
+            let running_flag_clone = Arc::clone(&running_flag);
+            let stop_for_thread = Arc::clone(&stop_flag);
+            let tree_tx_clone = tree_tx.clone();
+            let event_tx_clone = event_tx.clone();
+            let renderer_stats_clone = renderer_stats.clone();
+            let native_log_clone = Arc::clone(&native_log);
+
+            let fbdev_config = backend::fbdev::FbdevRunConfig {
+                device_path: config
+                    .fbdev_path
+                    .clone()
+                    .unwrap_or_else(|| "/dev/fb0".to_string()),
+                width: config.width,
+                height: config.height,
+                renderer_cache_config: config.renderer_cache_config,
+            };
+
+            handles.backend_handle = Some(thread::spawn(move || {
+                backend::fbdev::run(
+                    backend::fbdev::FbdevRunContext {
+                        startup_tx,
+                        stop: stop_for_thread,
+                        running_flag: running_flag_clone,
+                        tree_tx: tree_tx_clone,
+                        render_rx,
+                        event_tx: event_tx_clone,
+                        render_counter: Arc::clone(&render_counter),
+                        native_log: native_log_clone,
+                        stats: renderer_stats_clone,
+                    },
+                    fbdev_config,
+                );
+            }));
+
+            handles.tree_handle = Some(runtime::tree_actor::spawn_tree_actor(
+                tree_rx,
+                TreeActorConfig {
+                    render_sender: render_sender.clone(),
+                    event_tx: event_tx.clone(),
+                    render_counter: Arc::clone(&render_counter),
+                    stats: renderer_stats.clone(),
+                    log_input,
+                    window_wake: backend_wake.clone(),
+                    initial_width,
+                    initial_height,
+                    initial_scale: 1.0,
+                },
+            ));
+
+            match startup_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => {
+                    shutdown_renderer_runtime(
+                        ShutdownRuntimeContext {
+                            running_flag: Arc::clone(&running_flag),
+                            backend_wake: backend_wake.clone(),
+                            stop_flag: Arc::clone(&stop_flag),
+                            tree_tx: tree_tx.clone(),
+                            event_tx: event_tx.clone(),
+                            render_tx: render_sender.clone(),
+                            close_signal_log,
+                            log_render,
+                            log_input,
+                        },
+                        std::mem::take(&mut handles),
+                    );
+                    return Err(rustler::Error::Term(Box::new(reason)));
+                }
+                Err(_) => {
+                    shutdown_renderer_runtime(
+                        ShutdownRuntimeContext {
+                            running_flag: Arc::clone(&running_flag),
+                            backend_wake: backend_wake.clone(),
+                            stop_flag: Arc::clone(&stop_flag),
+                            tree_tx: tree_tx.clone(),
+                            event_tx: event_tx.clone(),
+                            render_tx: render_sender.clone(),
+                            close_signal_log,
+                            log_render,
+                            log_input,
+                        },
+                        std::mem::take(&mut handles),
+                    );
+                    return Err(rustler::Error::Term(Box::new(
+                        "failed to receive fbdev backend startup info",
+                    )));
+                }
+            }
+
+            (BackendKind::Fbdev, false)
+        }
         #[cfg(all(feature = "ios", target_os = "ios"))]
         BackendKind::Ios => {
             eprintln!("iOS backend starting...");
@@ -1380,6 +1497,93 @@ fn start_native_renderer_with_config(
 
             (BackendKind::Ios, startup.prime_video_supported)
         }
+        #[cfg(all(feature = "android", target_os = "android"))]
+        BackendKind::Android => {
+            eprintln!("Android backend starting...");
+            let (proxy_tx, proxy_rx) = std::sync::mpsc::channel();
+            let android_config = crate::backend::android::AndroidConfig {
+                title: config.title.clone(),
+            };
+            let running_flag_clone = Arc::clone(&running_flag);
+            let tree_tx_clone = tree_tx.clone();
+            let event_tx_clone = event_tx.clone();
+            let renderer_stats_clone = renderer_stats.clone();
+
+            handles.backend_handle = Some(thread::spawn(move || {
+                crate::backend::android::run(crate::backend::android::AndroidRunArgs {
+                    config: android_config,
+                    running_flag: running_flag_clone,
+                    tree_tx: tree_tx_clone,
+                    event_tx: event_tx_clone,
+                    render_rx,
+                    close_signal_log,
+                    stats: renderer_stats_clone,
+                    proxy_tx,
+                });
+            }));
+
+            let startup = match proxy_rx.recv() {
+                Ok(Ok(info)) => info,
+                Ok(Err(reason)) => {
+                    eprintln!("Android backend startup failed: {}", reason);
+                    shutdown_renderer_runtime(
+                        ShutdownRuntimeContext {
+                            running_flag: Arc::clone(&running_flag),
+                            backend_wake: backend_wake.clone(),
+                            stop_flag: Arc::clone(&stop_flag),
+                            tree_tx: tree_tx.clone(),
+                            event_tx: event_tx.clone(),
+                            render_tx: render_sender.clone(),
+                            close_signal_log,
+                            log_render,
+                            log_input,
+                        },
+                        std::mem::take(&mut handles),
+                    );
+                    return Err(rustler::Error::Term(Box::new(reason)));
+                }
+                Err(_) => {
+                    eprintln!("Android backend startup recv failed");
+                    shutdown_renderer_runtime(
+                        ShutdownRuntimeContext {
+                            running_flag: Arc::clone(&running_flag),
+                            backend_wake: backend_wake.clone(),
+                            stop_flag: Arc::clone(&stop_flag),
+                            tree_tx: tree_tx.clone(),
+                            event_tx: event_tx.clone(),
+                            render_tx: render_sender.clone(),
+                            close_signal_log,
+                            log_render,
+                            log_input,
+                        },
+                        std::mem::take(&mut handles),
+                    );
+                    return Err(rustler::Error::Term(Box::new(
+                        "Android backend startup recv failed",
+                    )));
+                }
+            };
+
+            eprintln!("Android backend started successfully");
+            backend_wake = startup.wake.clone();
+
+            handles.tree_handle = Some(runtime::tree_actor::spawn_tree_actor(
+                tree_rx,
+                TreeActorConfig {
+                    render_sender: render_sender.clone(),
+                    event_tx: event_tx.clone(),
+                    render_counter: Arc::clone(&render_counter),
+                    stats: renderer_stats.clone(),
+                    log_input: false,
+                    window_wake: backend_wake.clone(),
+                    initial_width: startup.width,
+                    initial_height: startup.height,
+                    initial_scale: startup.scale,
+                },
+            ));
+
+            (BackendKind::Android, startup.prime_video_supported)
+        }
         #[cfg(feature = "macos")]
         BackendKind::Macos => unreachable!("macOS backend should return before runtime startup"),
     };
@@ -1439,7 +1643,8 @@ fn start_native_renderer_with_config(
 #[cfg(not(any(
     all(feature = "wayland", target_os = "linux"),
     all(feature = "drm", target_os = "linux"),
-    all(feature = "ios", target_os = "ios")
+    all(feature = "ios", target_os = "ios"),
+    all(feature = "android", target_os = "android")
 )))]
 fn start_native_renderer_with_config(
     config: StartConfig,
@@ -1496,6 +1701,15 @@ fn start(
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
+fn debug_renderer_cache(env: Env, opts: Term) -> NifResult<String> {
+    let key = Atom::from_str(env, "renderer_cache").unwrap().to_term(env);
+    match opts.map_get(key) {
+        Ok(cache_term) => Ok(format!("renderer_cache: {:?}", cache_term)),
+        Err(e) => Ok(format!("renderer_cache not found: {:?}", e)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
 fn start_opts(env: Env, opts: StartOptsNif) -> NifResult<ResourceArc<RendererResource>> {
     let backend = opts.backend.to_lowercase();
     let backend =
@@ -1521,6 +1735,7 @@ fn start_opts(env: Env, opts: StartOptsNif) -> NifResult<ResourceArc<RendererRes
             height: opts.height,
             scroll_line_pixels: opts.scroll_line_pixels,
             asset_config,
+            fbdev_path: opts.fbdev_path,
             drm_card: opts.drm_card,
             drm_startup_retries: opts.drm_startup_retries,
             drm_retry_interval_ms: opts.drm_retry_interval_ms,
@@ -1631,6 +1846,28 @@ fn measure_text(text: String, font_size: f32) -> (f32, f32, f32, f32) {
     services::measure_text(&text, font_size)
 }
 
+#[rustler::nif]
+fn resolve_host_nif(name: String, family: String) -> Result<Vec<Vec<u8>>, String> {
+    use std::net::ToSocketAddrs;
+
+    let addr = format!("{}:{}", name, 0);
+    let addrs = addr.to_socket_addrs().map_err(|e| format!("{}", e))?;
+
+    let ips: Vec<Vec<u8>> = addrs
+        .filter(|a| match family.as_str() {
+            "inet" => a.is_ipv4(),
+            "inet6" => a.is_ipv6(),
+            _ => true,
+        })
+        .map(|a| match a.ip() {
+            std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+            std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
+        })
+        .collect();
+
+    Ok(ips)
+}
+
 /// Load a font from binary data and register it with a name.
 ///
 /// - `name`: Family name to register (e.g., "my-font")
@@ -1641,6 +1878,17 @@ fn measure_text(text: String, font_size: f32) -> (f32, f32, f32, f32) {
 fn load_font_nif(name: String, weight: u32, italic: bool, data: Binary) -> Result<bool, String> {
     services::load_font_bytes(&name, weight as u16, italic, data.as_slice())?;
     Ok(true)
+}
+
+/// Register runtime-supplied SVG content under a logical id.
+///
+/// - `id`: caller-chosen asset id, referenced from Elixir as `{:id, id}`
+/// - `data`: raw SVG document bytes
+///
+/// Returns the intrinsic `{width, height}` of the parsed SVG.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn register_svg_nif(id: String, data: Binary) -> Result<(u32, u32), String> {
+    crate::assets::register_inline_svg(&id, data.as_slice())
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -2954,6 +3202,20 @@ fn parse_backend_name(value: &str) -> Result<BackendKind, String> {
         #[cfg(not(all(feature = "ios", target_os = "ios")))]
         "ios" => Err(
             "iOS backend not compiled; add :ios to config :emerge, compiled_backends: [...]"
+                .to_string(),
+        ),
+        #[cfg(all(feature = "android", target_os = "android"))]
+        "android" => Ok(BackendKind::Android),
+        #[cfg(not(all(feature = "android", target_os = "android")))]
+        "android" => Err(
+            "Android backend not compiled; add :android to config :emerge, compiled_backends: [...]"
+                .to_string(),
+        ),
+        #[cfg(feature = "fbdev")]
+        "fbdev" => Ok(BackendKind::Fbdev),
+        #[cfg(not(feature = "fbdev"))]
+        "fbdev" => Err(
+            "fbdev backend not compiled; add :fbdev to config :emerge, compiled_backends: [...]"
                 .to_string(),
         ),
         "wayland_legacy" => {

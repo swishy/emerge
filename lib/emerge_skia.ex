@@ -79,8 +79,9 @@ defmodule EmergeSkia do
   ## Options
 
   - `otp_app` - OTP application used to resolve logical assets from its `priv` dir (**required**)
-   - `backend` - Backend selection (`:wayland`, `:drm`, or `:macos`). Defaults to `:wayland` for Linux desktop builds, `:macos` on Darwin, and `:drm` for Nerves-style builds. The requested backend must also be present in `config :emerge, compiled_backends: [...]`.
+   - `backend` - Backend selection (`:wayland`, `:drm`, `:macos`, `:ios`, `:android`, or `:fbdev`). Defaults to `:wayland` for Linux desktop builds, `:macos` on Darwin, `:ios` on iOS, `:android` on Android, and `:drm` for Nerves-style builds. The requested backend must also be present in `config :emerge, compiled_backends: [...]`.
    - `macos_backend` - macOS surface backend selection (`:auto`, `:metal`, or `:raster`). Defaults to `:auto` and is only supported with `backend: :macos`.
+   - `fbdev_path` - fbdev framebuffer device path (default: `/dev/fb0`). Only used with `backend: :fbdev`.
   - `title` - Window title (default: "Emerge")
   - `width` - Window width in pixels (default: 800)
   - `height` - Window height in pixels (default: 600)
@@ -136,8 +137,9 @@ defmodule EmergeSkia do
   the built-in `mocu-black-right` theme.
 
   Compile-time backend selection is configured separately with
-  `config :emerge, compiled_backends: [...]`. If omitted, desktop builds assume
-  `[:wayland]` and Nerves-style builds assume `[:drm]`.
+   `config :emerge, compiled_backends: [...]`. If omitted, desktop builds assume
+   `[:wayland]` and Nerves-style builds assume `[:drm]`. SH-4A builds using the
+   `:fbdev` backend should configure `compiled_backends: [:fbdev]` explicitly.
   """
   @spec start(keyword()) :: {:ok, renderer()} | {:error, term()}
   def start(opts) when is_list(opts) do
@@ -331,6 +333,28 @@ defmodule EmergeSkia do
           :ok | {:error, term()}
   def load_font_file(name, weight, italic, path) do
     Assets.load_font_file(name, weight, italic, path)
+  end
+
+  @doc """
+  Register SVG content supplied at runtime under a logical asset id.
+
+  Unlike `svg/2` asset files loaded from disk, this lets an application generate
+  SVG markup on the fly (gauges, charts, data-driven vectors) and render it
+  through the same Skia/usvg pipeline. The registered asset is referenced from a
+  tree by its id and resolves without filesystem access, including in the
+  offscreen `render_to_pixels/2` and `render_to_png/2` paths:
+
+      :ok = EmergeSkia.register_svg("gauge:power", power_gauge_svg(kw))
+      svg([width(px(360)), height(px(360))], {:id, "gauge:power"})
+
+  Re-registering the same id replaces the cached asset. Returns the intrinsic
+  `{:ok, {width, height}}` of the parsed SVG, or `{:error, reason}` if the
+  markup fails to parse.
+  """
+  @spec register_svg(String.t(), iodata()) ::
+          {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, String.t()}
+  def register_svg(id, svg) when is_binary(id) do
+    Native.register_svg_nif(id, IO.iodata_to_binary(svg))
   end
 
   # ===========================================================================
@@ -651,6 +675,36 @@ defmodule EmergeSkia do
     renderer
     |> Transport.for_renderer()
     |> apply(:stats, [renderer, command])
+  end
+
+  @doc """
+  Resolve a hostname to IP addresses.
+
+  Used by the iOS host resolver and Mahiuka ECU connection.
+  Defaults to IPv4. Returns `{:ok, [tuple()]}` on success.
+  """
+  @spec resolve_host(String.t()) :: {:ok, [tuple()]} | {:error, term()}
+  def resolve_host(name) do
+    resolve_host(name, :inet)
+  end
+
+  @doc """
+  Resolve a hostname to IP addresses for a given address family.
+  """
+  @spec resolve_host(String.t(), :inet | :inet6) :: {:ok, [tuple()]} | {:error, term()}
+  def resolve_host(name, family) do
+    family_str = Atom.to_string(family)
+
+    case Native.resolve_host_nif(name, family_str) do
+      {:ok, octets_list} ->
+        {:ok, Enum.map(octets_list, &List.to_tuple/1)}
+
+      {:error, reason} when is_binary(reason) ->
+        {:error, reason}
+
+      _ ->
+        {:error, :nxdomain}
+    end
   end
 
   defp normalize_native_ok({:ok, _}), do: :ok

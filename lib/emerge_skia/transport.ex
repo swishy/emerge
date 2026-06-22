@@ -30,6 +30,7 @@ defmodule EmergeSkia.Transport do
 
   @spec for_backend(atom() | String.t()) :: module()
   def for_backend(backend) when backend in [:macos, "macos"], do: EmergeSkia.Transport.MacosHost
+  def for_backend(backend) when backend in [:android, "android"], do: EmergeSkia.Transport.Native
   def for_backend(_backend), do: EmergeSkia.Transport.Native
 
   @spec for_renderer(renderer_handle()) :: module()

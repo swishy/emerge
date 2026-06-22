@@ -71,7 +71,12 @@ pub struct TreeUpdateEngine {
 }
 
 impl TreeUpdateEngine {
-    pub fn new(initial_tree: ElementTree, initial_width: u32, initial_height: u32, initial_scale: f32) -> Self {
+    pub fn new(
+        initial_tree: ElementTree,
+        initial_width: u32,
+        initial_height: u32,
+        initial_scale: f32,
+    ) -> Self {
         Self {
             tree: initial_tree,
             width: (initial_width as f32).max(1.0),

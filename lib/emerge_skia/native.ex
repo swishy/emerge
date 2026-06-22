@@ -62,6 +62,17 @@ defmodule EmergeSkia.Native do
             ],
             @rustler_opts
           )
+    else
+      # Static NIF linking (iOS): the ERTS is built with --enable-static-nifs
+      # and calls emerge_skia_nif_init() during VM startup. We just need to
+      # trigger the VM to check its static NIF table.
+      @on_load :load_nif_if_static
+      def load_nif_if_static do
+        case :erlang.load_nif("", 0) do
+          :ok -> :ok
+          {:error, _reason} -> :ok
+        end
+      end
     end
   end
 
@@ -85,6 +96,7 @@ defmodule EmergeSkia.Native do
           required(:width) => non_neg_integer(),
           required(:height) => non_neg_integer(),
           required(:drm_card) => String.t() | nil,
+          required(:fbdev_path) => String.t() | nil,
           required(:drm_startup_retries) => non_neg_integer(),
           required(:drm_retry_interval_ms) => non_neg_integer(),
           required(:asset_sources) => [String.t()],
@@ -110,11 +122,14 @@ defmodule EmergeSkia.Native do
           required(:renderer_stats_log) => boolean(),
           required(:renderer_animation_log) => boolean(),
           required(:renderer_cache) => %{
+            required(:enabled) => boolean(),
             required(:max_new_payloads_per_frame) => non_neg_integer(),
-            required(:clean_subtree) => %{
+            required(:paint_layer) => %{
               required(:max_entries) => non_neg_integer(),
               required(:max_bytes) => non_neg_integer(),
-              required(:max_entry_bytes) => non_neg_integer()
+              required(:max_entry_bytes) => non_neg_integer(),
+              required(:min_visible_before_store) => non_neg_integer(),
+              required(:max_stale_frames) => non_neg_integer()
             }
           }
         }) :: reference() | {:ok, reference()} | {:error, term()}
@@ -166,6 +181,17 @@ defmodule EmergeSkia.Native do
   def load_font_nif(_name, _weight, _italic, _data), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc """
+  Register runtime-supplied SVG bytes under a logical id.
+
+  The parsed asset is referenced from a tree via the `{:id, id}` image source
+  and resolves without filesystem access in both windowed and offscreen paths.
+  Returns the intrinsic `{:ok, {width, height}}` of the SVG.
+  """
+  @spec register_svg_nif(String.t(), binary()) ::
+          {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, String.t()}
+  def register_svg_nif(_id, _data), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
   Configure native asset loading policy and source roots.
   """
   @spec configure_assets_nif(
@@ -208,6 +234,24 @@ defmodule EmergeSkia.Native do
   @spec video_target_submit_prime(reference(), map()) ::
           {:ok, boolean()} | {:error, String.t()}
   def video_target_submit_prime(_target, _desc), do: :erlang.nif_error(:nif_not_loaded)
+
+  # ===========================================================================
+  # Renderer Cache Debug
+  # ===========================================================================
+
+  @doc false
+  @spec debug_renderer_cache(map()) :: {:ok, String.t()} | {:error, String.t()}
+  def debug_renderer_cache(_opts), do: :erlang.nif_error(:nif_not_loaded)
+
+  # ===========================================================================
+  # DNS Resolution
+  # ===========================================================================
+
+  @doc """
+  Resolve a hostname to a list of IP addresses (binary octets).
+  """
+  @spec resolve_host_nif(String.t(), String.t()) :: {:ok, [[byte()]]} | {:error, String.t()}
+  def resolve_host_nif(_name, _family), do: :erlang.nif_error(:nif_not_loaded)
 
   # ===========================================================================
   # Raster Backend
@@ -317,15 +361,28 @@ defmodule EmergeSkia.Native do
           required(:current_cpu_payloads) => non_neg_integer(),
           required(:evicted_bytes) => non_neg_integer(),
           required(:stale_evicted_bytes) => non_neg_integer(),
+          required(:gpu_payload_stores) => non_neg_integer(),
+          required(:cpu_payload_stores) => non_neg_integer(),
+          required(:prepare_successes) => non_neg_integer(),
+          required(:prepare_failures) => non_neg_integer(),
+          required(:direct_fallbacks_after_admission) => non_neg_integer(),
+          required(:rejected_ineligible) => non_neg_integer(),
+          required(:rejected_admission) => non_neg_integer(),
+          required(:rejected_oversized) => non_neg_integer(),
+          required(:rejected_payload_budget) => non_neg_integer(),
+          required(:rejected_fractional_placement) => non_neg_integer(),
+          required(:rejected_unsupported_transform) => non_neg_integer(),
           required(:prepare) => duration_stats(),
           required(:draw_hit) => duration_stats()
         }
 
   @type renderer_cache_stats :: %{
-          required(:noop) => renderer_cache_kind_stats(),
-          required(:clean_subtree) => renderer_cache_kind_stats()
+          required(:paint_layer) => renderer_cache_kind_stats()
         }
 
+  @typedoc """
+  Native stats payload. Current schema version: 15.
+  """
   @type stats_snapshot :: %{
           required(:version) => pos_integer(),
           required(:kind) => String.t(),

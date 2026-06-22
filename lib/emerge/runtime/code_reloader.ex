@@ -60,27 +60,32 @@ defmodule Emerge.Runtime.CodeReloader do
 
   @impl true
   def init(opts) do
-    with :ok <- ensure_mix_available(),
-         {:ok, dirs} <- validate_dirs(opts),
-         {:ok, reloadable_apps} <- validate_reloadable_apps(opts),
-         {:ok, debounce_ms} <- validate_debounce_ms(opts),
-         {:ok, watcher_module} <- validate_module_opt(opts, :watcher, FileSystem),
-         {:ok, compiler_module} <- validate_module_opt(opts, :compiler, Compiler),
-         {:ok, watcher_pid} <- start_watcher(watcher_module, dirs, opts) do
-      subscribe_mix_listener(Keyword.get(opts, :mix_listener, MixListener), reloadable_apps)
+    case ensure_mix_available() do
+      :ok ->
+        with {:ok, dirs} <- validate_dirs(opts),
+             {:ok, reloadable_apps} <- validate_reloadable_apps(opts),
+             {:ok, debounce_ms} <- validate_debounce_ms(opts),
+             {:ok, watcher_module} <- validate_module_opt(opts, :watcher, FileSystem),
+             {:ok, compiler_module} <- validate_module_opt(opts, :compiler, Compiler),
+             {:ok, watcher_pid} <- start_watcher(watcher_module, dirs, opts) do
+          subscribe_mix_listener(Keyword.get(opts, :mix_listener, MixListener), reloadable_apps)
 
-      {:ok,
-       %State{
-         compiler: compiler_module,
-         compiler_opts: compiler_opts(opts),
-         debounce_ms: debounce_ms,
-         dirs: dirs,
-         mix_listener: Keyword.get(opts, :mix_listener, MixListener),
-         reloadable_apps: reloadable_apps,
-         watcher_pid: watcher_pid
-       }}
-    else
-      {:error, reason} -> {:stop, reason}
+          {:ok,
+           %State{
+             compiler: compiler_module,
+             compiler_opts: compiler_opts(opts),
+             debounce_ms: debounce_ms,
+             dirs: dirs,
+             mix_listener: Keyword.get(opts, :mix_listener, MixListener),
+             reloadable_apps: reloadable_apps,
+             watcher_pid: watcher_pid
+           }}
+        else
+          {:error, reason} -> {:stop, reason}
+        end
+
+      :ignore ->
+        :ignore
     end
   end
 
@@ -122,10 +127,10 @@ defmodule Emerge.Runtime.CodeReloader do
   defp ensure_mix_available do
     cond do
       not Code.ensure_loaded?(Mix.Project) ->
-        {:error, "Emerge.Runtime.CodeReloader requires Mix to be available in the running VM."}
+        :ignore
 
       is_nil(Mix.Project.get()) ->
-        {:error, "Emerge.Runtime.CodeReloader requires a current Mix project."}
+        :ignore
 
       true ->
         :ok

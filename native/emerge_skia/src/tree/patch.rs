@@ -12,18 +12,19 @@
 use super::animation::{
     AnimationSpec, retarget_exit_animation_spec_to_current_visual, scale_animation_spec,
 };
-use super::attrs::{Attrs, decode_attrs, effective_scrollbar_x, effective_scrollbar_y};
+use super::attrs::{AlignX, Attrs, decode_attrs, effective_scrollbar_x, effective_scrollbar_y};
 use super::deserialize::{DecodeError, decode_tree};
 #[cfg(test)]
 use super::element::NearbyMounts;
 use super::element::{
-    Element, ElementKind, ElementTree, GhostAttachment, NearbyMount, NearbySlot, NodeId,
+    Element, ElementKind, ElementTree, GhostAttachment, NearbyMount, NearbySlot, NodeId, NodeIx,
     NodeResidency, ParentLink, SliderValueOrigin, TextInputContentOrigin,
 };
 use super::invalidation::{
     TreeInvalidation, attrs_change_affects_registry_refresh, classify_attrs_change,
+    downgrade_content_measure_when_layout_independent,
 };
-use super::layout::effective_layout_scale_for_node;
+use super::layout::{effective_layout_scale_for_node, layout_nearby_mounts_for_refresh};
 use std::collections::{HashMap, HashSet};
 
 /// A single patch operation.
@@ -276,6 +277,205 @@ pub fn apply_patches(
     Ok(invalidation)
 }
 
+fn text_content_patch_can_skip_layout(tree: &ElementTree, id: &NodeId) -> bool {
+    let Some(mut current_ix) = tree.ix_of(id) else {
+        return false;
+    };
+
+    loop {
+        let Some(parent_ix) = tree.parent_link_of(current_ix).and_then(|link| match link {
+            ParentLink::Child { parent } => Some(parent),
+            ParentLink::Nearby { .. } => None,
+        }) else {
+            return false;
+        };
+        let Some(parent) = tree.get_ix(parent_ix) else {
+            return false;
+        };
+        if plain_single_child_wrapper_contains(tree, parent_ix, current_ix, parent) {
+            current_ix = parent_ix;
+            continue;
+        }
+
+        return parent.spec.kind == ElementKind::Column
+            && parent.layout.effective.align_x.unwrap_or(AlignX::Left) == AlignX::Left;
+    }
+}
+
+fn plain_single_child_wrapper_contains(
+    tree: &ElementTree,
+    wrapper_ix: NodeIx,
+    child_ix: NodeIx,
+    wrapper: &Element,
+) -> bool {
+    matches!(wrapper.spec.kind, ElementKind::El | ElementKind::None)
+        && plain_wrapper_attrs(&wrapper.layout.effective)
+        && tree.child_ixs(wrapper_ix).as_slice() == [child_ix]
+        && tree.nearby_ixs(wrapper_ix).is_empty()
+}
+
+fn plain_wrapper_attrs(attrs: &Attrs) -> bool {
+    attrs.width.is_none()
+        && attrs.height.is_none()
+        && attrs.layout_scale.is_none()
+        && attrs.layout_rotate.is_none()
+        && attrs.padding.is_none()
+        && attrs.spacing.is_none()
+        && attrs.spacing_x.is_none()
+        && attrs.spacing_y.is_none()
+        && attrs.scrollbar_y != Some(true)
+        && attrs.scrollbar_x != Some(true)
+        && attrs.ghost_scrollbar_y != Some(true)
+        && attrs.ghost_scrollbar_x != Some(true)
+        && attrs.clip_nearby != Some(true)
+        && attrs.background.is_none()
+        && attrs.border_radius.is_none()
+        && attrs.border_width.is_none()
+        && attrs.border_color.is_none()
+        && attrs.box_shadows.is_none()
+        && attrs.move_x.is_none()
+        && attrs.move_y.is_none()
+        && attrs.rotate.is_none()
+        && attrs.scale.is_none()
+        && attrs.alpha.is_none()
+        && !attrs_affect_interaction_or_registry(attrs)
+}
+
+fn plain_text_content_change_can_paint_without_layout(
+    element: &Element,
+    before: &Attrs,
+    after: &Attrs,
+) -> bool {
+    element.spec.kind == ElementKind::Text
+        && before.content != after.content
+        && content_is_single_line(before.content.as_deref())
+        && content_is_single_line(after.content.as_deref())
+        && plain_text_leaf_attrs(before)
+        && plain_text_leaf_attrs(after)
+        && attrs_equal_except_content(before, after)
+}
+
+fn text_input_content_change_can_paint_without_layout(
+    element: &Element,
+    before: &Attrs,
+    after: &Attrs,
+) -> bool {
+    element.spec.kind == ElementKind::TextInput
+        && before.content != after.content
+        && content_is_single_line(before.content.as_deref())
+        && content_is_single_line(after.content.as_deref())
+        && !length_depends_on_text_input_content(after.width.as_ref())
+        && attrs_equal_except_content(before, after)
+}
+
+fn length_depends_on_text_input_content(length: Option<&super::attrs::Length>) -> bool {
+    match length {
+        None | Some(super::attrs::Length::Content) => true,
+        Some(super::attrs::Length::Fill)
+        | Some(super::attrs::Length::FillWeighted(_))
+        | Some(super::attrs::Length::Px(_)) => false,
+        Some(super::attrs::Length::Min(left, right))
+        | Some(super::attrs::Length::Max(left, right)) => {
+            length_depends_on_text_input_content(Some(left.as_ref()))
+                || length_depends_on_text_input_content(Some(right.as_ref()))
+        }
+    }
+}
+
+fn content_is_single_line(content: Option<&str>) -> bool {
+    content.is_none_or(|content| !content.contains('\n'))
+}
+
+fn plain_text_leaf_attrs(attrs: &Attrs) -> bool {
+    attrs.width.is_none()
+        && attrs.height.is_none()
+        && attrs.layout_scale.is_none()
+        && attrs.layout_rotate.is_none()
+        && attrs.padding.is_none()
+        && attrs.text_align.is_none()
+        && attrs.clip_nearby != Some(true)
+        && attrs.background.is_none()
+        && attrs.border_radius.is_none()
+        && attrs.border_width.is_none()
+        && attrs.border_color.is_none()
+        && attrs.box_shadows.is_none()
+        && attrs.move_x.is_none()
+        && attrs.move_y.is_none()
+        && attrs.rotate.is_none()
+        && attrs.scale.is_none()
+        && attrs.alpha.is_none()
+        && !attrs_affect_interaction_or_registry(attrs)
+}
+
+fn attrs_affect_interaction_or_registry(attrs: &Attrs) -> bool {
+    attrs.on_click.unwrap_or(false)
+        || attrs.on_mouse_down.unwrap_or(false)
+        || attrs.on_mouse_up.unwrap_or(false)
+        || attrs.on_mouse_enter.unwrap_or(false)
+        || attrs.on_mouse_leave.unwrap_or(false)
+        || attrs.on_mouse_move.unwrap_or(false)
+        || attrs.on_press.unwrap_or(false)
+        || attrs.on_swipe_up.unwrap_or(false)
+        || attrs.on_swipe_down.unwrap_or(false)
+        || attrs.on_swipe_left.unwrap_or(false)
+        || attrs.on_swipe_right.unwrap_or(false)
+        || attrs.on_change.unwrap_or(false)
+        || attrs.on_focus.unwrap_or(false)
+        || attrs.on_blur.unwrap_or(false)
+        || attrs.focus_on_mount.unwrap_or(false)
+        || attrs.on_key_down.is_some()
+        || attrs.on_key_up.is_some()
+        || attrs.on_key_press.is_some()
+        || attrs.virtual_key.is_some()
+        || attrs.mouse_over.is_some()
+        || attrs.focused.is_some()
+        || attrs.mouse_down.is_some()
+}
+
+fn attrs_equal_except_content(before: &Attrs, after: &Attrs) -> bool {
+    let mut before = before.clone();
+    let mut after = after.clone();
+    before.content = None;
+    after.content = None;
+    attrs_equivalent_for_plain_text_paint(&before, &after)
+}
+
+fn attrs_equivalent_for_plain_text_paint(before: &Attrs, after: &Attrs) -> bool {
+    before.width == after.width
+        && before.height == after.height
+        && before.layout_scale == after.layout_scale
+        && before.layout_rotate == after.layout_rotate
+        && before.padding == after.padding
+        && before.spacing == after.spacing
+        && before.spacing_x == after.spacing_x
+        && before.spacing_y == after.spacing_y
+        && before.align_x == after.align_x
+        && before.align_y == after.align_y
+        && before.background == after.background
+        && before.border_radius == after.border_radius
+        && before.border_width == after.border_width
+        && before.border_style == after.border_style
+        && before.border_color == after.border_color
+        && before.box_shadows == after.box_shadows
+        && before.font_size == after.font_size
+        && before.font_color == after.font_color
+        && before.font == after.font
+        && before.font_weight == after.font_weight
+        && before.font_style == after.font_style
+        && before.font_underline == after.font_underline
+        && before.font_strike == after.font_strike
+        && before.font_letter_spacing == after.font_letter_spacing
+        && before.font_word_spacing == after.font_word_spacing
+        && before.text_align == after.text_align
+        && before.move_x == after.move_x
+        && before.move_y == after.move_y
+        && before.rotate == after.rotate
+        && before.scale == after.scale
+        && before.alpha == after.alpha
+        && before.svg_color == after.svg_color
+        && before.svg_expected == after.svg_expected
+}
+
 /// Apply a single patch to the tree.
 fn apply_patch(
     tree: &mut ElementTree,
@@ -284,6 +484,7 @@ fn apply_patch(
 ) -> Result<TreeInvalidation, String> {
     let invalidation = match patch {
         Patch::SetAttrs { id, attrs_raw } => {
+            let text_content_patch_can_skip_layout = text_content_patch_can_skip_layout(tree, &id);
             let invalidation = {
                 let element = tree
                     .get_mut(&id)
@@ -313,7 +514,11 @@ fn apply_patch(
                 }
 
                 if slider_value_is_from_patch && slider_value_is_runtime_owned {
-                    element.runtime.slider_patch_value = decoded.slider_value.map(f64::to_bits);
+                    element.runtime.slider_patch_value =
+                        decoded.slider_value.and_then(|patch_value| {
+                            (!slider_patch_matches_runtime_value(element, patch_value))
+                                .then_some(patch_value.to_bits())
+                        });
                     decoded.slider_value = element.spec.declared.slider_value;
                 } else if element.spec.kind == ElementKind::Slider {
                     element.runtime.slider_patch_value = None;
@@ -329,7 +534,27 @@ fn apply_patch(
                     element.runtime.slider_value_origin = SliderValueOrigin::TreePatch;
                 }
 
-                let mut invalidation = classify_attrs_change(&before_attrs, &element.spec.declared);
+                let mut invalidation = downgrade_content_measure_when_layout_independent(
+                    &before_attrs,
+                    &element.spec.declared,
+                    classify_attrs_change(&before_attrs, &element.spec.declared),
+                );
+                if text_content_patch_can_skip_layout
+                    && plain_text_content_change_can_paint_without_layout(
+                        element,
+                        &before_attrs,
+                        &element.spec.declared,
+                    )
+                {
+                    invalidation = TreeInvalidation::Paint;
+                }
+                if text_input_content_change_can_paint_without_layout(
+                    element,
+                    &before_attrs,
+                    &element.spec.declared,
+                ) {
+                    invalidation = TreeInvalidation::Paint;
+                }
                 let registry_refresh_dirty =
                     attrs_change_affects_registry_refresh(&before_attrs, &element.spec.declared);
                 if before_patch_content != element.runtime.patch_content
@@ -337,7 +562,7 @@ fn apply_patch(
                     || before_slider_patch_value != element.runtime.slider_patch_value
                     || before_slider_value_origin != element.runtime.slider_value_origin
                 {
-                    invalidation.add(TreeInvalidation::Registry);
+                    invalidation.add(TreeInvalidation::Paint);
                 }
                 (
                     invalidation,
@@ -357,15 +582,30 @@ fn apply_patch(
         }
 
         Patch::SetChildren { id, children } => {
+            let nearby_local_change = tree.is_inside_nearby_subtree(&id);
             let merged_children = tree.merge_live_children_with_ghosts(&id, children);
             tree.set_children(&id, merged_children)?;
-            TreeInvalidation::Structure
+            if nearby_local_change {
+                TreeInvalidation::Resolve
+            } else {
+                TreeInvalidation::Structure
+            }
         }
 
         Patch::SetNearbyMounts { host_id, mounts } => {
             let merged_mounts = tree.merge_live_nearby_with_ghosts(&host_id, mounts);
+            let registry_relevant =
+                tree.nearby_mount_change_affects_registry(&host_id, &merged_mounts);
             tree.set_nearby_mounts(&host_id, merged_mounts)?;
-            TreeInvalidation::Resolve
+            if layout_nearby_mounts_for_refresh(tree, &host_id) {
+                if registry_relevant {
+                    TreeInvalidation::Registry
+                } else {
+                    TreeInvalidation::Paint
+                }
+            } else {
+                TreeInvalidation::Resolve
+            }
         }
 
         Patch::InsertSubtree {
@@ -471,7 +711,7 @@ fn apply_patch(
             }
 
             let registry_relevant =
-                slot == NearbySlot::InFront || tree.subtree_affects_registry(&subtree_root_id);
+                slot.is_overlay() || tree.subtree_affects_registry(&subtree_root_id);
             let merged_mounts = tree.merge_live_nearby_with_ghosts(&host_id, live_mounts);
             tree.set_nearby_mounts(&host_id, merged_mounts)?;
             let restored_layout = tree.restore_detached_layout_subtree_cache(&subtree_root_id);
@@ -491,6 +731,15 @@ fn apply_patch(
                 } else {
                     TreeInvalidation::Paint
                 }
+            } else if layout_nearby_mounts_for_refresh(tree, &host_id) {
+                if !registry_relevant {
+                    tree.clear_registry_refresh_dirty_for_subtree(&subtree_root_id);
+                }
+                if registry_relevant {
+                    TreeInvalidation::Registry
+                } else {
+                    TreeInvalidation::Paint
+                }
             } else {
                 TreeInvalidation::Resolve
             }
@@ -500,7 +749,7 @@ fn apply_patch(
             let parent_link = tree.ix_of(&id).and_then(|ix| tree.parent_link_of(ix));
             let nearby_registry_relevant = match parent_link {
                 Some(ParentLink::Nearby { slot, .. }) => {
-                    slot == NearbySlot::InFront || tree.subtree_affects_registry(&id)
+                    slot.is_overlay() || tree.subtree_affects_registry(&id)
                 }
                 _ => false,
             };
@@ -550,6 +799,17 @@ fn filter_descendant_remove_patches(tree: &ElementTree, patches: Vec<Patch>) -> 
             _ => true,
         })
         .collect()
+}
+
+fn slider_patch_matches_runtime_value(element: &Element, patch_value: f64) -> bool {
+    let runtime_value = element
+        .layout
+        .effective
+        .slider_value
+        .or(element.spec.declared.slider_value)
+        .unwrap_or(0.0);
+    patch_value.to_bits() == runtime_value.to_bits()
+        || (patch_value - runtime_value).abs() <= f64::EPSILON
 }
 
 fn has_removed_live_ancestor(
@@ -1006,18 +1266,22 @@ mod tests {
     use super::*;
     use crate::events::registry_builder::ListenerMatcherKind;
     use crate::tree::animation::{AnimationCurve, AnimationRepeat, AnimationSpec};
-    use crate::tree::attrs::Attrs;
+    use crate::tree::attrs::{Attrs, Length};
     use crate::tree::element::{
         Element, ElementKind, Frame, NearbyMountIx, NearbySlot, NodeId, NodeIx, ParentLink,
         TextInputContentOrigin,
     };
 
     fn exit_alpha_spec() -> AnimationSpec {
-        let mut from = Attrs::default();
-        from.alpha = Some(1.0);
+        let from = Attrs {
+            alpha: Some(1.0),
+            ..Attrs::default()
+        };
 
-        let mut to = Attrs::default();
-        to.alpha = Some(0.0);
+        let to = Attrs {
+            alpha: Some(0.0),
+            ..Attrs::default()
+        };
 
         AnimationSpec {
             keyframes: vec![from, to],
@@ -1039,8 +1303,10 @@ mod tests {
     }
 
     fn text_element(id: u8, content: &str) -> Element {
-        let mut attrs = Attrs::default();
-        attrs.content = Some(content.to_string());
+        let attrs = Attrs {
+            content: Some(content.to_string()),
+            ..Attrs::default()
+        };
         let mut element = Element::with_attrs(
             NodeId::from_term_bytes(vec![id]),
             ElementKind::Text,
@@ -1058,6 +1324,12 @@ mod tests {
             Vec::new(),
             Attrs::default(),
         )
+    }
+
+    fn slider_value_attrs_raw(value: f64) -> Vec<u8> {
+        let mut raw = vec![0, 1, 82];
+        raw.extend_from_slice(&value.to_be_bytes());
+        raw
     }
 
     fn node_ix(tree: &ElementTree, id: &NodeId) -> NodeIx {
@@ -1957,13 +2229,15 @@ mod tests {
     #[test]
     fn test_preserve_runtime_attrs_on_patch() {
         let id = NodeId::from_term_bytes(vec![1]);
-        let mut attrs = Attrs::default();
-        attrs.scroll_x = Some(12.0);
-        attrs.scroll_y = Some(34.0);
-        attrs.scroll_x_max = Some(50.0);
-        attrs.scroll_y_max = Some(60.0);
-        attrs.scrollbar_y = Some(true);
-        attrs.scrollbar_hover_axis = Some(crate::tree::attrs::ScrollbarHoverAxis::Y);
+        let attrs = Attrs {
+            scroll_x: Some(12.0),
+            scroll_y: Some(34.0),
+            scroll_x_max: Some(50.0),
+            scroll_y_max: Some(60.0),
+            scrollbar_y: Some(true),
+            scrollbar_hover_axis: Some(crate::tree::attrs::ScrollbarHoverAxis::Y),
+            ..Attrs::default()
+        };
 
         let element = Element::with_attrs(id, ElementKind::El, Vec::new(), attrs);
         let mut tree = ElementTree::new();
@@ -1988,13 +2262,15 @@ mod tests {
     #[test]
     fn test_preserve_runtime_attrs_on_patch_when_axis_present() {
         let id = NodeId::from_term_bytes(vec![1]);
-        let mut attrs = Attrs::default();
-        attrs.scroll_x = Some(12.0);
-        attrs.scroll_y = Some(34.0);
-        attrs.scroll_x_max = Some(50.0);
-        attrs.scroll_y_max = Some(60.0);
-        attrs.scrollbar_y = Some(true);
-        attrs.scrollbar_hover_axis = Some(crate::tree::attrs::ScrollbarHoverAxis::Y);
+        let attrs = Attrs {
+            scroll_x: Some(12.0),
+            scroll_y: Some(34.0),
+            scroll_x_max: Some(50.0),
+            scroll_y_max: Some(60.0),
+            scrollbar_y: Some(true),
+            scrollbar_hover_axis: Some(crate::tree::attrs::ScrollbarHoverAxis::Y),
+            ..Attrs::default()
+        };
 
         let element = Element::with_attrs(id, ElementKind::El, Vec::new(), attrs);
         let mut tree = ElementTree::new();
@@ -2019,9 +2295,11 @@ mod tests {
     #[test]
     fn test_patch_clears_mouse_over_active_when_mouse_over_removed() {
         let id = NodeId::from_term_bytes(vec![1]);
-        let mut attrs = Attrs::default();
-        attrs.mouse_over = Some(crate::tree::attrs::MouseOverAttrs::default());
-        attrs.mouse_over_active = Some(true);
+        let attrs = Attrs {
+            mouse_over: Some(crate::tree::attrs::MouseOverAttrs::default()),
+            mouse_over_active: Some(true),
+            ..Attrs::default()
+        };
 
         let element = Element::with_attrs(id, ElementKind::El, Vec::new(), attrs);
         let mut tree = ElementTree::new();
@@ -2121,6 +2399,195 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_patches_classifies_fixed_box_content_attr_as_paint() {
+        let id = NodeId::from_term_bytes(vec![1]);
+        let element = Element::with_attrs(
+            id,
+            ElementKind::Text,
+            Vec::new(),
+            Attrs {
+                width: Some(Length::Px(120.0)),
+                height: Some(Length::Px(24.0)),
+                content: Some("ab".to_string()),
+                ..Attrs::default()
+            },
+        );
+        let mut tree = ElementTree::new();
+        tree.set_root_id(id);
+        tree.insert(element);
+
+        let invalidation = apply_patches(
+            &mut tree,
+            vec![Patch::SetAttrs {
+                id,
+                attrs_raw: fixed_content_attrs_raw("abc", 120.0, 24.0),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(invalidation, TreeInvalidation::Paint);
+    }
+
+    #[test]
+    fn test_apply_patches_classifies_single_line_text_input_content_as_paint() {
+        let id = NodeId::from_term_bytes(vec![7]);
+        let element = Element::with_attrs(
+            id,
+            ElementKind::TextInput,
+            Vec::new(),
+            Attrs {
+                width: Some(Length::Fill),
+                content: Some("ab".to_string()),
+                ..Attrs::default()
+            },
+        );
+        let mut tree = ElementTree::new();
+        tree.set_root_id(id);
+        tree.insert(element);
+
+        let mut raw = vec![0, 2, 1, 0];
+        raw.extend_from_slice(&content_attr_raw_tail("abc"));
+        let invalidation =
+            apply_patches(&mut tree, vec![Patch::SetAttrs { id, attrs_raw: raw }]).unwrap();
+
+        assert_eq!(invalidation, TreeInvalidation::Paint);
+    }
+
+    #[test]
+    fn test_apply_patches_keeps_multiline_text_input_content_as_measure() {
+        let id = NodeId::from_term_bytes(vec![8]);
+        let element = Element::with_attrs(
+            id,
+            ElementKind::TextInput,
+            Vec::new(),
+            Attrs {
+                width: Some(Length::Fill),
+                content: Some("ab".to_string()),
+                ..Attrs::default()
+            },
+        );
+        let mut tree = ElementTree::new();
+        tree.set_root_id(id);
+        tree.insert(element);
+
+        let mut raw = vec![0, 2, 1, 0];
+        raw.extend_from_slice(&content_attr_raw_tail("ab\nc"));
+        let invalidation =
+            apply_patches(&mut tree, vec![Patch::SetAttrs { id, attrs_raw: raw }]).unwrap();
+
+        assert_eq!(invalidation, TreeInvalidation::Measure);
+    }
+
+    #[test]
+    fn test_apply_patches_classifies_plain_column_text_label_content_as_paint() {
+        let root_id = NodeId::from_term_bytes(vec![1]);
+        let wrapper_id = NodeId::from_term_bytes(vec![2]);
+        let text_id = NodeId::from_term_bytes(vec![3]);
+        let mut tree = ElementTree::new();
+        tree.set_root_id(root_id);
+        tree.insert(Element::with_attrs(
+            root_id,
+            ElementKind::Column,
+            Vec::new(),
+            Attrs::default(),
+        ));
+        tree.insert(Element::with_attrs(
+            wrapper_id,
+            ElementKind::El,
+            Vec::new(),
+            Attrs::default(),
+        ));
+        tree.insert(Element::with_attrs(
+            text_id,
+            ElementKind::Text,
+            Vec::new(),
+            Attrs {
+                content: Some("Value: a".to_string()),
+                ..Attrs::default()
+            },
+        ));
+        tree.set_children(&root_id, vec![wrapper_id]).unwrap();
+        tree.set_children(&wrapper_id, vec![text_id]).unwrap();
+
+        let invalidation = apply_patches(
+            &mut tree,
+            vec![Patch::SetAttrs {
+                id: text_id,
+                attrs_raw: content_only_attrs_raw("Value: ab"),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(invalidation, TreeInvalidation::Paint);
+    }
+
+    #[test]
+    fn test_apply_patches_keeps_row_text_label_content_as_measure() {
+        let root_id = NodeId::from_term_bytes(vec![4]);
+        let wrapper_id = NodeId::from_term_bytes(vec![5]);
+        let text_id = NodeId::from_term_bytes(vec![6]);
+        let mut tree = ElementTree::new();
+        tree.set_root_id(root_id);
+        tree.insert(Element::with_attrs(
+            root_id,
+            ElementKind::Row,
+            Vec::new(),
+            Attrs::default(),
+        ));
+        tree.insert(Element::with_attrs(
+            wrapper_id,
+            ElementKind::El,
+            Vec::new(),
+            Attrs::default(),
+        ));
+        tree.insert(Element::with_attrs(
+            text_id,
+            ElementKind::Text,
+            Vec::new(),
+            Attrs {
+                content: Some("Value: a".to_string()),
+                ..Attrs::default()
+            },
+        ));
+        tree.set_children(&root_id, vec![wrapper_id]).unwrap();
+        tree.set_children(&wrapper_id, vec![text_id]).unwrap();
+
+        let invalidation = apply_patches(
+            &mut tree,
+            vec![Patch::SetAttrs {
+                id: text_id,
+                attrs_raw: content_only_attrs_raw("Value: ab"),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(invalidation, TreeInvalidation::Measure);
+    }
+
+    fn fixed_content_attrs_raw(content: &str, width: f64, height: f64) -> Vec<u8> {
+        let mut raw = vec![0, 3, 1, 2];
+        raw.extend_from_slice(&width.to_be_bytes());
+        raw.extend_from_slice(&[2, 2]);
+        raw.extend_from_slice(&height.to_be_bytes());
+        raw.extend_from_slice(&content_attr_raw_tail(content));
+        raw
+    }
+
+    fn content_only_attrs_raw(content: &str) -> Vec<u8> {
+        let mut raw = vec![0, 1];
+        raw.extend_from_slice(&content_attr_raw_tail(content));
+        raw
+    }
+
+    fn content_attr_raw_tail(content: &str) -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.push(21);
+        raw.extend_from_slice(&(content.len() as u16).to_be_bytes());
+        raw.extend_from_slice(content.as_bytes());
+        raw
+    }
+
+    #[test]
     fn test_apply_patches_classifies_child_changes_as_structure() {
         let parent_id = NodeId::from_term_bytes(vec![1]);
         let child_id = NodeId::from_term_bytes(vec![2]);
@@ -2199,8 +2666,10 @@ mod tests {
     #[test]
     fn test_set_attrs_marks_text_input_content_as_tree_patch_when_content_present() {
         let id = NodeId::from_term_bytes(vec![17]);
-        let mut attrs = Attrs::default();
-        attrs.content = Some("before".to_string());
+        let attrs = Attrs {
+            content: Some("before".to_string()),
+            ..Attrs::default()
+        };
         let mut element = Element::with_attrs(id, ElementKind::TextInput, Vec::new(), attrs);
         element.runtime.text_input_content_origin = TextInputContentOrigin::Event;
 
@@ -2228,8 +2697,10 @@ mod tests {
     #[test]
     fn test_set_attrs_preserves_text_input_content_origin_when_content_absent() {
         let id = NodeId::from_term_bytes(vec![18]);
-        let mut attrs = Attrs::default();
-        attrs.content = Some("before".to_string());
+        let attrs = Attrs {
+            content: Some("before".to_string()),
+            ..Attrs::default()
+        };
         let mut element = Element::with_attrs(id, ElementKind::TextInput, Vec::new(), attrs);
         element.runtime.text_input_content_origin = TextInputContentOrigin::Event;
 
@@ -2255,9 +2726,11 @@ mod tests {
     #[test]
     fn test_set_attrs_buffers_focused_text_input_patch_content() {
         let id = NodeId::from_term_bytes(vec![181]);
-        let mut attrs = Attrs::default();
-        attrs.content = Some("before".to_string());
-        attrs.text_input_focused = Some(true);
+        let attrs = Attrs {
+            content: Some("before".to_string()),
+            text_input_focused: Some(true),
+            ..Attrs::default()
+        };
         let mut element = Element::with_attrs(id, ElementKind::TextInput, Vec::new(), attrs);
         element.runtime.text_input_content_origin = TextInputContentOrigin::Event;
 
@@ -2287,8 +2760,10 @@ mod tests {
     #[test]
     fn test_set_attrs_clears_patch_content_when_unfocused_text_input_accepts_patch() {
         let id = NodeId::from_term_bytes(vec![182]);
-        let mut attrs = Attrs::default();
-        attrs.content = Some("before".to_string());
+        let attrs = Attrs {
+            content: Some("before".to_string()),
+            ..Attrs::default()
+        };
         let mut element = Element::with_attrs(id, ElementKind::TextInput, Vec::new(), attrs);
         element.runtime.patch_content = Some("stale".to_string());
 
@@ -2311,6 +2786,40 @@ mod tests {
         assert_eq!(
             updated.runtime.text_input_content_origin,
             TextInputContentOrigin::TreePatch
+        );
+    }
+
+    #[test]
+    fn test_runtime_owned_slider_patch_matching_current_value_is_noop() {
+        let id = NodeId::from_term_bytes(vec![183]);
+        let attrs = Attrs {
+            slider_value: Some(60.0),
+            ..Attrs::default()
+        };
+        let mut element = Element::with_attrs(id, ElementKind::Slider, Vec::new(), attrs);
+        element.runtime.slider_value_origin = SliderValueOrigin::Event;
+
+        let mut tree = ElementTree::new();
+        tree.set_root_id(id);
+        tree.insert(element);
+
+        let invalidation = apply_patches(
+            &mut tree,
+            vec![Patch::SetAttrs {
+                id,
+                attrs_raw: slider_value_attrs_raw(60.0),
+            }],
+        )
+        .unwrap();
+
+        let updated = tree.get(&id).unwrap();
+        assert_eq!(invalidation, TreeInvalidation::None);
+        assert_eq!(updated.spec.declared.slider_value, Some(60.0));
+        assert_eq!(updated.layout.effective.slider_value, Some(60.0));
+        assert_eq!(updated.runtime.slider_patch_value, None);
+        assert_eq!(
+            updated.runtime.slider_value_origin,
+            SliderValueOrigin::Event
         );
     }
 
@@ -2411,17 +2920,19 @@ mod tests {
             Element::with_attrs(parent_id, ElementKind::El, Vec::new(), Attrs::default());
         parent.children = vec![child_id];
 
-        let mut child_attrs = Attrs::default();
-        child_attrs.content = Some("ghosted".to_string());
-        child_attrs.on_click = Some(true);
-        child_attrs.mouse_over = Some(crate::tree::attrs::MouseOverAttrs::default());
-        child_attrs.mouse_over_active = Some(true);
-        child_attrs.scrollbar_y = Some(true);
-        child_attrs.scroll_y = Some(12.0);
-        child_attrs.scroll_y_max = Some(40.0);
-        child_attrs.text_input_focused = Some(true);
-        child_attrs.text_input_cursor = Some(2);
-        child_attrs.animate_exit = Some(exit_alpha_spec());
+        let child_attrs = Attrs {
+            content: Some("ghosted".to_string()),
+            on_click: Some(true),
+            mouse_over: Some(crate::tree::attrs::MouseOverAttrs::default()),
+            mouse_over_active: Some(true),
+            scrollbar_y: Some(true),
+            scroll_y: Some(12.0),
+            scroll_y_max: Some(40.0),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(2),
+            animate_exit: Some(exit_alpha_spec()),
+            ..Attrs::default()
+        };
 
         let mut child =
             Element::with_attrs(child_id, ElementKind::TextInput, Vec::new(), child_attrs);
@@ -2471,8 +2982,10 @@ mod tests {
             Element::with_attrs(parent_id, ElementKind::El, Vec::new(), Attrs::default());
         parent.children = vec![removed_id];
 
-        let mut removed_attrs = Attrs::default();
-        removed_attrs.animate_exit = Some(exit_alpha_spec());
+        let removed_attrs = Attrs {
+            animate_exit: Some(exit_alpha_spec()),
+            ..Attrs::default()
+        };
         let mut removed =
             Element::with_attrs(removed_id, ElementKind::Row, Vec::new(), removed_attrs);
         removed.children = vec![text_id];

@@ -7,22 +7,25 @@ use emerge_skia::events::{
         build_registry_rebuild_cached_for_benchmark, build_registry_rebuild_for_benchmark,
     },
 };
+use emerge_skia::render_scene::RenderSceneSummary;
 use emerge_skia::tree::animation::{
     AnimationCurve, AnimationRepeat, AnimationRuntime, AnimationSpec,
 };
 use emerge_skia::tree::attrs::{Attrs, Length, Padding};
 use emerge_skia::tree::deserialize::decode_tree;
 use emerge_skia::tree::element::{
-    Element, ElementKind, ElementTree, NearbyMount, NearbySlot, NodeId,
+    Element, ElementKind, ElementTree, Frame, NearbyMount, NearbySlot, NodeId,
 };
 use emerge_skia::tree::invalidation::TreeInvalidation;
+#[cfg(feature = "bench-diagnostics")]
+use emerge_skia::tree::layout::layout_or_refresh_default_with_animation_and_invalidation_profile_for_benchmark;
 use emerge_skia::tree::layout::{
-    Constraint, layout_and_refresh_default, layout_and_refresh_default_uncached_for_benchmark,
-    layout_and_refresh_default_with_animation, layout_or_refresh_default_with_animation,
-    layout_or_refresh_default_with_animation_uncached_for_benchmark, layout_tree,
-    layout_tree_default, refresh, refresh_render_scene_cached_for_benchmark,
-    refresh_render_scene_uncached_for_benchmark, refresh_reusing_clean_registry_for_benchmark,
-    refresh_uncached_reusing_clean_registry_for_benchmark,
+    Constraint, layout_and_refresh_default, layout_and_refresh_default_with_animation,
+    layout_or_refresh_default_with_animation,
+    layout_or_refresh_default_with_animation_and_dirty_ids_reusing_clean_registry_for_benchmark,
+    layout_or_refresh_default_with_animation_and_invalidation_reusing_clean_registry_for_benchmark,
+    layout_tree, layout_tree_default, refresh, refresh_render_scene_for_benchmark,
+    refresh_reusing_clean_registry_for_benchmark,
 };
 use emerge_skia::tree::patch::{Patch, apply_patches, decode_patches};
 #[cfg(feature = "bench-diagnostics")]
@@ -35,7 +38,8 @@ use std::time::{Duration, Instant};
 use support::{
     CARD_COUNT, MockTextMeasurer, SCROLL_VIEWPORT_ROW_COUNT, TEXT_ROW_COUNT,
     animated_shadow_showcase, large_paint_rich_scroll_column, large_simple_scroll_column,
-    large_text_column, load_fixture, nested_card_grid, scrollable_animated_shadow_showcase,
+    large_text_column, load_fixture, nested_card_grid, rich_borders_shadow_showcase,
+    scrollable_animated_shadow_showcase, scrollable_rich_borders_shadow_showcase,
 };
 
 const RETAINED_FIXTURE_IDS: &[&str] = &[
@@ -73,6 +77,32 @@ const REGISTRY_REFRESH_REGRESSION_FIXTURE_CASES: &[(&str, &str)] = &[
     ("scroll_rich_500", "event_attr"),
     ("text_rich_500", "event_attr"),
 ];
+
+const EMERGE_DEMO_SHOWCASE_LAYOUT_EMRG: &[u8] =
+    include_bytes!("../../../bench/external_fixtures/emerge_demo_showcase_layout/full.emrg");
+const EMERGE_DEMO_SHOWCASE_BORDERS_EMRG: &[u8] =
+    include_bytes!("../../../bench/external_fixtures/emerge_demo_showcase_borders/full.emrg");
+const EMERGE_DEMO_SHOWCASE_INTERACTION_EMRG: &[u8] =
+    include_bytes!("../../../bench/external_fixtures/emerge_demo_showcase_interaction/full.emrg");
+const EMERGE_DEMO_SHOWCASE_INTERACTION_VIRTUAL_KEY_PATCH: &[u8] = include_bytes!(
+    "../../../bench/external_fixtures/emerge_demo_showcase_interaction/virtual_key_text_echo.patch"
+);
+const EMERGE_DEMO_SHOWCASE_INTERACTION_VIRTUAL_KEY_REVERSE_PATCH: &[u8] = include_bytes!(
+    "../../../bench/external_fixtures/emerge_demo_showcase_interaction/virtual_key_text_echo_reverse.patch"
+);
+const SHOWCASE_FRAME_MS: u64 = 16;
+const SHOWCASE_SCROLL_ID: NodeId = NodeId(33);
+const SHOWCASE_LAYOUT_VISIBLE_WIDTH: u32 = 1440;
+const SHOWCASE_LAYOUT_VISIBLE_HEIGHT: u32 = 900;
+const SHOWCASE_LAYOUT_VISIBLE_SCROLL_Y: f32 = 256.0;
+const SHOWCASE_INTERACTION_WIDTH: u32 = 1440;
+const SHOWCASE_INTERACTION_HEIGHT: u32 = 900;
+const SHOWCASE_INTERACTION_INITIAL_TEXT: &str = "quick brown fox";
+const SHOWCASE_INTERACTION_NEXT_TEXT: &str = "quick brown foxa";
+const SHOWCASE_BORDERS_SCREENSHOT_WIDTH: u32 = 1909;
+const SHOWCASE_BORDERS_SCREENSHOT_HEIGHT: u32 = 2148;
+const SHOWCASE_BORDERS_SCREENSHOT_SCALE: f32 = 1.5;
+const SHOWCASE_BORDERS_SCREENSHOT_SCROLL_Y: f32 = 952.0;
 
 fn bench_large_text_column(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("native/layout/list_text_{TEXT_ROW_COUNT}"));
@@ -563,18 +593,26 @@ fn set_first_child_animation(tree: &mut ElementTree, spec: AnimationSpec) {
 }
 
 fn layout_scale_animation_spec(from: f64, to: f64) -> AnimationSpec {
-    let mut from_attrs = Attrs::default();
-    from_attrs.layout_scale = Some(from);
-    let mut to_attrs = Attrs::default();
-    to_attrs.layout_scale = Some(to);
+    let from_attrs = Attrs {
+        layout_scale: Some(from),
+        ..Attrs::default()
+    };
+    let to_attrs = Attrs {
+        layout_scale: Some(to),
+        ..Attrs::default()
+    };
     animation_spec(from_attrs, to_attrs)
 }
 
 fn layout_rotate_animation_spec(from: f64, to: f64) -> AnimationSpec {
-    let mut from_attrs = Attrs::default();
-    from_attrs.layout_rotate = Some(from);
-    let mut to_attrs = Attrs::default();
-    to_attrs.layout_rotate = Some(to);
+    let from_attrs = Attrs {
+        layout_rotate: Some(from),
+        ..Attrs::default()
+    };
+    let to_attrs = Attrs {
+        layout_rotate: Some(to),
+        ..Attrs::default()
+    };
     animation_spec(from_attrs, to_attrs)
 }
 
@@ -584,28 +622,40 @@ fn layout_scale_with_width_animation_spec(
     from_width: f64,
     to_width: f64,
 ) -> AnimationSpec {
-    let mut from_attrs = Attrs::default();
-    from_attrs.layout_scale = Some(from_scale);
-    from_attrs.width = Some(Length::Px(from_width));
-    let mut to_attrs = Attrs::default();
-    to_attrs.layout_scale = Some(to_scale);
-    to_attrs.width = Some(Length::Px(to_width));
+    let from_attrs = Attrs {
+        layout_scale: Some(from_scale),
+        width: Some(Length::Px(from_width)),
+        ..Attrs::default()
+    };
+    let to_attrs = Attrs {
+        layout_scale: Some(to_scale),
+        width: Some(Length::Px(to_width)),
+        ..Attrs::default()
+    };
     animation_spec(from_attrs, to_attrs)
 }
 
 fn paint_scale_animation_spec(from: f64, to: f64) -> AnimationSpec {
-    let mut from_attrs = Attrs::default();
-    from_attrs.scale = Some(from);
-    let mut to_attrs = Attrs::default();
-    to_attrs.scale = Some(to);
+    let from_attrs = Attrs {
+        scale: Some(from),
+        ..Attrs::default()
+    };
+    let to_attrs = Attrs {
+        scale: Some(to),
+        ..Attrs::default()
+    };
     animation_spec(from_attrs, to_attrs)
 }
 
 fn paint_rotate_animation_spec(from: f64, to: f64) -> AnimationSpec {
-    let mut from_attrs = Attrs::default();
-    from_attrs.rotate = Some(from);
-    let mut to_attrs = Attrs::default();
-    to_attrs.rotate = Some(to);
+    let from_attrs = Attrs {
+        rotate: Some(from),
+        ..Attrs::default()
+    };
+    let to_attrs = Attrs {
+        rotate: Some(to),
+        ..Attrs::default()
+    };
     animation_spec(from_attrs, to_attrs)
 }
 
@@ -625,13 +675,35 @@ fn first_root_child_id(tree: &ElementTree) -> Option<NodeId> {
 
 // Apply each patch during setup so the timed body is the first layout after invalidation.
 fn bench_animated_shadow_showcase(c: &mut Criterion) {
-    let mut group = c.benchmark_group("native/layout_animation_paint_only/shadow_showcase");
-    let constraint = Constraint::new(960.0, 4_000.0);
+    bench_animation_paint_only_showcase(
+        c,
+        "native/layout_animation_paint_only/shadow_showcase",
+        Constraint::new(960.0, 4_000.0),
+        animated_shadow_showcase,
+    );
+}
+
+fn bench_rich_borders_shadow_showcase(c: &mut Criterion) {
+    bench_animation_paint_only_showcase(
+        c,
+        "native/layout_animation_paint_only/rich_borders_showcase",
+        Constraint::new(960.0, 4_000.0),
+        rich_borders_shadow_showcase,
+    );
+}
+
+fn bench_animation_paint_only_showcase(
+    c: &mut Criterion,
+    group_name: &str,
+    constraint: Constraint,
+    make_tree: fn() -> ElementTree,
+) {
+    let mut group = c.benchmark_group(group_name);
     let start = Instant::now();
-    let node_count = animated_shadow_showcase().len() as u64;
+    let node_count = make_tree().len() as u64;
     group.throughput(Throughput::Elements(node_count));
 
-    let mut full_tree = animated_shadow_showcase();
+    let mut full_tree = make_tree();
     let mut full_runtime = AnimationRuntime::default();
     full_runtime.sync_with_tree(&full_tree, start);
     layout_and_refresh_default_with_animation(
@@ -660,7 +732,7 @@ fn bench_animated_shadow_showcase(c: &mut Criterion) {
         });
     });
 
-    let mut refresh_tree = animated_shadow_showcase();
+    let mut refresh_tree = make_tree();
     let mut refresh_runtime = AnimationRuntime::default();
     refresh_runtime.sync_with_tree(&refresh_tree, start);
     layout_and_refresh_default_with_animation(
@@ -693,13 +765,1690 @@ fn bench_animated_shadow_showcase(c: &mut Criterion) {
 }
 
 fn bench_scrolling_animated_shadow_showcase(c: &mut Criterion) {
-    let mut group = c.benchmark_group("native/layout_scroll_paint_only_animation/shadow_showcase");
-    let constraint = Constraint::new(960.0, 640.0);
+    bench_scrolling_animation_paint_only_showcase(
+        c,
+        "native/layout_scroll_paint_only_animation/shadow_showcase",
+        Constraint::new(960.0, 640.0),
+        scrollable_animated_shadow_showcase,
+    );
+}
+
+fn bench_scrolling_rich_borders_shadow_showcase(c: &mut Criterion) {
+    bench_scrolling_animation_paint_only_showcase(
+        c,
+        "native/layout_scroll_paint_only_animation/rich_borders_showcase",
+        Constraint::new(960.0, 900.0),
+        scrollable_rich_borders_shadow_showcase,
+    );
+}
+
+fn bench_emerge_demo_showcase_layout_refresh(c: &mut Criterion) {
+    let mut group = c.benchmark_group("native/layout_refresh/emerge_demo_showcase");
+
+    let mut layout_case = ShowcaseLayoutVisibleAnimationCase::new();
+    group.throughput(Throughput::Elements(
+        layout_case.initial_summary.nodes as u64,
+    ));
+    group.bench_function("layout_page_visible_animated_row", |b| {
+        b.iter(|| {
+            let update = layout_case.next_frame();
+            assert!(update.layout_performed);
+            black_box(update.output.scene.nodes.len())
+        });
+    });
+
+    let mut hover_case = ShowcaseBordersHoverCase::new();
+    group.throughput(Throughput::Elements(
+        hover_case.initial_summary.nodes as u64,
+    ));
+    group.bench_function("borders_screenshot_hover_visible_targets", |b| {
+        b.iter(|| {
+            let update = hover_case.next_hover_frame();
+            black_box((update.layout_performed, update.output.scene.nodes.len()))
+        });
+    });
+
+    let mut held_nearby_case = ShowcaseBordersHeldNearbyCase::new();
+    group.throughput(Throughput::Elements(
+        held_nearby_case.initial_summary.nodes as u64,
+    ));
+    group.bench_function("borders_screenshot_held_nearby_refresh", |b| {
+        b.iter(|| {
+            let update = held_nearby_case.next_frame();
+            black_box((update.layout_performed, update.output.scene.nodes.len()))
+        });
+    });
+
+    let mut interaction_case = ShowcaseInteractionVirtualKeyboardCase::new();
+    group.throughput(Throughput::Elements(
+        interaction_case.initial_summary.nodes as u64,
+    ));
+    group.bench_function("interaction_virtual_keyboard_text_echo", |b| {
+        b.iter(|| {
+            let update = interaction_case.next_text_echo_frame();
+            black_box((update.layout_performed, update.output.scene.nodes.len()))
+        });
+    });
+
+    let mut interaction_key_case = ShowcaseInteractionVirtualKeyFullLoopCase::new();
+    group.throughput(Throughput::Elements(
+        interaction_key_case.initial_summary.nodes as u64,
+    ));
+    group.bench_function("interaction_virtual_key_full_loop", |b| {
+        b.iter(|| {
+            let update = interaction_key_case.next_frame();
+            black_box((update.layout_performed, update.output.scene.nodes.len()))
+        });
+    });
+
+    let mut interaction_scroll_case = ShowcaseInteractionScrollCase::new();
+    group.throughput(Throughput::Elements(
+        interaction_scroll_case.initial_summary.nodes as u64,
+    ));
+    group.bench_function("interaction_scroll_step_cached_refresh", |b| {
+        b.iter(|| {
+            let update = interaction_scroll_case.next_scroll_frame();
+            black_box((update.layout_performed, update.output.scene.nodes.len()))
+        });
+    });
+
+    group.finish();
+}
+
+struct ShowcaseLayoutVisibleAnimationCase {
+    tree: ElementTree,
+    runtime: AnimationRuntime,
+    cached_rebuild: RegistryRebuildPayload,
+    started_at: Instant,
+    target: ShowcaseLayoutTarget,
+    next_frame: u64,
+    initial_summary: RenderSceneSummary,
+}
+
+impl ShowcaseLayoutVisibleAnimationCase {
+    fn new() -> Self {
+        let started_at = Instant::now();
+        let tree =
+            decode_tree(EMERGE_DEMO_SHOWCASE_LAYOUT_EMRG).expect("layout fixture should decode");
+        let mut runtime = AnimationRuntime::default();
+        runtime.sync_with_tree(&tree, started_at);
+        let target = ShowcaseLayoutTarget::visible_animation_fixture();
+        if std::env::var_os("EMERGE_BENCH_DIAGNOSTICS").is_some() {
+            eprintln!("showcase layout visible target: {target:?}");
+        }
+        let constraint = Constraint::new(target.width as f32, target.height as f32);
+        let mut tree = tree.clone();
+        let initial = layout_and_refresh_default_with_animation(
+            &mut tree, constraint, 1.0, &runtime, started_at,
+        );
+        tree.apply_scroll_y(&target.scroll_id, -target.scroll_y);
+        let warm = layout_or_refresh_default_with_animation_and_invalidation_reusing_clean_registry_for_benchmark(
+            &mut tree,
+            constraint,
+            1.0,
+            &runtime,
+            started_at,
+            TreeInvalidation::None,
+            Some(&initial.event_rebuild),
+        );
+        assert!(
+            warm.layout_performed,
+            "showcase layout visible animation should require layout: target={target:?}"
+        );
+        let initial_summary = warm.output.scene.summary();
+        assert!(
+            initial_summary.dynamic_layers > 0
+                && initial_summary.nodes >= 600
+                && initial_summary.texts >= 100,
+            "showcase layout visible animation selected the wrong scene: \
+             target={target:?}, summary={initial_summary:?}"
+        );
+
+        let cached_rebuild = if warm.output.event_rebuild_changed {
+            warm.output.event_rebuild
+        } else {
+            initial.event_rebuild
+        };
+        #[cfg(feature = "bench-diagnostics")]
+        if std::env::var_os("EMERGE_BENCH_DIAGNOSTICS").is_some() {
+            sample_showcase_layout_profile(
+                tree.clone(),
+                runtime.clone(),
+                cached_rebuild.clone(),
+                started_at,
+                target,
+            );
+        }
+
+        Self {
+            tree,
+            runtime,
+            cached_rebuild,
+            started_at,
+            target,
+            next_frame: 1,
+            initial_summary,
+        }
+    }
+
+    fn next_frame(&mut self) -> emerge_skia::tree::layout::LayoutUpdateOutput {
+        self.next_frame = self.next_frame.saturating_add(1);
+        let update = layout_or_refresh_default_with_animation_and_invalidation_reusing_clean_registry_for_benchmark(
+            &mut self.tree,
+            Constraint::new(self.target.width as f32, self.target.height as f32),
+            1.0,
+            &self.runtime,
+            self.started_at + Duration::from_millis(self.next_frame.saturating_mul(SHOWCASE_FRAME_MS)),
+            TreeInvalidation::None,
+            Some(&self.cached_rebuild),
+        );
+
+        if update.output.event_rebuild_changed {
+            self.cached_rebuild = update.output.event_rebuild.clone();
+        }
+
+        update
+    }
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn sample_showcase_layout_profile(
+    mut tree: ElementTree,
+    runtime: AnimationRuntime,
+    mut cached_rebuild: RegistryRebuildPayload,
+    started_at: Instant,
+    target: ShowcaseLayoutTarget,
+) {
+    let constraint = Constraint::new(target.width as f32, target.height as f32);
+    for frame in 1..=6_u64 {
+        let (update, profile) =
+            layout_or_refresh_default_with_animation_and_invalidation_profile_for_benchmark(
+                &mut tree,
+                constraint,
+                1.0,
+                &runtime,
+                started_at + Duration::from_millis(frame.saturating_mul(SHOWCASE_FRAME_MS)),
+                TreeInvalidation::None,
+                Some(&cached_rebuild),
+            );
+        if update.output.event_rebuild_changed {
+            cached_rebuild = update.output.event_rebuild;
+        }
+        eprintln!(
+            "showcase layout profile frame={frame} prepare={:.3}ms layout={:.3}ms refresh={:.3}ms render_scene={:.3}ms registry={:.3}ms layout_performed={} scene_nodes={} render_visits={} culled={} registry_visits={} registry_hits={} registry_stores={} registry_damaged={} registry_ineligible={} registry_misses={} pre_registry_damage={} registry_damage={} registry_damage_nodes={}",
+            profile.prepare.as_secs_f64() * 1000.0,
+            profile.layout.as_secs_f64() * 1000.0,
+            profile.refresh.as_secs_f64() * 1000.0,
+            profile.render_scene.as_secs_f64() * 1000.0,
+            profile.registry.as_secs_f64() * 1000.0,
+            profile.layout_performed,
+            profile.scene_nodes,
+            profile.render_visits,
+            profile.culled_subtrees,
+            profile.registry_visits,
+            profile.registry_cache_hits,
+            profile.registry_cache_stores,
+            profile.registry_cache_damaged,
+            profile.registry_cache_ineligible,
+            profile.registry_cache_misses,
+            profile.pre_layout_registry_damage,
+            profile.registry_damage,
+            profile.registry_damage_nodes
+        );
+        if frame == 1 {
+            eprintln!(
+                "showcase layout scene summary: {:?}",
+                update.output.scene.summary()
+            );
+            print_showcase_paint_layers(&update.output.scene.nodes, 0);
+        }
+    }
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn print_showcase_paint_layers(nodes: &[emerge_skia::render_scene::RenderNode], depth: usize) {
+    for node in nodes {
+        match node {
+            emerge_skia::render_scene::RenderNode::PaintLayer(layer) => {
+                let indent = "  ".repeat(depth);
+                eprintln!(
+                    "{indent}layer stable={} root={} reason={:?} policy={:?} bounds=({:.1},{:.1},{:.1},{:.1}) own_nodes={} own_primitives={} own_cost={} child_refs={} generation={}",
+                    layer.stable_id,
+                    layer.root_id,
+                    layer.reason,
+                    layer.policy,
+                    layer.bounds.x,
+                    layer.bounds.y,
+                    layer.bounds.width,
+                    layer.bounds.height,
+                    layer.own_nodes.len(),
+                    layer.metrics.own_primitive_count,
+                    layer.metrics.own_primitive_cost,
+                    layer.child_refs.len(),
+                    layer.content_generation
+                );
+                print_showcase_paint_layers(&layer.own_nodes, depth + 1);
+                for child_ref in layer.child_refs.iter() {
+                    print_showcase_paint_layers(&child_ref.nodes, depth + 1);
+                }
+            }
+            emerge_skia::render_scene::RenderNode::Clip { children, .. }
+            | emerge_skia::render_scene::RenderNode::RelaxedClip { children, .. }
+            | emerge_skia::render_scene::RenderNode::Transform { children, .. }
+            | emerge_skia::render_scene::RenderNode::Alpha { children, .. }
+            | emerge_skia::render_scene::RenderNode::ShadowPass { children } => {
+                print_showcase_paint_layers(children, depth);
+            }
+            emerge_skia::render_scene::RenderNode::Primitive(_) => {}
+        }
+    }
+}
+
+struct ShowcaseBordersHoverCase {
+    tree: ElementTree,
+    runtime: AnimationRuntime,
+    cached_rebuild: RegistryRebuildPayload,
+    started_at: Instant,
+    target: ShowcaseBordersTarget,
+    hover_ids: Vec<NodeId>,
+    active_id: Option<NodeId>,
+    next_hover: usize,
+    next_frame: u64,
+    initial_summary: RenderSceneSummary,
+}
+
+impl ShowcaseBordersHoverCase {
+    fn new() -> Self {
+        let started_at = Instant::now();
+        let tree =
+            decode_tree(EMERGE_DEMO_SHOWCASE_BORDERS_EMRG).expect("Borders fixture should decode");
+        let mut runtime = AnimationRuntime::default();
+        runtime.sync_with_tree(&tree, started_at);
+        let target = ShowcaseBordersTarget::screenshot_fixture();
+        if std::env::var_os("EMERGE_BENCH_DIAGNOSTICS").is_some() {
+            eprintln!("showcase Borders hover target: {target:?}");
+        }
+        let constraint = target.constraint();
+        let mut tree = tree.clone();
+        let initial = layout_and_refresh_default_with_animation(
+            &mut tree,
+            constraint,
+            target.scale,
+            &runtime,
+            started_at,
+        );
+        tree.apply_scroll_y(&target.scroll_id, -target.scroll_y);
+        let warm = layout_or_refresh_default_with_animation_and_invalidation_reusing_clean_registry_for_benchmark(
+            &mut tree,
+            constraint,
+            target.scale,
+            &runtime,
+            started_at,
+            TreeInvalidation::None,
+            Some(&initial.event_rebuild),
+        );
+        let initial_summary = warm.output.scene.summary();
+        assert!(
+            initial_summary.nodes >= 500
+                && initial_summary.texts >= 100
+                && initial_summary.paint_layers >= 8,
+            "Borders hover benchmark selected the wrong scene: \
+             target={target:?}, summary={initial_summary:?}"
+        );
+        let hover_ids = visible_hover_targets(&tree, target.width, target.height);
+        assert!(
+            hover_ids.len() >= 3,
+            "Borders hover benchmark needs several visible hover targets: \
+             target={target:?}, summary={:?}, hover_ids={hover_ids:?}",
+            initial_summary
+        );
+
+        let cached_rebuild = if warm.output.event_rebuild_changed {
+            warm.output.event_rebuild
+        } else {
+            initial.event_rebuild
+        };
+        #[cfg(feature = "bench-diagnostics")]
+        if std::env::var_os("EMERGE_BENCH_DIAGNOSTICS").is_some() {
+            sample_showcase_borders_hover_profile(
+                tree.clone(),
+                runtime.clone(),
+                cached_rebuild.clone(),
+                started_at,
+                target,
+                hover_ids[0],
+            );
+        }
+
+        Self {
+            tree,
+            runtime,
+            cached_rebuild,
+            started_at,
+            target,
+            hover_ids,
+            active_id: None,
+            next_hover: 0,
+            next_frame: 1,
+            initial_summary,
+        }
+    }
+
+    fn next_hover_frame(&mut self) -> emerge_skia::tree::layout::LayoutUpdateOutput {
+        let next_id = self.hover_ids[self.next_hover % self.hover_ids.len()];
+        self.next_hover = self.next_hover.wrapping_add(1);
+        self.next_frame = self.next_frame.saturating_add(1);
+
+        let mut dirty_ids = Vec::new();
+        let mut invalidation = self
+            .active_id
+            .map(|id| {
+                let invalidation = self.tree.set_mouse_over_active(&id, false);
+                record_frame_attr_dirty_id(&mut dirty_ids, id, invalidation);
+                invalidation
+            })
+            .unwrap_or(TreeInvalidation::None);
+        let next_invalidation = self.tree.set_mouse_over_active(&next_id, true);
+        record_frame_attr_dirty_id(&mut dirty_ids, next_id, next_invalidation);
+        invalidation.add(next_invalidation);
+        self.active_id = Some(next_id);
+
+        let update = layout_or_refresh_default_with_animation_and_dirty_ids_reusing_clean_registry_for_benchmark(
+            &mut self.tree,
+            self.target.constraint(),
+            self.target.scale,
+            &self.runtime,
+            self.started_at + Duration::from_millis(self.next_frame.saturating_mul(SHOWCASE_FRAME_MS)),
+            invalidation,
+            &dirty_ids,
+            Some(&self.cached_rebuild),
+        );
+
+        if update.output.event_rebuild_changed {
+            self.cached_rebuild = update.output.event_rebuild.clone();
+        }
+
+        update
+    }
+}
+
+struct ShowcaseBordersHeldNearbyCase {
+    tree: ElementTree,
+    runtime: AnimationRuntime,
+    cached_rebuild: RegistryRebuildPayload,
+    started_at: Instant,
+    target: ShowcaseBordersTarget,
+    next_frame: u64,
+    initial_summary: RenderSceneSummary,
+}
+
+impl ShowcaseBordersHeldNearbyCase {
+    fn new() -> Self {
+        let started_at = Instant::now();
+        let tree =
+            decode_tree(EMERGE_DEMO_SHOWCASE_BORDERS_EMRG).expect("Borders fixture should decode");
+        let mut runtime = AnimationRuntime::default();
+        runtime.sync_with_tree(&tree, started_at);
+        let target = ShowcaseBordersTarget::screenshot_fixture();
+        let constraint = target.constraint();
+        let mut tree = tree.clone();
+        let initial = layout_and_refresh_default_with_animation(
+            &mut tree,
+            constraint,
+            target.scale,
+            &runtime,
+            started_at,
+        );
+        tree.apply_scroll_y(&target.scroll_id, -target.scroll_y);
+        let warm = layout_or_refresh_default_with_animation_and_invalidation_reusing_clean_registry_for_benchmark(
+            &mut tree,
+            constraint,
+            target.scale,
+            &runtime,
+            started_at,
+            TreeInvalidation::None,
+            Some(&initial.event_rebuild),
+        );
+        let mut cached_rebuild = if warm.output.event_rebuild_changed {
+            warm.output.event_rebuild
+        } else {
+            initial.event_rebuild
+        };
+
+        let hover_ids = visible_hover_targets(&tree, target.width, target.height);
+        let host_id = *hover_ids
+            .first()
+            .expect("held nearby benchmark needs one visible hover host");
+        let invalidation = apply_patches(
+            &mut tree,
+            vec![Patch::InsertNearbySubtree {
+                host_id,
+                index: 0,
+                slot: NearbySlot::Above,
+                subtree: nearby_code_block_subtree(920_000),
+            }],
+        )
+        .expect("held nearby patch should apply");
+        let mounted = layout_or_refresh_default_with_animation_and_invalidation_reusing_clean_registry_for_benchmark(
+            &mut tree,
+            constraint,
+            target.scale,
+            &runtime,
+            started_at + Duration::from_millis(SHOWCASE_FRAME_MS),
+            invalidation,
+            Some(&cached_rebuild),
+        );
+        cached_rebuild = if mounted.output.event_rebuild_changed {
+            mounted.output.event_rebuild
+        } else {
+            cached_rebuild
+        };
+        let warm_held = layout_or_refresh_default_with_animation_and_invalidation_reusing_clean_registry_for_benchmark(
+            &mut tree,
+            constraint,
+            target.scale,
+            &runtime,
+            started_at + Duration::from_millis(SHOWCASE_FRAME_MS * 2),
+            TreeInvalidation::None,
+            Some(&cached_rebuild),
+        );
+        if warm_held.output.event_rebuild_changed {
+            cached_rebuild = warm_held.output.event_rebuild;
+        }
+
+        let initial_summary = warm_held.output.scene.summary();
+        assert!(
+            initial_summary.nodes >= 500
+                && initial_summary.texts >= 100
+                && initial_summary.paint_layers >= 8,
+            "Borders held-nearby benchmark selected the wrong scene: \
+             target={target:?}, summary={initial_summary:?}"
+        );
+
+        Self {
+            tree,
+            runtime,
+            cached_rebuild,
+            started_at,
+            target,
+            next_frame: 3,
+            initial_summary,
+        }
+    }
+
+    fn next_frame(&mut self) -> emerge_skia::tree::layout::LayoutUpdateOutput {
+        self.next_frame = self.next_frame.saturating_add(1);
+        let update = layout_or_refresh_default_with_animation_and_invalidation_reusing_clean_registry_for_benchmark(
+            &mut self.tree,
+            self.target.constraint(),
+            self.target.scale,
+            &self.runtime,
+            self.started_at + Duration::from_millis(self.next_frame.saturating_mul(SHOWCASE_FRAME_MS)),
+            TreeInvalidation::None,
+            Some(&self.cached_rebuild),
+        );
+
+        if update.output.event_rebuild_changed {
+            self.cached_rebuild = update.output.event_rebuild.clone();
+        }
+
+        update
+    }
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn sample_showcase_borders_hover_profile(
+    tree: ElementTree,
+    runtime: AnimationRuntime,
+    cached_rebuild: RegistryRebuildPayload,
+    started_at: Instant,
+    target: ShowcaseBordersTarget,
+    hover_id: NodeId,
+) {
+    sample_showcase_borders_steady_profile(
+        "no_hover",
+        tree.clone(),
+        runtime.clone(),
+        cached_rebuild.clone(),
+        started_at,
+        target,
+        TreeInvalidation::None,
+    );
+
+    let mut hovered_tree = tree;
+    let hover_invalidation = hovered_tree.set_mouse_over_active(&hover_id, true);
+    sample_showcase_borders_steady_profile(
+        "hovered",
+        hovered_tree,
+        runtime,
+        cached_rebuild,
+        started_at,
+        target,
+        hover_invalidation,
+    );
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn sample_showcase_borders_steady_profile(
+    label: &str,
+    mut tree: ElementTree,
+    runtime: AnimationRuntime,
+    mut cached_rebuild: RegistryRebuildPayload,
+    started_at: Instant,
+    target: ShowcaseBordersTarget,
+    first_invalidation: TreeInvalidation,
+) {
+    for frame in 1..=4_u64 {
+        let invalidation = if frame == 1 {
+            first_invalidation
+        } else {
+            TreeInvalidation::None
+        };
+        let (update, profile) =
+            layout_or_refresh_default_with_animation_and_invalidation_profile_for_benchmark(
+                &mut tree,
+                target.constraint(),
+                target.scale,
+                &runtime,
+                started_at + Duration::from_millis(frame.saturating_mul(SHOWCASE_FRAME_MS)),
+                invalidation,
+                Some(&cached_rebuild),
+            );
+        if update.output.event_rebuild_changed {
+            cached_rebuild = update.output.event_rebuild;
+        }
+        eprintln!(
+            "showcase Borders {label} profile frame={frame} invalidation={:?} prepare={:.3}ms layout={:.3}ms refresh={:.3}ms render_scene={:.3}ms registry={:.3}ms layout_performed={} event_rebuild_changed={} scene_nodes={} render_visits={} culled={} registry_visits={} registry_hits={} registry_stores={} registry_damaged={} registry_ineligible={} registry_misses={} pre_registry_damage={} registry_damage={} registry_damage_nodes={} summary={:?}",
+            invalidation,
+            profile.prepare.as_secs_f64() * 1000.0,
+            profile.layout.as_secs_f64() * 1000.0,
+            profile.refresh.as_secs_f64() * 1000.0,
+            profile.render_scene.as_secs_f64() * 1000.0,
+            profile.registry.as_secs_f64() * 1000.0,
+            profile.layout_performed,
+            update.output.event_rebuild_changed,
+            profile.scene_nodes,
+            profile.render_visits,
+            profile.culled_subtrees,
+            profile.registry_visits,
+            profile.registry_cache_hits,
+            profile.registry_cache_stores,
+            profile.registry_cache_damaged,
+            profile.registry_cache_ineligible,
+            profile.registry_cache_misses,
+            profile.pre_layout_registry_damage,
+            profile.registry_damage,
+            profile.registry_damage_nodes,
+            update.output.scene.summary()
+        );
+    }
+}
+
+struct ShowcaseInteractionVirtualKeyboardCase {
+    tree: ElementTree,
+    runtime: AnimationRuntime,
+    cached_rebuild: RegistryRebuildPayload,
+    started_at: Instant,
+    target: ShowcaseInteractionTarget,
+    forward_patches: Vec<Patch>,
+    reverse_patches: Vec<Patch>,
+    next_forward: bool,
+    next_frame: u64,
+    initial_summary: RenderSceneSummary,
+}
+
+impl ShowcaseInteractionVirtualKeyboardCase {
+    fn new() -> Self {
+        let started_at = Instant::now();
+        let tree = decode_tree(EMERGE_DEMO_SHOWCASE_INTERACTION_EMRG)
+            .expect("Interaction fixture should decode");
+        let mut runtime = AnimationRuntime::default();
+        runtime.sync_with_tree(&tree, started_at);
+        let constraint = Constraint::new(
+            SHOWCASE_INTERACTION_WIDTH as f32,
+            SHOWCASE_INTERACTION_HEIGHT as f32,
+        );
+        let mut tree = tree.clone();
+        let initial = layout_and_refresh_default_with_animation(
+            &mut tree, constraint, 1.0, &runtime, started_at,
+        );
+        let target = ShowcaseInteractionTarget::from_laid_out_tree(
+            &tree,
+            SHOWCASE_INTERACTION_WIDTH,
+            SHOWCASE_INTERACTION_HEIGHT,
+        );
+        if std::env::var_os("EMERGE_BENCH_DIAGNOSTICS").is_some() {
+            eprintln!("showcase Interaction virtual keyboard target: {target:?}");
+            if let Some(element) = tree.get(&target.text_input_id) {
+                eprintln!(
+                    "showcase Interaction virtual keyboard input kind={:?} width={:?} height={:?} frame={:?}",
+                    element.spec.kind,
+                    element.layout.effective.width,
+                    element.layout.effective.height,
+                    element.layout.frame
+                );
+            }
+        }
+
+        let mut warm_invalidation = tree.apply_scroll_y(&target.scroll_id, -target.scroll_y);
+        warm_invalidation.add(tree.set_text_input_runtime(
+            &target.text_input_id,
+            true,
+            Some(SHOWCASE_INTERACTION_INITIAL_TEXT.chars().count() as u32),
+            None,
+            None,
+            None,
+        ));
+        let warm =
+            layout_or_refresh_default_with_animation_and_invalidation_reusing_clean_registry_for_benchmark(
+                &mut tree,
+                constraint,
+                1.0,
+                &runtime,
+                started_at,
+                warm_invalidation,
+                Some(&initial.event_rebuild),
+            );
+        let initial_summary = warm.output.scene.summary();
+        let virtual_key_count = virtual_key_count(&tree);
+        assert!(
+            initial_summary.nodes >= 700
+                && initial_summary.texts >= 200
+                && virtual_key_count >= 30
+                && tree
+                    .get(&target.text_input_id)
+                    .and_then(|element| element.layout.frame)
+                    .is_some(),
+            "Interaction virtual keyboard benchmark selected the wrong scene: \
+             target={target:?}, summary={initial_summary:?}, virtual_keys={virtual_key_count}"
+        );
+
+        let cached_rebuild = if warm.output.event_rebuild_changed {
+            warm.output.event_rebuild
+        } else {
+            initial.event_rebuild
+        };
+        let forward_patches = decode_patches(EMERGE_DEMO_SHOWCASE_INTERACTION_VIRTUAL_KEY_PATCH)
+            .expect("Interaction virtual-key forward patch should decode");
+        let reverse_patches =
+            decode_patches(EMERGE_DEMO_SHOWCASE_INTERACTION_VIRTUAL_KEY_REVERSE_PATCH)
+                .expect("Interaction virtual-key reverse patch should decode");
+        assert!(
+            !forward_patches.is_empty() && !reverse_patches.is_empty(),
+            "Interaction virtual-key benchmark patches should not be empty"
+        );
+        #[cfg(feature = "bench-diagnostics")]
+        if std::env::var_os("EMERGE_BENCH_DIAGNOSTICS").is_some() {
+            sample_showcase_interaction_profile(
+                tree.clone(),
+                runtime.clone(),
+                cached_rebuild.clone(),
+                started_at,
+                target,
+                forward_patches.clone(),
+                reverse_patches.clone(),
+            );
+        }
+
+        Self {
+            tree,
+            runtime,
+            cached_rebuild,
+            started_at,
+            target,
+            forward_patches,
+            reverse_patches,
+            next_forward: true,
+            next_frame: 1,
+            initial_summary,
+        }
+    }
+
+    fn next_text_echo_frame(&mut self) -> emerge_skia::tree::layout::LayoutUpdateOutput {
+        self.next_frame = self.next_frame.saturating_add(1);
+        let (content, patches) = if self.next_forward {
+            (SHOWCASE_INTERACTION_NEXT_TEXT, &self.forward_patches)
+        } else {
+            (SHOWCASE_INTERACTION_INITIAL_TEXT, &self.reverse_patches)
+        };
+        self.next_forward = !self.next_forward;
+
+        let cursor = content.chars().count() as u32;
+        let mut dirty_ids = Vec::new();
+        let mut invalidation = self
+            .tree
+            .set_text_input_content(&self.target.text_input_id, content.to_string());
+        record_frame_attr_dirty_id(&mut dirty_ids, self.target.text_input_id, invalidation);
+        let runtime_invalidation = self.tree.set_text_input_runtime(
+            &self.target.text_input_id,
+            true,
+            Some(cursor),
+            None,
+            None,
+            None,
+        );
+        record_frame_attr_dirty_id(
+            &mut dirty_ids,
+            self.target.text_input_id,
+            runtime_invalidation,
+        );
+        invalidation.add(runtime_invalidation);
+        let patch_dirty_ids = patch_set_attrs_ids(patches);
+        let patch_invalidation = apply_patches(&mut self.tree, patches.clone())
+            .expect("Interaction virtual-key echo patch applies");
+        if patch_invalidation.can_refresh_only()
+            && let Some(ids) = patch_dirty_ids
+        {
+            extend_frame_attr_dirty_ids(&mut dirty_ids, ids);
+        }
+        invalidation.add(patch_invalidation);
+
+        let update =
+            layout_or_refresh_default_with_animation_and_dirty_ids_reusing_clean_registry_for_benchmark(
+                &mut self.tree,
+                Constraint::new(
+                    SHOWCASE_INTERACTION_WIDTH as f32,
+                    SHOWCASE_INTERACTION_HEIGHT as f32,
+                ),
+                1.0,
+                &self.runtime,
+                self.started_at
+                    + Duration::from_millis(self.next_frame.saturating_mul(SHOWCASE_FRAME_MS)),
+                invalidation,
+                &dirty_ids,
+                Some(&self.cached_rebuild),
+            );
+
+        if update.output.event_rebuild_changed {
+            self.cached_rebuild = update.output.event_rebuild.clone();
+        }
+
+        update
+    }
+}
+
+struct ShowcaseInteractionVirtualKeyFullLoopCase {
+    tree: ElementTree,
+    runtime: AnimationRuntime,
+    cached_rebuild: RegistryRebuildPayload,
+    started_at: Instant,
+    target: ShowcaseInteractionTarget,
+    virtual_key_id: NodeId,
+    hover_id: Option<NodeId>,
+    forward_patches: Vec<Patch>,
+    reverse_patches: Vec<Patch>,
+    next_forward: bool,
+    next_frame: u64,
+    phase: u8,
+    initial_summary: RenderSceneSummary,
+}
+
+impl ShowcaseInteractionVirtualKeyFullLoopCase {
+    fn new() -> Self {
+        let started_at = Instant::now();
+        let tree = decode_tree(EMERGE_DEMO_SHOWCASE_INTERACTION_EMRG)
+            .expect("Interaction fixture should decode");
+        let mut runtime = AnimationRuntime::default();
+        runtime.sync_with_tree(&tree, started_at);
+        let constraint = Constraint::new(
+            SHOWCASE_INTERACTION_WIDTH as f32,
+            SHOWCASE_INTERACTION_HEIGHT as f32,
+        );
+        let mut tree = tree.clone();
+        let initial = layout_and_refresh_default_with_animation(
+            &mut tree, constraint, 1.0, &runtime, started_at,
+        );
+        let target = ShowcaseInteractionTarget::from_laid_out_tree(
+            &tree,
+            SHOWCASE_INTERACTION_WIDTH,
+            SHOWCASE_INTERACTION_HEIGHT,
+        );
+        let mut warm_invalidation = tree.apply_scroll_y(&target.scroll_id, -target.scroll_y);
+        warm_invalidation.add(tree.set_text_input_runtime(
+            &target.text_input_id,
+            true,
+            Some(SHOWCASE_INTERACTION_INITIAL_TEXT.chars().count() as u32),
+            None,
+            None,
+            None,
+        ));
+        let warm =
+            layout_or_refresh_default_with_animation_and_invalidation_reusing_clean_registry_for_benchmark(
+                &mut tree,
+                constraint,
+                1.0,
+                &runtime,
+                started_at,
+                warm_invalidation,
+                Some(&initial.event_rebuild),
+            );
+        let initial_summary = warm.output.scene.summary();
+        let virtual_key_id = visible_virtual_key_id(
+            &tree,
+            SHOWCASE_INTERACTION_WIDTH,
+            SHOWCASE_INTERACTION_HEIGHT,
+            target.scroll_y,
+        )
+        .expect("Interaction full-loop benchmark should have a visible virtual key");
+        let hover_id = keyboard_hover_target_id(&tree, virtual_key_id);
+        let cached_rebuild = if warm.output.event_rebuild_changed {
+            warm.output.event_rebuild
+        } else {
+            initial.event_rebuild
+        };
+        let forward_patches = decode_patches(EMERGE_DEMO_SHOWCASE_INTERACTION_VIRTUAL_KEY_PATCH)
+            .expect("Interaction virtual-key forward patch should decode");
+        let reverse_patches =
+            decode_patches(EMERGE_DEMO_SHOWCASE_INTERACTION_VIRTUAL_KEY_REVERSE_PATCH)
+                .expect("Interaction virtual-key reverse patch should decode");
+
+        if std::env::var_os("EMERGE_BENCH_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "showcase Interaction virtual-key full-loop target: {target:?}, virtual_key={virtual_key_id:?}, hover={hover_id:?}, summary={initial_summary:?}"
+            );
+            #[cfg(feature = "bench-diagnostics")]
+            sample_showcase_interaction_virtual_key_full_loop_profile(
+                tree.clone(),
+                runtime.clone(),
+                cached_rebuild.clone(),
+                started_at,
+                target,
+                virtual_key_id,
+                hover_id,
+                forward_patches.clone(),
+                reverse_patches.clone(),
+            );
+        }
+
+        Self {
+            tree,
+            runtime,
+            cached_rebuild,
+            started_at,
+            target,
+            virtual_key_id,
+            hover_id,
+            forward_patches,
+            reverse_patches,
+            next_forward: true,
+            next_frame: 1,
+            phase: 0,
+            initial_summary,
+        }
+    }
+
+    fn next_frame(&mut self) -> emerge_skia::tree::layout::LayoutUpdateOutput {
+        self.next_frame = self.next_frame.saturating_add(1);
+        let mut dirty_ids = Vec::new();
+        let invalidation = match self.phase {
+            0 => self.hover_id.map_or(TreeInvalidation::None, |id| {
+                let invalidation = self.tree.set_mouse_over_active(&id, true);
+                record_frame_attr_dirty_id(&mut dirty_ids, id, invalidation);
+                invalidation
+            }),
+            1 => {
+                let invalidation = self.tree.set_mouse_down_active(&self.virtual_key_id, true);
+                record_frame_attr_dirty_id(&mut dirty_ids, self.virtual_key_id, invalidation);
+                invalidation
+            }
+            2 => {
+                let mut invalidation = self.tree.set_mouse_down_active(&self.virtual_key_id, false);
+                record_frame_attr_dirty_id(&mut dirty_ids, self.virtual_key_id, invalidation);
+                let (content, patches) = if self.next_forward {
+                    (SHOWCASE_INTERACTION_NEXT_TEXT, &self.forward_patches)
+                } else {
+                    (SHOWCASE_INTERACTION_INITIAL_TEXT, &self.reverse_patches)
+                };
+                self.next_forward = !self.next_forward;
+                let cursor = content.chars().count() as u32;
+                let content_invalidation = self
+                    .tree
+                    .set_text_input_content(&self.target.text_input_id, content.to_string());
+                record_frame_attr_dirty_id(
+                    &mut dirty_ids,
+                    self.target.text_input_id,
+                    content_invalidation,
+                );
+                invalidation.add(content_invalidation);
+                let runtime_invalidation = self.tree.set_text_input_runtime(
+                    &self.target.text_input_id,
+                    true,
+                    Some(cursor),
+                    None,
+                    None,
+                    None,
+                );
+                record_frame_attr_dirty_id(
+                    &mut dirty_ids,
+                    self.target.text_input_id,
+                    runtime_invalidation,
+                );
+                invalidation.add(runtime_invalidation);
+                let patch_dirty_ids = patch_set_attrs_ids(patches);
+                let patch_invalidation = apply_patches(&mut self.tree, patches.clone())
+                    .expect("Interaction virtual-key echo patch applies");
+                if patch_invalidation.can_refresh_only()
+                    && let Some(ids) = patch_dirty_ids
+                {
+                    extend_frame_attr_dirty_ids(&mut dirty_ids, ids);
+                }
+                invalidation.add(patch_invalidation);
+                invalidation
+            }
+            _ => self.hover_id.map_or(TreeInvalidation::None, |id| {
+                let invalidation = self.tree.set_mouse_over_active(&id, false);
+                record_frame_attr_dirty_id(&mut dirty_ids, id, invalidation);
+                invalidation
+            }),
+        };
+        self.phase = (self.phase + 1) % 4;
+
+        let update =
+            layout_or_refresh_default_with_animation_and_dirty_ids_reusing_clean_registry_for_benchmark(
+                &mut self.tree,
+                Constraint::new(
+                    SHOWCASE_INTERACTION_WIDTH as f32,
+                    SHOWCASE_INTERACTION_HEIGHT as f32,
+                ),
+                1.0,
+                &self.runtime,
+                self.started_at
+                    + Duration::from_millis(self.next_frame.saturating_mul(SHOWCASE_FRAME_MS)),
+                invalidation,
+                &dirty_ids,
+                Some(&self.cached_rebuild),
+            );
+
+        if update.output.event_rebuild_changed {
+            self.cached_rebuild = update.output.event_rebuild.clone();
+        }
+
+        update
+    }
+}
+
+struct ShowcaseInteractionScrollCase {
+    tree: ElementTree,
+    runtime: AnimationRuntime,
+    cached_rebuild: RegistryRebuildPayload,
+    started_at: Instant,
+    target: ShowcaseInteractionTarget,
+    next_frame: u64,
+    scroll_forward: bool,
+    initial_summary: RenderSceneSummary,
+}
+
+impl ShowcaseInteractionScrollCase {
+    fn new() -> Self {
+        let started_at = Instant::now();
+        let tree = decode_tree(EMERGE_DEMO_SHOWCASE_INTERACTION_EMRG)
+            .expect("Interaction fixture should decode");
+        let mut runtime = AnimationRuntime::default();
+        runtime.sync_with_tree(&tree, started_at);
+        let constraint = Constraint::new(
+            SHOWCASE_INTERACTION_WIDTH as f32,
+            SHOWCASE_INTERACTION_HEIGHT as f32,
+        );
+        let mut tree = tree.clone();
+        let initial = layout_and_refresh_default_with_animation(
+            &mut tree, constraint, 1.0, &runtime, started_at,
+        );
+        let target = ShowcaseInteractionTarget::from_laid_out_tree(
+            &tree,
+            SHOWCASE_INTERACTION_WIDTH,
+            SHOWCASE_INTERACTION_HEIGHT,
+        );
+        let warm_invalidation = tree.apply_scroll_y(&target.scroll_id, -target.scroll_y);
+        let warm =
+            layout_or_refresh_default_with_animation_and_invalidation_reusing_clean_registry_for_benchmark(
+                &mut tree,
+                constraint,
+                1.0,
+                &runtime,
+                started_at,
+                warm_invalidation,
+                Some(&initial.event_rebuild),
+        );
+        let initial_summary = warm.output.scene.summary();
+        if std::env::var_os("EMERGE_BENCH_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "showcase Interaction scroll target: {target:?}, summary={initial_summary:?}"
+            );
+            print_showcase_paint_layers(&warm.output.scene.nodes, 0);
+            #[cfg(feature = "bench-diagnostics")]
+            {
+                sample_showcase_interaction_scroll_profile(
+                    tree.clone(),
+                    runtime.clone(),
+                    if warm.output.event_rebuild_changed {
+                        warm.output.event_rebuild.clone()
+                    } else {
+                        initial.event_rebuild.clone()
+                    },
+                    started_at,
+                    target,
+                );
+            }
+        }
+        assert!(
+            initial_summary.nodes >= 700 && initial_summary.paint_layers >= 4,
+            "Interaction scroll benchmark selected the wrong scene: \
+             target={target:?}, summary={initial_summary:?}"
+        );
+
+        Self {
+            tree,
+            runtime,
+            cached_rebuild: if warm.output.event_rebuild_changed {
+                warm.output.event_rebuild
+            } else {
+                initial.event_rebuild
+            },
+            started_at,
+            target,
+            next_frame: 1,
+            scroll_forward: true,
+            initial_summary,
+        }
+    }
+
+    fn next_scroll_frame(&mut self) -> emerge_skia::tree::layout::LayoutUpdateOutput {
+        self.next_frame = self.next_frame.saturating_add(1);
+        let delta = if self.scroll_forward { -24.0 } else { 24.0 };
+        self.scroll_forward = !self.scroll_forward;
+        let invalidation = self.tree.apply_scroll_y(&self.target.scroll_id, delta);
+
+        let update =
+            layout_or_refresh_default_with_animation_and_dirty_ids_reusing_clean_registry_for_benchmark(
+                &mut self.tree,
+                Constraint::new(
+                    SHOWCASE_INTERACTION_WIDTH as f32,
+                    SHOWCASE_INTERACTION_HEIGHT as f32,
+                ),
+                1.0,
+                &self.runtime,
+                self.started_at
+                    + Duration::from_millis(self.next_frame.saturating_mul(SHOWCASE_FRAME_MS)),
+                invalidation,
+                &[],
+                Some(&self.cached_rebuild),
+            );
+
+        if update.output.event_rebuild_changed {
+            self.cached_rebuild = update.output.event_rebuild.clone();
+        }
+
+        update
+    }
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn sample_showcase_interaction_scroll_profile(
+    mut tree: ElementTree,
+    runtime: AnimationRuntime,
+    mut cached_rebuild: RegistryRebuildPayload,
+    started_at: Instant,
+    target: ShowcaseInteractionTarget,
+) {
+    let mut scroll_forward = true;
+    for frame in 1..=6_u64 {
+        let delta = if scroll_forward { -24.0 } else { 24.0 };
+        scroll_forward = !scroll_forward;
+        let invalidation = tree.apply_scroll_y(&target.scroll_id, delta);
+        let (update, profile) =
+            layout_or_refresh_default_with_animation_and_invalidation_profile_for_benchmark(
+                &mut tree,
+                Constraint::new(
+                    SHOWCASE_INTERACTION_WIDTH as f32,
+                    SHOWCASE_INTERACTION_HEIGHT as f32,
+                ),
+                1.0,
+                &runtime,
+                started_at + Duration::from_millis(frame.saturating_mul(SHOWCASE_FRAME_MS)),
+                invalidation,
+                Some(&cached_rebuild),
+            );
+        if update.output.event_rebuild_changed {
+            cached_rebuild = update.output.event_rebuild;
+        }
+        eprintln!(
+            "showcase interaction scroll profile frame={frame} invalidation={:?} prepare={:.3}ms layout={:.3}ms refresh={:.3}ms render_scene={:.3}ms registry={:.3}ms layout_performed={} event_rebuild_changed={} scene_nodes={} render_visits={} culled={} registry_visits={} registry_hits={} registry_stores={} registry_damaged={} registry_ineligible={} registry_misses={} pre_registry_damage={} registry_damage={} registry_damage_nodes={} summary={:?}",
+            invalidation,
+            profile.prepare.as_secs_f64() * 1000.0,
+            profile.layout.as_secs_f64() * 1000.0,
+            profile.refresh.as_secs_f64() * 1000.0,
+            profile.render_scene.as_secs_f64() * 1000.0,
+            profile.registry.as_secs_f64() * 1000.0,
+            profile.layout_performed,
+            update.output.event_rebuild_changed,
+            profile.scene_nodes,
+            profile.render_visits,
+            profile.culled_subtrees,
+            profile.registry_visits,
+            profile.registry_cache_hits,
+            profile.registry_cache_stores,
+            profile.registry_cache_damaged,
+            profile.registry_cache_ineligible,
+            profile.registry_cache_misses,
+            profile.pre_layout_registry_damage,
+            profile.registry_damage,
+            profile.registry_damage_nodes,
+            update.output.scene.summary()
+        );
+    }
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn sample_showcase_interaction_profile(
+    mut tree: ElementTree,
+    runtime: AnimationRuntime,
+    mut cached_rebuild: RegistryRebuildPayload,
+    started_at: Instant,
+    target: ShowcaseInteractionTarget,
+    forward_patches: Vec<Patch>,
+    reverse_patches: Vec<Patch>,
+) {
+    for frame in 1..=6_u64 {
+        let (content, patches) = if frame % 2 == 1 {
+            (SHOWCASE_INTERACTION_NEXT_TEXT, &forward_patches)
+        } else {
+            (SHOWCASE_INTERACTION_INITIAL_TEXT, &reverse_patches)
+        };
+        let cursor = content.chars().count() as u32;
+        let mut invalidation = tree.set_text_input_content(&target.text_input_id, content.into());
+        invalidation.add(tree.set_text_input_runtime(
+            &target.text_input_id,
+            true,
+            Some(cursor),
+            None,
+            None,
+            None,
+        ));
+        if frame == 1 {
+            print_showcase_patch_summary(&tree, patches);
+        }
+        invalidation.add(
+            apply_patches(&mut tree, patches.clone())
+                .expect("Interaction virtual-key echo patch applies"),
+        );
+
+        let (update, profile) =
+            layout_or_refresh_default_with_animation_and_invalidation_profile_for_benchmark(
+                &mut tree,
+                Constraint::new(
+                    SHOWCASE_INTERACTION_WIDTH as f32,
+                    SHOWCASE_INTERACTION_HEIGHT as f32,
+                ),
+                1.0,
+                &runtime,
+                started_at + Duration::from_millis(frame.saturating_mul(SHOWCASE_FRAME_MS)),
+                invalidation,
+                Some(&cached_rebuild),
+            );
+        if update.output.event_rebuild_changed {
+            cached_rebuild = update.output.event_rebuild;
+        }
+        eprintln!(
+            "showcase interaction profile frame={frame} invalidation={:?} prepare={:.3}ms layout={:.3}ms refresh={:.3}ms render_scene={:.3}ms registry={:.3}ms layout_performed={} event_rebuild_changed={} scene_nodes={} render_visits={} culled={} registry_visits={} registry_hits={} registry_stores={} registry_damaged={} registry_ineligible={} registry_misses={} pre_registry_damage={} registry_damage={} registry_damage_nodes={}",
+            invalidation,
+            profile.prepare.as_secs_f64() * 1000.0,
+            profile.layout.as_secs_f64() * 1000.0,
+            profile.refresh.as_secs_f64() * 1000.0,
+            profile.render_scene.as_secs_f64() * 1000.0,
+            profile.registry.as_secs_f64() * 1000.0,
+            profile.layout_performed,
+            update.output.event_rebuild_changed,
+            profile.scene_nodes,
+            profile.render_visits,
+            profile.culled_subtrees,
+            profile.registry_visits,
+            profile.registry_cache_hits,
+            profile.registry_cache_stores,
+            profile.registry_cache_damaged,
+            profile.registry_cache_ineligible,
+            profile.registry_cache_misses,
+            profile.pre_layout_registry_damage,
+            profile.registry_damage,
+            profile.registry_damage_nodes
+        );
+        if frame == 1 {
+            eprintln!(
+                "showcase interaction scene summary: {:?}",
+                update.output.scene.summary()
+            );
+            print_showcase_paint_layers(&update.output.scene.nodes, 0);
+        }
+    }
+}
+
+#[cfg(feature = "bench-diagnostics")]
+struct VirtualKeyFullLoopProfileState {
+    tree: ElementTree,
+    runtime: AnimationRuntime,
+    cached_rebuild: RegistryRebuildPayload,
+    started_at: Instant,
+    target: ShowcaseInteractionTarget,
+    virtual_key_id: NodeId,
+    hover_id: Option<NodeId>,
+    forward_patches: Vec<Patch>,
+    reverse_patches: Vec<Patch>,
+    next_forward: bool,
+    phase: u8,
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn sample_showcase_interaction_virtual_key_full_loop_profile(
+    tree: ElementTree,
+    runtime: AnimationRuntime,
+    cached_rebuild: RegistryRebuildPayload,
+    started_at: Instant,
+    target: ShowcaseInteractionTarget,
+    virtual_key_id: NodeId,
+    hover_id: Option<NodeId>,
+    forward_patches: Vec<Patch>,
+    reverse_patches: Vec<Patch>,
+) {
+    let mut state = VirtualKeyFullLoopProfileState {
+        tree,
+        runtime,
+        cached_rebuild,
+        started_at,
+        target,
+        virtual_key_id,
+        hover_id,
+        forward_patches,
+        reverse_patches,
+        next_forward: true,
+        phase: 0,
+    };
+
+    for frame in 1..=8_u64 {
+        let phase_name = match state.phase {
+            0 => "hover_on",
+            1 => "key_down",
+            2 => "key_release_echo",
+            _ => "hover_off",
+        };
+        let invalidation = virtual_key_full_loop_invalidation(&mut state);
+        let (update, profile) =
+            layout_or_refresh_default_with_animation_and_invalidation_profile_for_benchmark(
+                &mut state.tree,
+                Constraint::new(
+                    SHOWCASE_INTERACTION_WIDTH as f32,
+                    SHOWCASE_INTERACTION_HEIGHT as f32,
+                ),
+                1.0,
+                &state.runtime,
+                state.started_at + Duration::from_millis(frame.saturating_mul(SHOWCASE_FRAME_MS)),
+                invalidation,
+                Some(&state.cached_rebuild),
+            );
+        if update.output.event_rebuild_changed {
+            state.cached_rebuild = update.output.event_rebuild;
+        }
+        eprintln!(
+            "showcase interaction virtual-key profile frame={frame} phase={phase_name} invalidation={:?} prepare={:.3}ms layout={:.3}ms refresh={:.3}ms render_scene={:.3}ms registry={:.3}ms layout_performed={} event_rebuild_changed={} scene_nodes={} render_visits={} culled={} registry_visits={} registry_hits={} registry_stores={} registry_damaged={} registry_ineligible={} registry_misses={} registry_damage={} registry_damage_nodes={} summary={:?}",
+            invalidation,
+            profile.prepare.as_secs_f64() * 1000.0,
+            profile.layout.as_secs_f64() * 1000.0,
+            profile.refresh.as_secs_f64() * 1000.0,
+            profile.render_scene.as_secs_f64() * 1000.0,
+            profile.registry.as_secs_f64() * 1000.0,
+            profile.layout_performed,
+            update.output.event_rebuild_changed,
+            profile.scene_nodes,
+            profile.render_visits,
+            profile.culled_subtrees,
+            profile.registry_visits,
+            profile.registry_cache_hits,
+            profile.registry_cache_stores,
+            profile.registry_cache_damaged,
+            profile.registry_cache_ineligible,
+            profile.registry_cache_misses,
+            profile.registry_damage,
+            profile.registry_damage_nodes,
+            update.output.scene.summary()
+        );
+    }
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn virtual_key_full_loop_invalidation(
+    state: &mut VirtualKeyFullLoopProfileState,
+) -> TreeInvalidation {
+    let invalidation = match state.phase {
+        0 => state
+            .hover_id
+            .map(|id| state.tree.set_mouse_over_active(&id, true))
+            .unwrap_or(TreeInvalidation::None),
+        1 => state
+            .tree
+            .set_mouse_down_active(&state.virtual_key_id, true),
+        2 => {
+            let mut invalidation = state
+                .tree
+                .set_mouse_down_active(&state.virtual_key_id, false);
+            let (content, patches) = if state.next_forward {
+                (SHOWCASE_INTERACTION_NEXT_TEXT, &state.forward_patches)
+            } else {
+                (SHOWCASE_INTERACTION_INITIAL_TEXT, &state.reverse_patches)
+            };
+            state.next_forward = !state.next_forward;
+            let cursor = content.chars().count() as u32;
+            invalidation.add(
+                state
+                    .tree
+                    .set_text_input_content(&state.target.text_input_id, content.to_string()),
+            );
+            invalidation.add(state.tree.set_text_input_runtime(
+                &state.target.text_input_id,
+                true,
+                Some(cursor),
+                None,
+                None,
+                None,
+            ));
+            invalidation.add(
+                apply_patches(&mut state.tree, patches.clone())
+                    .expect("Interaction virtual-key echo patch applies"),
+            );
+            invalidation
+        }
+        _ => state
+            .hover_id
+            .map(|id| state.tree.set_mouse_over_active(&id, false))
+            .unwrap_or(TreeInvalidation::None),
+    };
+    state.phase = (state.phase + 1) % 4;
+    invalidation
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn print_showcase_patch_summary(tree: &ElementTree, patches: &[Patch]) {
+    patches.iter().for_each(|patch| match patch {
+        Patch::SetAttrs { id, attrs_raw } => {
+            match emerge_skia::tree::attrs::decode_attrs(attrs_raw) {
+                Ok(attrs) => eprintln!(
+                    "showcase patch SetAttrs id={id:?} kind={:?} frame={:?} parent={:?} content={:?} width={:?} height={:?} focused={:?} mouse_down={:?}",
+                    tree.get(id).map(|element| element.spec.kind),
+                    tree.get(id).and_then(|element| element.layout.frame),
+                    patch_target_parent_summary(tree, id),
+                    attrs.content,
+                    attrs.width,
+                    attrs.height,
+                    attrs.focused.as_ref().map(|_| true),
+                    attrs.mouse_down.as_ref().map(|_| true)
+                ),
+                Err(err) => eprintln!("showcase patch SetAttrs id={id:?} decode error={err}"),
+            }
+        }
+        Patch::SetChildren { id, children } => {
+            eprintln!(
+                "showcase patch SetChildren id={id:?} child_count={}",
+                children.len()
+            );
+        }
+        Patch::SetNearbyMounts { host_id, mounts } => {
+            eprintln!(
+                "showcase patch SetNearbyMounts host={host_id:?} count={}",
+                mounts.len()
+            );
+        }
+        Patch::InsertSubtree {
+            parent_id,
+            index,
+            subtree,
+        } => {
+            eprintln!(
+                "showcase patch InsertSubtree parent={parent_id:?} index={index} nodes={}",
+                subtree.len()
+            );
+        }
+        Patch::InsertNearbySubtree {
+            host_id,
+            index,
+            slot,
+            subtree,
+        } => {
+            eprintln!(
+                "showcase patch InsertNearbySubtree host={host_id:?} index={index} slot={slot:?} nodes={}",
+                subtree.len()
+            );
+        }
+        Patch::Remove { id } => {
+            eprintln!("showcase patch Remove id={id:?}");
+        }
+    });
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn patch_target_parent_summary(
+    tree: &ElementTree,
+    id: &NodeId,
+) -> Option<(
+    NodeId,
+    ElementKind,
+    Option<Length>,
+    Option<Length>,
+    Option<Frame>,
+)> {
+    let parent_ix =
+        tree.ix_of(id)
+            .and_then(|ix| tree.parent_link_of(ix))
+            .map(|link| match link {
+                emerge_skia::tree::element::ParentLink::Child { parent }
+                | emerge_skia::tree::element::ParentLink::Nearby { host: parent, .. } => parent,
+            })?;
+    tree.get_ix(parent_ix).map(|element| {
+        (
+            element.id,
+            element.spec.kind,
+            element.layout.effective.width.clone(),
+            element.layout.effective.height.clone(),
+            element.layout.frame,
+        )
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ShowcaseLayoutTarget {
+    width: u32,
+    height: u32,
+    scroll_id: NodeId,
+    scroll_y: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ShowcaseBordersTarget {
+    width: u32,
+    height: u32,
+    scale: f32,
+    scroll_id: NodeId,
+    scroll_y: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ShowcaseInteractionTarget {
+    scroll_id: NodeId,
+    scroll_y: f32,
+    text_input_id: NodeId,
+}
+
+impl ShowcaseInteractionTarget {
+    fn from_laid_out_tree(tree: &ElementTree, width: u32, height: u32) -> Self {
+        let (scroll_id, scroll_y_max) = tree
+            .iter_node_pairs()
+            .filter_map(|(id, element)| {
+                (element.layout.effective.scrollbar_y == Some(true)
+                    && element.layout.scroll_y_max > 0.0)
+                    .then_some((id, element.layout.scroll_y_max))
+            })
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .expect("Interaction benchmark should have a vertical scroll container");
+
+        let keyboard_min_y = tree
+            .iter_node_pairs()
+            .filter_map(|(_, element)| {
+                element
+                    .layout
+                    .effective
+                    .virtual_key
+                    .is_some()
+                    .then_some(element.layout.frame?)
+            })
+            .map(|frame| frame.y)
+            .min_by(f32::total_cmp)
+            .expect("Interaction benchmark should have virtual keys");
+
+        let (text_input_id, text_input_frame) = tree
+            .iter_node_pairs()
+            .filter_map(|(id, element)| {
+                let frame = element.layout.frame?;
+                (element.spec.kind.is_text_input_family() && frame.y <= keyboard_min_y)
+                    .then_some((id, frame))
+            })
+            .max_by(|(_, left), (_, right)| left.y.total_cmp(&right.y))
+            .expect("Interaction benchmark should have a text input before virtual keys");
+
+        let scroll_y = (text_input_frame.y - height as f32 * 0.20)
+            .max(0.0)
+            .min(scroll_y_max);
+        let _ = width;
+
+        Self {
+            scroll_id,
+            scroll_y,
+            text_input_id,
+        }
+    }
+}
+
+impl ShowcaseBordersTarget {
+    fn screenshot_fixture() -> Self {
+        Self {
+            width: SHOWCASE_BORDERS_SCREENSHOT_WIDTH,
+            height: SHOWCASE_BORDERS_SCREENSHOT_HEIGHT,
+            scale: SHOWCASE_BORDERS_SCREENSHOT_SCALE,
+            scroll_id: SHOWCASE_SCROLL_ID,
+            scroll_y: SHOWCASE_BORDERS_SCREENSHOT_SCROLL_Y,
+        }
+    }
+
+    fn constraint(self) -> Constraint {
+        Constraint::new(self.width as f32, self.height as f32)
+    }
+}
+
+impl ShowcaseLayoutTarget {
+    fn visible_animation_fixture() -> Self {
+        Self {
+            width: SHOWCASE_LAYOUT_VISIBLE_WIDTH,
+            height: SHOWCASE_LAYOUT_VISIBLE_HEIGHT,
+            scroll_id: SHOWCASE_SCROLL_ID,
+            scroll_y: SHOWCASE_LAYOUT_VISIBLE_SCROLL_Y,
+        }
+    }
+}
+
+fn visible_hover_targets(tree: &ElementTree, width: u32, height: u32) -> Vec<NodeId> {
+    tree.iter_node_pairs()
+        .filter_map(|(id, element)| {
+            let frame = element.layout.frame?;
+            (element.layout.effective.mouse_over.is_some()
+                && frame.width > 8.0
+                && frame.height > 8.0
+                && frame_intersects_viewport(frame, width as f32, height as f32))
+            .then_some(id)
+        })
+        .collect()
+}
+
+fn virtual_key_count(tree: &ElementTree) -> usize {
+    tree.iter_node_pairs()
+        .filter(|(_, element)| element.layout.effective.virtual_key.is_some())
+        .count()
+}
+
+fn visible_virtual_key_id(
+    tree: &ElementTree,
+    width: u32,
+    height: u32,
+    scroll_y: f32,
+) -> Option<NodeId> {
+    tree.iter_node_pairs()
+        .filter_map(|(id, element)| {
+            let frame = element.layout.frame?;
+            (element.layout.effective.virtual_key.is_some()
+                && scrolled_frame_intersects_viewport(frame, width as f32, height as f32, scroll_y))
+            .then_some((id, frame))
+        })
+        .min_by(|(_, left), (_, right)| {
+            left.y
+                .total_cmp(&right.y)
+                .then_with(|| left.x.total_cmp(&right.x))
+        })
+        .map(|(id, _)| id)
+}
+
+fn scrolled_frame_intersects_viewport(
+    frame: Frame,
+    width: f32,
+    height: f32,
+    scroll_y: f32,
+) -> bool {
+    frame.x < width
+        && frame.y - scroll_y < height
+        && frame.x + frame.width > 0.0
+        && frame.y - scroll_y + frame.height > 0.0
+}
+
+fn keyboard_hover_target_id(tree: &ElementTree, virtual_key_id: NodeId) -> Option<NodeId> {
+    let key_frame = tree
+        .get(&virtual_key_id)
+        .and_then(|element| element.layout.frame)?;
+    let key_center_x = key_frame.x + key_frame.width * 0.5;
+    let key_center_y = key_frame.y + key_frame.height * 0.5;
+
+    if tree
+        .get(&virtual_key_id)
+        .is_some_and(|element| element.layout.effective.mouse_over.is_some())
+    {
+        return Some(virtual_key_id);
+    }
+
+    tree.iter_node_pairs()
+        .filter_map(|(id, element)| {
+            let frame = element.layout.frame?;
+            (element.layout.effective.mouse_over.is_some()
+                && frame.x <= key_center_x
+                && frame.x + frame.width >= key_center_x
+                && frame.y <= key_center_y
+                && frame.y + frame.height >= key_center_y)
+                .then_some((id, frame.width * frame.height))
+        })
+        .min_by(|(_, left_area), (_, right_area)| left_area.total_cmp(right_area))
+        .map(|(id, _)| id)
+}
+
+fn frame_intersects_viewport(frame: Frame, width: f32, height: f32) -> bool {
+    frame.x < width
+        && frame.y < height
+        && frame.x + frame.width > 0.0
+        && frame.y + frame.height > 0.0
+}
+
+fn bench_scrolling_animation_paint_only_showcase(
+    c: &mut Criterion,
+    group_name: &str,
+    constraint: Constraint,
+    make_tree: fn() -> ElementTree,
+) {
+    let mut group = c.benchmark_group(group_name);
     let start = Instant::now();
-    let node_count = scrollable_animated_shadow_showcase().len() as u64;
+    let node_count = make_tree().len() as u64;
     group.throughput(Throughput::Elements(node_count));
 
-    let mut full_tree = scrollable_animated_shadow_showcase();
+    let mut full_tree = make_tree();
     let full_root_id = full_tree.root_id().expect("scroll tree should have root");
     let mut full_runtime = AnimationRuntime::default();
     full_runtime.sync_with_tree(&full_tree, start);
@@ -735,7 +2484,7 @@ fn bench_scrolling_animated_shadow_showcase(c: &mut Criterion) {
         });
     });
 
-    let mut refresh_tree = scrollable_animated_shadow_showcase();
+    let mut refresh_tree = make_tree();
     let refresh_root_id = refresh_tree
         .root_id()
         .expect("scroll tree should have root");
@@ -849,43 +2598,14 @@ fn bench_scroll_viewport_case(
         });
     });
 
-    let (mut uncached_middle_tree, uncached_middle_rebuild, _) =
-        prepare_scroll_viewport_tree(case.make_tree, constraint, ScrollViewportPosition::Middle);
-    group.bench_function(format!("{}/middle_uncached_refresh", case.name), move |b| {
-        b.iter(|| {
-            let output = refresh_uncached_reusing_clean_registry_for_benchmark(
-                &mut uncached_middle_tree,
-                Some(&uncached_middle_rebuild),
-            );
-            consume_layout_output(output)
-        });
-    });
-
     let (mut render_only_middle_tree, _, _) =
         prepare_scroll_viewport_tree(case.make_tree, constraint, ScrollViewportPosition::Middle);
-    group.bench_function(
-        format!("{}/middle_render_only_cached", case.name),
-        move |b| {
-            b.iter(|| {
-                let scene = refresh_render_scene_cached_for_benchmark(&mut render_only_middle_tree);
-                consume_render_scene(scene)
-            });
-        },
-    );
-
-    let (mut render_only_uncached_middle_tree, _, _) =
-        prepare_scroll_viewport_tree(case.make_tree, constraint, ScrollViewportPosition::Middle);
-    group.bench_function(
-        format!("{}/middle_render_only_uncached", case.name),
-        move |b| {
-            b.iter(|| {
-                let scene = refresh_render_scene_uncached_for_benchmark(
-                    &mut render_only_uncached_middle_tree,
-                );
-                consume_render_scene(scene)
-            });
-        },
-    );
+    group.bench_function(format!("{}/middle_render_only", case.name), move |b| {
+        b.iter(|| {
+            let scene = refresh_render_scene_for_benchmark(&mut render_only_middle_tree);
+            consume_render_scene(scene)
+        });
+    });
 
     let (mut step_tree, mut step_cached_rebuild, step_root_id) =
         prepare_scroll_viewport_tree(case.make_tree, constraint, ScrollViewportPosition::Middle);
@@ -916,73 +2636,19 @@ fn bench_scroll_viewport_case(
     let (mut render_only_step_tree, _, render_only_step_root_id) =
         prepare_scroll_viewport_tree(case.make_tree, constraint, ScrollViewportPosition::Middle);
     let mut render_only_step_tick = 0_u64;
-    group.bench_function(
-        format!("{}/scroll_step_render_only_cached", case.name),
-        move |b| {
-            b.iter(|| {
-                render_only_step_tick = render_only_step_tick.saturating_add(1);
-                let delta = if render_only_step_tick.is_multiple_of(2) {
-                    -24.0
-                } else {
-                    24.0
-                };
-                black_box(render_only_step_tree.apply_scroll_y(&render_only_step_root_id, delta));
-                let scene = refresh_render_scene_cached_for_benchmark(&mut render_only_step_tree);
-                consume_render_scene(scene)
-            });
-        },
-    );
-
-    let (mut render_only_uncached_step_tree, _, render_only_uncached_step_root_id) =
-        prepare_scroll_viewport_tree(case.make_tree, constraint, ScrollViewportPosition::Middle);
-    let mut render_only_uncached_step_tick = 0_u64;
-    group.bench_function(
-        format!("{}/scroll_step_render_only_uncached", case.name),
-        move |b| {
-            b.iter(|| {
-                render_only_uncached_step_tick = render_only_uncached_step_tick.saturating_add(1);
-                let delta = if render_only_uncached_step_tick.is_multiple_of(2) {
-                    -24.0
-                } else {
-                    24.0
-                };
-                black_box(
-                    render_only_uncached_step_tree
-                        .apply_scroll_y(&render_only_uncached_step_root_id, delta),
-                );
-                let scene = refresh_render_scene_uncached_for_benchmark(
-                    &mut render_only_uncached_step_tree,
-                );
-                consume_render_scene(scene)
-            });
-        },
-    );
-
-    let (mut uncached_step_tree, mut uncached_step_rebuild, uncached_step_root_id) =
-        prepare_scroll_viewport_tree(case.make_tree, constraint, ScrollViewportPosition::Middle);
-    let mut uncached_step_tick = 0_u64;
-    group.bench_function(
-        format!("{}/scroll_step_uncached_refresh", case.name),
-        move |b| {
-            b.iter(|| {
-                uncached_step_tick = uncached_step_tick.saturating_add(1);
-                let delta = if uncached_step_tick.is_multiple_of(2) {
-                    -24.0
-                } else {
-                    24.0
-                };
-                black_box(uncached_step_tree.apply_scroll_y(&uncached_step_root_id, delta));
-                let output = refresh_uncached_reusing_clean_registry_for_benchmark(
-                    &mut uncached_step_tree,
-                    Some(&uncached_step_rebuild),
-                );
-                if output.event_rebuild_changed {
-                    uncached_step_rebuild = output.event_rebuild.clone();
-                }
-                consume_layout_output(output)
-            });
-        },
-    );
+    group.bench_function(format!("{}/scroll_step_render_only", case.name), move |b| {
+        b.iter(|| {
+            render_only_step_tick = render_only_step_tick.saturating_add(1);
+            let delta = if render_only_step_tick.is_multiple_of(2) {
+                -24.0
+            } else {
+                24.0
+            };
+            black_box(render_only_step_tree.apply_scroll_y(&render_only_step_root_id, delta));
+            let scene = refresh_render_scene_for_benchmark(&mut render_only_step_tree);
+            consume_render_scene(scene)
+        });
+    });
 }
 
 fn prepare_scroll_viewport_tree(
@@ -1040,13 +2706,12 @@ fn sample_scroll_viewport_refresh_diagnostics(
     eprintln!(
         concat!(
             "scroll_viewport_diag {}: retained_nodes={} traversal_visits={} ",
-            "culled_subtrees={} render_subtree_cache_key_builds={} scene={}"
+            "culled_subtrees={} scene={}"
         ),
         label,
         tree.len(),
         diagnostics.element_visits,
         diagnostics.culled_subtrees,
-        diagnostics.render_subtree_cache_lookup_key_builds,
         summary
     );
     consume_layout_output(output);
@@ -1065,7 +2730,9 @@ fn bench_fixture_retained_layout_after_patch(c: &mut Criterion) {
 
     for fixture_id in RETAINED_FIXTURE_IDS {
         let fixture = load_fixture(fixture_id);
-        let base_tree = decode_tree(&fixture.full_emrg).expect("fixture tree should decode");
+        let Some(base_tree) = decode_fixture_tree_or_skip(&fixture.id, &fixture.full_emrg) else {
+            continue;
+        };
         let node_count = base_tree.len() as u64;
         let mut warmed_base = base_tree.clone();
         layout_tree_default(&mut warmed_base, constraint, 1.0);
@@ -1075,8 +2742,13 @@ fn bench_fixture_retained_layout_after_patch(c: &mut Criterion) {
         group.throughput(Throughput::Elements(node_count));
 
         for mutation in RETAINED_MUTATIONS {
-            let decoded_patches =
-                decode_patches(fixture.patch_bytes(mutation)).expect("fixture patch should decode");
+            let Some(decoded_patches) = decode_fixture_patches_or_skip(
+                &fixture.id,
+                mutation,
+                fixture.patch_bytes(mutation),
+            ) else {
+                continue;
+            };
 
             group.bench_function(*mutation, |b| {
                 b.iter_batched(
@@ -1100,12 +2772,34 @@ fn bench_fixture_retained_layout_after_patch(c: &mut Criterion) {
     }
 }
 
+fn decode_fixture_tree_or_skip(id: &str, bytes: &[u8]) -> Option<ElementTree> {
+    match decode_tree(bytes) {
+        Ok(tree) => Some(tree),
+        Err(err) => {
+            eprintln!("Skipping benchmark fixture {id}: full.emrg does not decode: {err}");
+            None
+        }
+    }
+}
+
+fn decode_fixture_patches_or_skip(id: &str, mutation: &str, bytes: &[u8]) -> Option<Vec<Patch>> {
+    match decode_patches(bytes) {
+        Ok(patches) => Some(patches),
+        Err(err) => {
+            eprintln!("Skipping benchmark fixture {id}/{mutation}: patch does not decode: {err}");
+            None
+        }
+    }
+}
+
 fn bench_fixture_retained_patch_layout(c: &mut Criterion) {
     let constraint = Constraint::new(960.0, 4_000.0);
 
     for fixture_id in RETAINED_FIXTURE_IDS {
         let fixture = load_fixture(fixture_id);
-        let base_tree = decode_tree(&fixture.full_emrg).expect("fixture tree should decode");
+        let Some(base_tree) = decode_fixture_tree_or_skip(&fixture.id, &fixture.full_emrg) else {
+            continue;
+        };
         let node_count = base_tree.len() as u64;
         let mut warmed_base = base_tree.clone();
         layout_tree_default(&mut warmed_base, constraint, 1.0);
@@ -1144,25 +2838,30 @@ fn bench_render_refresh_cache_regression(c: &mut Criterion) {
 
     for (fixture_id, mutation) in RENDER_REFRESH_REGRESSION_FIXTURE_CASES {
         let fixture = load_fixture(fixture_id);
-        let base_tree = decode_tree(&fixture.full_emrg).expect("fixture tree should decode");
+        let Some(base_tree) = decode_fixture_tree_or_skip(&fixture.id, &fixture.full_emrg) else {
+            continue;
+        };
         let node_count = base_tree.len() as u64;
         let mut warmed_base = base_tree;
         let warm_output = layout_and_refresh_default(&mut warmed_base, constraint, 1.0);
         let cached_rebuild = warm_output.event_rebuild;
-        let decoded_patches =
-            decode_patches(fixture.patch_bytes(mutation)).expect("fixture patch should decode");
+        let Some(decoded_patches) =
+            decode_fixture_patches_or_skip(&fixture.id, mutation, fixture.patch_bytes(mutation))
+        else {
+            continue;
+        };
         let patch_bytes = fixture.patch_bytes(mutation).to_vec();
         let case = format!("{fixture_id}/{mutation}");
 
         group.throughput(Throughput::Elements(node_count));
-        bench_cold_layout_refresh_pair(&mut group, &case, &fixture.full_emrg, constraint);
-        bench_warm_refresh_pair(
+        bench_cold_layout_refresh(&mut group, &case, &fixture.full_emrg, constraint);
+        bench_warm_refresh(
             &mut group,
             &case,
             warmed_base.clone(),
             cached_rebuild.clone(),
         );
-        bench_after_patch_refresh_pair(
+        bench_after_patch_refresh(
             &mut group,
             &case,
             warmed_base.clone(),
@@ -1170,7 +2869,7 @@ fn bench_render_refresh_cache_regression(c: &mut Criterion) {
             decoded_patches,
             constraint,
         );
-        bench_patch_refresh_pair(
+        bench_patch_refresh(
             &mut group,
             &case,
             warmed_base,
@@ -1180,14 +2879,14 @@ fn bench_render_refresh_cache_regression(c: &mut Criterion) {
         );
     }
 
-    bench_animation_refresh_regression_pair(
+    bench_animation_refresh_regression(
         &mut group,
         "animated_shadow_showcase/paint_only_refresh_each_frame",
         Constraint::new(960.0, 4_000.0),
         animated_shadow_showcase,
         false,
     );
-    bench_animation_refresh_regression_pair(
+    bench_animation_refresh_regression(
         &mut group,
         "scroll_shadow_showcase/paint_only_refresh_scroll_frame",
         Constraint::new(960.0, 640.0),
@@ -1198,14 +2897,14 @@ fn bench_render_refresh_cache_regression(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_cold_layout_refresh_pair(
+fn bench_cold_layout_refresh(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     case: &str,
     full_emrg: &[u8],
     constraint: Constraint,
 ) {
     let full_bytes = full_emrg.to_vec();
-    group.bench_function(format!("{case}/cold_cached_layout_refresh"), move |b| {
+    group.bench_function(format!("{case}/cold_layout_refresh"), move |b| {
         b.iter_batched(
             || decode_tree(&full_bytes).expect("fixture tree should decode"),
             |mut tree| {
@@ -1215,22 +2914,9 @@ fn bench_cold_layout_refresh_pair(
             BatchSize::SmallInput,
         );
     });
-
-    let full_bytes = full_emrg.to_vec();
-    group.bench_function(format!("{case}/cold_uncached_layout_refresh"), move |b| {
-        b.iter_batched(
-            || decode_tree(&full_bytes).expect("fixture tree should decode"),
-            |mut tree| {
-                let output =
-                    layout_and_refresh_default_uncached_for_benchmark(&mut tree, constraint, 1.0);
-                consume_layout_output(output)
-            },
-            BatchSize::SmallInput,
-        );
-    });
 }
 
-fn bench_warm_refresh_pair(
+fn bench_warm_refresh(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     case: &str,
     warmed_base: ElementTree,
@@ -1247,20 +2933,9 @@ fn bench_warm_refresh_pair(
             consume_layout_output(output)
         });
     });
-
-    let mut uncached_tree = warmed_base;
-    group.bench_function(format!("{case}/uncached_refresh"), move |b| {
-        b.iter(|| {
-            let output = refresh_uncached_reusing_clean_registry_for_benchmark(
-                &mut uncached_tree,
-                Some(&cached_rebuild),
-            );
-            consume_layout_output(output)
-        });
-    });
 }
 
-fn bench_after_patch_refresh_pair(
+fn bench_after_patch_refresh(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     case: &str,
     warmed_base: ElementTree,
@@ -1282,23 +2957,9 @@ fn bench_after_patch_refresh_pair(
             BatchSize::SmallInput,
         );
     });
-
-    group.bench_function(format!("{case}/after_patch_uncached_refresh"), move |b| {
-        b.iter_batched(
-            || prepare_after_patch_refresh_tree(&warmed_base, &decoded_patches, constraint),
-            |mut tree| {
-                let output = refresh_uncached_reusing_clean_registry_for_benchmark(
-                    &mut tree,
-                    Some(&cached_rebuild),
-                );
-                consume_layout_output(output)
-            },
-            BatchSize::SmallInput,
-        );
-    });
 }
 
-fn bench_patch_refresh_pair(
+fn bench_patch_refresh(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     case: &str,
     warmed_base: ElementTree,
@@ -1316,21 +2977,6 @@ fn bench_patch_refresh_pair(
                 apply_patch_and_relayout_if_needed(&mut tree, &bytes, constraint);
                 let output =
                     refresh_reusing_clean_registry_for_benchmark(&mut tree, Some(&cached_registry));
-                consume_layout_output(output)
-            },
-            BatchSize::SmallInput,
-        );
-    });
-
-    group.bench_function(format!("{case}/patch_uncached_refresh"), move |b| {
-        b.iter_batched(
-            || (warmed_base.clone(), patch_bytes.clone()),
-            |(mut tree, bytes)| {
-                apply_patch_and_relayout_if_needed(&mut tree, &bytes, constraint);
-                let output = refresh_uncached_reusing_clean_registry_for_benchmark(
-                    &mut tree,
-                    Some(&cached_rebuild),
-                );
                 consume_layout_output(output)
             },
             BatchSize::SmallInput,
@@ -1363,7 +3009,7 @@ fn apply_patch_and_relayout_if_needed(
     }
 }
 
-fn bench_animation_refresh_regression_pair(
+fn bench_animation_refresh_regression(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     case: &str,
     constraint: Constraint,
@@ -1409,42 +3055,6 @@ fn bench_animation_refresh_regression_pair(
             consume_layout_update_output(update)
         });
     });
-
-    let mut uncached_tree = make_tree();
-    let uncached_root_id = uncached_tree.root_id();
-    let mut uncached_runtime = AnimationRuntime::default();
-    uncached_runtime.sync_with_tree(&uncached_tree, start);
-    layout_and_refresh_default_with_animation(
-        &mut uncached_tree,
-        constraint,
-        1.0,
-        &uncached_runtime,
-        start,
-    );
-    let mut uncached_tick = 0_u64;
-    group.bench_function(format!("{case}/uncached_refresh"), move |b| {
-        b.iter(|| {
-            uncached_tick += 16;
-            if scroll_each_frame {
-                let delta = if uncached_tick.is_multiple_of(32) {
-                    8.0
-                } else {
-                    -8.0
-                };
-                if let Some(root_id) = uncached_root_id {
-                    black_box(uncached_tree.apply_scroll_y(&root_id, delta));
-                }
-            }
-            let update = layout_or_refresh_default_with_animation_uncached_for_benchmark(
-                &mut uncached_tree,
-                constraint,
-                1.0,
-                &uncached_runtime,
-                start + Duration::from_millis(uncached_tick),
-            );
-            consume_layout_update_output(update)
-        });
-    });
 }
 
 fn bench_registry_refresh_cache_regression(c: &mut Criterion) {
@@ -1453,13 +3063,18 @@ fn bench_registry_refresh_cache_regression(c: &mut Criterion) {
 
     for (fixture_id, mutation) in REGISTRY_REFRESH_REGRESSION_FIXTURE_CASES {
         let fixture = load_fixture(fixture_id);
-        let base_tree = decode_tree(&fixture.full_emrg).expect("fixture tree should decode");
+        let Some(base_tree) = decode_fixture_tree_or_skip(&fixture.id, &fixture.full_emrg) else {
+            continue;
+        };
         let node_count = base_tree.len() as u64;
         let mut warmed_base = base_tree;
         let warm_output = layout_and_refresh_default(&mut warmed_base, constraint, 1.0);
         let cached_rebuild = warm_output.event_rebuild;
-        let decoded_patches =
-            decode_patches(fixture.patch_bytes(mutation)).expect("fixture patch should decode");
+        let Some(decoded_patches) =
+            decode_fixture_patches_or_skip(&fixture.id, mutation, fixture.patch_bytes(mutation))
+        else {
+            continue;
+        };
         let patch_bytes = fixture.patch_bytes(mutation).to_vec();
         let case = format!("{fixture_id}/{mutation}");
 
@@ -1659,6 +3274,36 @@ fn consume_layout_output(output: emerge_skia::tree::layout::LayoutOutput) {
     ));
 }
 
+fn patch_set_attrs_ids(patches: &[Patch]) -> Option<Vec<NodeId>> {
+    patches
+        .iter()
+        .map(|patch| match patch {
+            Patch::SetAttrs { id, .. } => Some(*id),
+            Patch::SetChildren { .. }
+            | Patch::SetNearbyMounts { .. }
+            | Patch::InsertSubtree { .. }
+            | Patch::InsertNearbySubtree { .. }
+            | Patch::Remove { .. } => None,
+        })
+        .collect()
+}
+
+fn record_frame_attr_dirty_id(
+    frame_attr_dirty_ids: &mut Vec<NodeId>,
+    id: NodeId,
+    invalidation: TreeInvalidation,
+) {
+    if invalidation.can_refresh_only() && !frame_attr_dirty_ids.contains(&id) {
+        frame_attr_dirty_ids.push(id);
+    }
+}
+
+fn extend_frame_attr_dirty_ids(frame_attr_dirty_ids: &mut Vec<NodeId>, ids: Vec<NodeId>) {
+    ids.into_iter().for_each(|id| {
+        record_frame_attr_dirty_id(frame_attr_dirty_ids, id, TreeInvalidation::Paint)
+    });
+}
+
 fn bench_nearby_hover_toggle_refresh(c: &mut Criterion) {
     let mut group = c.benchmark_group("native/nearby_hover_toggle_refresh/borders_like");
     let constraint = Constraint::new(960.0, 4_000.0);
@@ -1684,6 +3329,19 @@ fn bench_nearby_hover_toggle_refresh(c: &mut Criterion) {
                 )
                 .expect("restored nearby show patch should apply");
                 debug_assert_eq!(invalidation, TreeInvalidation::Paint);
+                let output =
+                    refresh_reusing_clean_registry_for_benchmark(&mut tree, Some(&cached_rebuild));
+                consume_layout_output(output)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    let (held_visible, held_cached_rebuild) = prepared_held_nearby_hover_tree(constraint);
+    group.bench_function("held_show_refresh_only", |b| {
+        b.iter_batched(
+            || (held_visible.clone(), held_cached_rebuild.clone()),
+            |(mut tree, cached_rebuild)| {
                 let output =
                     refresh_reusing_clean_registry_for_benchmark(&mut tree, Some(&cached_rebuild));
                 consume_layout_output(output)
@@ -1719,7 +3377,57 @@ fn bench_nearby_hover_toggle_refresh(c: &mut Criterion) {
         );
     });
 
+    let (reused_hidden, reused_overlay_id, reused_code_ids) =
+        reused_node_hidden_nearby_hover_tree(constraint);
+    group.bench_function("reused_node_show_layout_refresh", |b| {
+        b.iter_batched(
+            || (reused_hidden.clone(), reused_code_ids.clone()),
+            |(mut tree, code_ids)| {
+                let invalidation = apply_patches(
+                    &mut tree,
+                    vec![Patch::SetChildren {
+                        id: reused_overlay_id,
+                        children: code_ids,
+                    }],
+                )
+                .expect("reused-node nearby show patch should apply");
+                debug_assert_eq!(invalidation, TreeInvalidation::Resolve);
+                let output = layout_and_refresh_default(&mut tree, constraint, 1.0);
+                consume_layout_output(output)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     group.finish();
+}
+
+fn prepared_held_nearby_hover_tree(
+    constraint: Constraint,
+) -> (ElementTree, RegistryRebuildPayload) {
+    let (mut tree, host_id) = cold_hidden_nearby_hover_tree_base(90_000);
+    let _ = layout_and_refresh_default(&mut tree, constraint, 1.0);
+
+    let hidden_id = current_nearby_id(&tree, host_id);
+    let invalidation = apply_patches(
+        &mut tree,
+        vec![
+            Patch::Remove { id: hidden_id },
+            Patch::InsertNearbySubtree {
+                host_id,
+                index: 0,
+                slot: NearbySlot::Above,
+                subtree: nearby_code_block_subtree(91_000),
+            },
+        ],
+    )
+    .expect("held nearby show patch should apply");
+    debug_assert_eq!(invalidation, TreeInvalidation::Resolve);
+    let output = layout_and_refresh_default(&mut tree, constraint, 1.0);
+    let cached_rebuild = output.event_rebuild;
+    let _ = refresh_reusing_clean_registry_for_benchmark(&mut tree, Some(&cached_rebuild));
+
+    (tree, cached_rebuild)
 }
 
 fn prepared_hidden_nearby_hover_tree(
@@ -1774,6 +3482,29 @@ fn cold_hidden_nearby_hover_tree(constraint: Constraint) -> (ElementTree, Regist
     let (mut tree, _host_id) = cold_hidden_nearby_hover_tree_base(40_000);
     let output = layout_and_refresh_default(&mut tree, constraint, 1.0);
     (tree, output.event_rebuild)
+}
+
+fn reused_node_hidden_nearby_hover_tree(
+    constraint: Constraint,
+) -> (ElementTree, NodeId, Vec<NodeId>) {
+    let (mut tree, host_id) = cold_hidden_nearby_hover_tree_base(70_000);
+    let hidden_id = current_nearby_id(&tree, host_id);
+    let overlay_attrs = Attrs {
+        width: Some(Length::Px(460.0)),
+        padding: Some(Padding::Uniform(12.0)),
+        spacing: Some(4.0),
+        ..Default::default()
+    };
+    if let Some(hidden) = tree.get_mut(&hidden_id) {
+        hidden.spec.kind = ElementKind::Column;
+        hidden.spec.declared = overlay_attrs.clone();
+        hidden.layout.effective = overlay_attrs;
+    }
+
+    let code_ids = insert_detached_code_line_nodes(&mut tree, 80_000);
+    let _ = layout_and_refresh_default(&mut tree, constraint, 1.0);
+
+    (tree, hidden_id, code_ids)
 }
 
 fn cold_hidden_nearby_hover_tree_base(hidden_seed: u64) -> (ElementTree, NodeId) {
@@ -1925,6 +3656,36 @@ fn nearby_none_subtree(seed: u64) -> ElementTree {
     tree
 }
 
+fn insert_detached_code_line_nodes(tree: &mut ElementTree, seed: u64) -> Vec<NodeId> {
+    [
+        "Code",
+        "el([",
+        "  Border.rounded(8),",
+        "  Border.width(2),",
+        "  Border.color(:orange),",
+        "  Border.dashed()",
+        "], text(\"Dashed medium round\"))",
+    ]
+    .iter()
+    .enumerate()
+    .map(|(index, line)| {
+        let id = NodeId::from_u64(seed + index as u64);
+        let attrs = Attrs {
+            content: Some((*line).to_string()),
+            font_size: Some(if index == 0 { 11.0 } else { 12.0 }),
+            ..Default::default()
+        };
+        tree.insert(Element::with_attrs(
+            id,
+            ElementKind::Text,
+            Vec::new(),
+            attrs,
+        ));
+        id
+    })
+    .collect()
+}
+
 fn current_nearby_id(tree: &ElementTree, host_id: NodeId) -> NodeId {
     tree.nearby_mounts_for(&host_id)
         .first()
@@ -1941,7 +3702,10 @@ criterion_group!(
     bench_layout_aware_transform,
     bench_layout_aware_transform_animation,
     bench_animated_shadow_showcase,
+    bench_rich_borders_shadow_showcase,
     bench_scrolling_animated_shadow_showcase,
+    bench_scrolling_rich_borders_shadow_showcase,
+    bench_emerge_demo_showcase_layout_refresh,
     bench_scroll_viewport_culling,
     bench_fixture_retained_layout_after_patch,
     bench_fixture_retained_patch_layout,

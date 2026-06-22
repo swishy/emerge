@@ -510,6 +510,26 @@ fn load_svg_asset(path: &Path, id: &str, bytes: &[u8]) -> Result<(u32, u32), Str
         .map_err(|reason| format!("failed to cache SVG {}: {reason}", path.display()))
 }
 
+/// Register SVG content supplied at runtime under a caller-chosen logical id.
+///
+/// Parses the bytes and inserts the parsed tree into the process-global asset
+/// cache, exactly like a disk-loaded `.svg`, so any element with an
+/// `{:id, id}` image source resolves to it in both windowed and offscreen
+/// (render-to-pixels/png) paths without touching the filesystem. Re-registering
+/// the same id replaces the cached asset.
+pub fn register_inline_svg(id: &str, bytes: &[u8]) -> Result<(u32, u32), String> {
+    let mut options = usvg::Options::default();
+    options.fontdb_mut().load_system_fonts();
+
+    let tree = usvg::Tree::from_data_nested(bytes, &options)
+        .map_err(|err| format!("failed to parse inline SVG {id}: {err}"))?;
+
+    let (width, height) = svg_dimensions(&tree).unwrap_or((64, 64));
+    insert_vector_asset(id, tree)
+        .map(|_| (width, height))
+        .map_err(|reason| format!("failed to cache inline SVG {id}: {reason}"))
+}
+
 fn svg_dimensions(tree: &usvg::Tree) -> Option<(u32, u32)> {
     positive_dimensions(tree.size().width(), tree.size().height())
 }

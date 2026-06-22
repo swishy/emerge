@@ -284,7 +284,8 @@ defmodule EmergeSkia.BuildConfigTest do
   end
 
   test "normalize_compiled_backends! rejects invalid entries" do
-    assert_raise ArgumentError, ~r/containing only :wayland, :drm, and :macos/, fn ->
+        assert_raise ArgumentError,
+                 ~r/containing only :wayland, :drm, :macos, :ios, :android, and :fbdev/, fn ->
       BuildConfig.normalize_compiled_backends!([:wayland, :bogus, "drm"])
     end
   end

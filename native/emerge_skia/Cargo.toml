@@ -66,7 +66,8 @@ ios = [
     "dep:objc2-quartz-core",
     "skia-safe/metal",
 ]
-
+android = []
+fbdev = []
 [dependencies]
 rustler = "0.37"
 objc2 = { version = "0.6", optional = true }
@@ -90,6 +91,15 @@ skia-safe = { version = "0.93.1", default-features = false, features = ["gl", "p
 [dev-dependencies]
 criterion = "0.7"
 
+# Release profile tuned for size without sacrificing render performance.
+# opt-level stays at 3 and panic stays unwind (a NIF panic must unwind into the
+# BEAM, never abort the VM). strip removes the ~9k unstripped symbols; thin LTO
+# and a single codegen unit improve both size and inlining.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
 [target.'cfg(target_os = "linux")'.dependencies]
 glutin = { version = "0.32", optional = true }
 smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop", "xkbcommon"], optional = true }
@@ -102,3 +112,6 @@ gbm = { version = "0.18", default-features = false, features = ["drm-support", "
 glutin_egl_sys = "0.7"
 evdev = { version = "0.13", optional = true }
 arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"], optional = true }
+
+[patch.crates-io]
+rustler = { path = "vendor/rustler-0.37.3" }

@@ -31,6 +31,7 @@ defmodule EmergeSkia.Options do
       width: Keyword.get(opts, :width, 800),
       height: Keyword.get(opts, :height, 600),
       drm_card: normalize_optional_string(Keyword.get(opts, :drm_card)),
+      fbdev_path: normalize_optional_string(Keyword.get(opts, :fbdev_path)),
       drm_startup_retries:
         opts
         |> Keyword.get(:drm_startup_retries, 40)

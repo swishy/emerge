@@ -202,8 +202,7 @@ impl FbdevBackend {
         // Parse fb_fix_screeninfo (32-bit LE):
         //   offset 24: smem_len (u32)
         //   offset 46: line_length (u32)
-        let smem_len =
-            u32::from_ne_bytes([fix_info[24], fix_info[25], fix_info[26], fix_info[27]]);
+        let smem_len = u32::from_ne_bytes([fix_info[24], fix_info[25], fix_info[26], fix_info[27]]);
         let line_length =
             u32::from_ne_bytes([fix_info[46], fix_info[47], fix_info[48], fix_info[49]]);
 
@@ -270,7 +269,9 @@ impl FbdevBackend {
             32 => {
                 // Direct RGBA copy (XRGB8888 framebuffer)
                 let line_length = self.screen.line_length as usize;
-                let fb = unsafe { std::slice::from_raw_parts_mut(self.fb_mmap as *mut u8, self.fb_size) };
+                let fb = unsafe {
+                    std::slice::from_raw_parts_mut(self.fb_mmap as *mut u8, self.fb_size)
+                };
 
                 for y in 0..self.height as usize {
                     let src_offset = y * (self.width as usize) * 4;
@@ -283,7 +284,9 @@ impl FbdevBackend {
             16 => {
                 // RGB565 conversion
                 let line_length = self.screen.line_length as usize;
-                let fb = unsafe { std::slice::from_raw_parts_mut(self.fb_mmap as *mut u8, self.fb_size) };
+                let fb = unsafe {
+                    std::slice::from_raw_parts_mut(self.fb_mmap as *mut u8, self.fb_size)
+                };
 
                 for y in 0..self.height as usize {
                     let src_offset = y * (self.width as usize) * 4;

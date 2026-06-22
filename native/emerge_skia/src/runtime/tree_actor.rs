@@ -71,8 +71,12 @@ pub(crate) fn spawn_tree_actor_with_initial_tree(
             initial_scale,
         } = config;
 
-        let mut engine = TreeUpdateEngine::new(initial_tree, initial_width, initial_height, initial_scale);
-        eprintln!("[emerge_skia] tree_actor: initial width={} height={} scale={}", initial_width, initial_height, initial_scale);
+        let mut engine =
+            TreeUpdateEngine::new(initial_tree, initial_width, initial_height, initial_scale);
+        eprintln!(
+            "[emerge_skia] tree_actor: initial width={} height={} scale={}",
+            initial_width, initial_height, initial_scale
+        );
 
         loop {
             let msg = match tree_rx.recv() {

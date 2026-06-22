@@ -1639,8 +1639,6 @@ dependencies = [
 [[package]]
 name = "rustler"
 version = "0.37.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c779e2cbfa2987990205d0d8fc142163739e45a4c6592dc637896c77fec01280"
 dependencies = [
  "inventory",
  "libloading 0.9.0",

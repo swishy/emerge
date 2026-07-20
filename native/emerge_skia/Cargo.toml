@@ -67,6 +67,7 @@ ios = [
     "skia-safe/metal",
 ]
 android = []
+mic_capture = []
 fbdev = []
 [dependencies]
 rustler = "0.37"

@@ -939,8 +939,12 @@ pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativeOnSurfaceCreat
     surface: JObject,
     width: i32,
     height: i32,
+    density: f32,
 ) {
-    eprintln!("[emerge_skia] nativeOnSurfaceCreated: {}x{}", width, height);
+    eprintln!(
+        "[emerge_skia] nativeOnSurfaceCreated: {}x{} density={}",
+        width, height, density
+    );
 
     // Convert the Java Surface to an ANativeWindow
     let native_window = unsafe { ANativeWindow_fromSurface(env, surface) };
@@ -953,7 +957,7 @@ pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativeOnSurfaceCreat
         native_window,
         width: width as u32,
         height: height as u32,
-        scale: 1.0,
+        scale: if density > 0.0 { density } else { 1.0 },
     });
 }
 

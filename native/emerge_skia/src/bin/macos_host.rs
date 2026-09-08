@@ -1749,11 +1749,11 @@ mod app {
         )?;
         let _ = handle_runtime_input(
             session,
-            InputEvent::Resized {
-                width: session.logical_size.0,
-                height: session.logical_size.1,
-                scale_factor: session.scale_factor,
-            },
+            InputEvent::resized(
+                session.logical_size.0,
+                session.logical_size.1,
+                session.scale_factor,
+            ),
         );
 
         if draw_now {
@@ -1786,11 +1786,11 @@ mod app {
                 if !session.initial_notifications_sent {
                     let _ = handle_runtime_input(
                         session,
-                        InputEvent::Resized {
-                            width: session.logical_size.0,
-                            height: session.logical_size.1,
-                            scale_factor: session.scale_factor,
-                        },
+                        InputEvent::resized(
+                            session.logical_size.0,
+                            session.logical_size.1,
+                            session.scale_factor,
+                        ),
                     );
                     let _ = handle_runtime_input(
                         session,
@@ -2761,6 +2761,7 @@ mod app {
                 width,
                 height,
                 scale_factor,
+                ..
             } => notify_resized(state, session_id, (*width, *height), *scale_factor),
             InputEvent::Focused { focused } => notify_focused(state, session_id, *focused),
             InputEvent::Key { key, action, mods } => {

@@ -1048,6 +1048,82 @@ fn utf16_offset_to_char_index(text: &str, utf16_offset: usize) -> u32 {
     char_count
 }
 
+/// Platform-neutral anchor rectangle for an active text-input session.
+///
+/// Backends expose this in surface/render coordinates so the host platform can
+/// place candidate windows, selection handles, or virtual keyboard affordances
+/// near the focused field.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TextInputSessionAnchor {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// Platform-neutral snapshot of the host-visible state for one focused text
+/// input session.
+///
+/// This is intentionally smaller than `TextInputState`: it carries only the
+/// data that backend adapters need to bridge a focused text field to native
+/// platform text-input systems. Editing behavior still flows through
+/// `TextInputEditRequest`, `TextInputCommandRequest`, `TextInputPreeditRequest`,
+/// and `InputEvent`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TextInputSession {
+    pub content: String,
+    pub cursor: u32,
+    pub selection_anchor: Option<u32>,
+    pub multiline: bool,
+    pub anchor: TextInputSessionAnchor,
+}
+
+impl TextInputSession {
+    pub fn from_state(state: &TextInputState, cursor_area: Option<(f32, f32, f32, f32)>) -> Self {
+        let (x, y, width, height) = cursor_area.unwrap_or((
+            state.frame_x,
+            state.frame_y,
+            state.frame_width,
+            state.frame_height,
+        ));
+
+        Self {
+            content: state.content.clone(),
+            cursor: state.cursor,
+            selection_anchor: state.selection_anchor,
+            multiline: state.multiline,
+            anchor: TextInputSessionAnchor {
+                x,
+                y,
+                width,
+                height,
+            },
+        }
+    }
+}
+
+/// Command emitted by a backend when the host-side text-input session should be
+/// shown, hidden, or updated.
+///
+/// The command stream is platform-neutral. Backends may adapt it to a concrete
+/// transport such as JNI polling on Android or direct native API calls on other
+/// platforms.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TextInputSessionCommand {
+    Show(TextInputSession),
+    Hide,
+    Update(TextInputSession),
+}
+
+impl TextInputSessionCommand {
+    pub fn session(&self) -> Option<&TextInputSession> {
+        match self {
+            Self::Show(session) | Self::Update(session) => Some(session),
+            Self::Hide => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TextInputEditRequest {
     MoveLeft {

@@ -3180,11 +3180,12 @@ impl ListenerCompute {
                 Some(InputEvent::Resized {
                     width,
                     height,
-                    scale_factor,
+                    layout_scale,
+                    ..
                 }) => vec![ListenerAction::TreeMsg(TreeMsg::Resize {
                     width: *width as f32,
                     height: *height as f32,
-                    scale: *scale_factor,
+                    scale: *layout_scale,
                 })],
                 _ => Vec::new(),
             },
@@ -14228,7 +14229,8 @@ mod tests {
         let actions = resize_listener.compute_actions(&InputEvent::Resized {
             width: 800,
             height: 600,
-            scale_factor: 1.5,
+            scale_factor: 2.0,
+            layout_scale: 1.5,
         });
         assert!(matches!(
             actions.as_slice(),
@@ -14236,6 +14238,16 @@ mod tests {
                 if (*width - 800.0).abs() < f32::EPSILON
                     && (*height - 600.0).abs() < f32::EPSILON
                     && (*scale - 1.5).abs() < f32::EPSILON
+        ));
+
+        let physical_actions =
+            resize_listener.compute_actions(&InputEvent::resized_physical(1080, 2400, 3.0));
+        assert!(matches!(
+            physical_actions.as_slice(),
+            [ListenerAction::TreeMsg(TreeMsg::Resize { width, height, scale })]
+                if (*width - 1080.0).abs() < f32::EPSILON
+                    && (*height - 2400.0).abs() < f32::EPSILON
+                    && (*scale - 1.0).abs() < f32::EPSILON
         ));
         assert!(matches!(
             cursor_listener

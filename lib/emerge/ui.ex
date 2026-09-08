@@ -138,6 +138,7 @@ defmodule Emerge.UI do
   """
 
   alias Emerge.Engine.Element
+  alias Emerge.VideoTarget
   alias Emerge.UI.Internal.Builder
   alias Emerge.UI.Internal.Validation
   alias Emerge.UI.Size
@@ -171,7 +172,7 @@ defmodule Emerge.UI do
           binary() | atom() | {:id, binary()} | {:path, binary()} | Emerge.Assets.Ref.t()
 
   @typedoc "A video target accepted by `video/2`."
-  @type video_target :: EmergeSkia.VideoTarget.t()
+  @type video_target :: VideoTarget.compatible_t()
 
   @type key_attr :: {:key, key()}
   @type layout_scale_attr :: {:layout_scale, number()}

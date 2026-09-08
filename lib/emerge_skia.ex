@@ -69,7 +69,7 @@ defmodule EmergeSkia do
 
   @type renderer :: reference() | Renderer.t()
   @type color :: non_neg_integer()
-  @type video_target :: VideoTarget.t()
+  @type video_target :: Emerge.VideoTarget.compatible_t()
 
   @default_asset_timeout_ms 30_000
 
@@ -212,6 +212,9 @@ defmodule EmergeSkia do
   @doc """
   Create a renderer-owned video target.
 
+  The returned compatibility struct can be passed directly to `Emerge.UI.video/2`
+  or normalized into `Emerge.VideoTarget` with `Emerge.VideoTarget.from_skia/1`.
+
   V1 supports fixed-size `:prime` targets only on Prime-capable backends
   (`:wayland` and `:drm`).
   """
@@ -259,7 +262,9 @@ defmodule EmergeSkia do
   Submit a DRM Prime descriptor to a video target.
   """
   @spec submit_prime(video_target(), map()) :: :ok | {:error, term()}
-  def submit_prime(%VideoTarget{mode: :prime, ref: ref}, desc) when is_map(desc) do
+  def submit_prime(target, desc) when is_map(desc) do
+    %{mode: :prime, ref: ref} = Emerge.VideoTarget.normalize!(target)
+
     Native.video_target_submit_prime(ref, desc)
     |> normalize_native_ok()
   end

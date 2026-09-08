@@ -6,7 +6,7 @@ defmodule Emerge.Bench.Scenarios do
   alias Emerge.Engine
   alias Emerge.Engine.Element
   alias Emerge.Engine.Patch
-  alias EmergeSkia.VideoTarget
+  alias Emerge.VideoTarget
 
   @default_sizes [500]
   @scenario_ids [

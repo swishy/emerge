@@ -852,7 +852,7 @@ mod tests {
     #[test]
     fn blocked_scroll_request_publishes_cached_registry_response() {
         let id = NodeId::from_term_bytes(vec![1]);
-        let mut engine = TreeUpdateEngine::new(scrollable_tree_at_start(), 100, 100);
+        let mut engine = TreeUpdateEngine::new(scrollable_tree_at_start(), 100, 100, 1.0);
         let options = TreeUpdateOptions::new(None, TreeUpdateDecodePolicy::ReturnErr);
 
         assert!(matches!(

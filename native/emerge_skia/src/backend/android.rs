@@ -14,7 +14,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex, Once,
+    Arc, LazyLock, Mutex, Once,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -24,8 +24,11 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use crate::actors::{EventMsg, TreeMsg};
 use crate::backend::wake::{BackendWake, BackendWakeHandle, WindowBackendStartupInfo};
 use crate::events::registry_builder::ElixirEventPayload;
-use crate::events::{ElementEventKind, HostEventSink};
-use crate::input::InputEvent;
+use crate::events::{
+    ElementEventKind, HostEventSink, TextInputSession, TextInputSessionCommand, TextInputState,
+};
+use crate::input::{ACTION_PRESS, ACTION_RELEASE, InputEvent};
+use crate::keys::CanonicalKey;
 use crate::render_scene::RenderScene;
 use crate::renderer::{RenderFrame, RenderState, SceneRenderer};
 use crate::stats::RendererStatsCollector;
@@ -470,6 +473,111 @@ fn send_event(event: EventMsg) {
 }
 
 // ============================================================================
+// Soft keyboard / IME — render loop publishes state; UI thread polls via JNI
+// ============================================================================
+
+const ANDROID_IME_OP_NONE: i32 = 0;
+const ANDROID_IME_OP_SHOW: i32 = 1;
+const ANDROID_IME_OP_HIDE: i32 = 2;
+const ANDROID_IME_OP_UPDATE: i32 = 3;
+
+/// Key codes shared with Kotlin (`EmergeBridge` / `EmergeImeHost`).
+const ANDROID_KEY_ENTER: i32 = 1;
+const ANDROID_KEY_BACKSPACE: i32 = 2;
+
+static ANDROID_IME_COMMAND: Mutex<Option<TextInputSessionCommand>> = Mutex::new(None);
+static ANDROID_IME_SESSION: LazyLock<Mutex<TextInputSession>> =
+    LazyLock::new(|| Mutex::new(TextInputSession::default()));
+
+fn android_ime_op_code(command: &TextInputSessionCommand) -> i32 {
+    match command {
+        TextInputSessionCommand::Show(_) => ANDROID_IME_OP_SHOW,
+        TextInputSessionCommand::Hide => ANDROID_IME_OP_HIDE,
+        TextInputSessionCommand::Update(_) => ANDROID_IME_OP_UPDATE,
+    }
+}
+
+fn queue_android_ime_command(command: TextInputSessionCommand) {
+    let session = command.session().cloned().unwrap_or_default();
+
+    if let Ok(mut guard) = ANDROID_IME_SESSION.lock() {
+        *guard = session;
+    }
+
+    if let Ok(mut guard) = ANDROID_IME_COMMAND.lock() {
+        *guard = Some(command);
+    }
+}
+
+#[derive(Default)]
+struct AndroidTextInputSessionSync {
+    session: Option<TextInputSession>,
+}
+
+impl AndroidTextInputSessionSync {
+    fn sync(
+        &mut self,
+        ime_enabled: bool,
+        ime_cursor_area: Option<(f32, f32, f32, f32)>,
+        ime_text_state: Option<TextInputState>,
+    ) {
+        let next_session = ime_text_state
+            .as_ref()
+            .filter(|state| ime_enabled && state.focused)
+            .map(|state| TextInputSession::from_state(state, ime_cursor_area));
+
+        match (&self.session, &next_session) {
+            (Some(_), None) => queue_android_ime_command(TextInputSessionCommand::Hide),
+            (None, Some(session)) => {
+                queue_android_ime_command(TextInputSessionCommand::Show(session.clone()));
+            }
+            (Some(current), Some(next)) if current != next => {
+                queue_android_ime_command(TextInputSessionCommand::Update(next.clone()));
+            }
+            _ => {}
+        }
+
+        self.session = next_session;
+    }
+}
+
+fn map_android_key(code: i32) -> Option<CanonicalKey> {
+    match code {
+        ANDROID_KEY_ENTER => Some(CanonicalKey::Enter),
+        ANDROID_KEY_BACKSPACE => Some(CanonicalKey::Backspace),
+        _ => None,
+    }
+}
+
+fn publish_surface_resize(width: u32, height: u32, display_scale: f32) {
+    let display_scale = if display_scale > 0.0 {
+        display_scale
+    } else {
+        1.0
+    };
+    let width = width.max(1);
+    let height = height.max(1);
+
+    let ready = with_android_state_mut(|state| {
+        state.width = width;
+        state.height = height;
+        state.scale = display_scale;
+        unsafe {
+            ANativeWindow_setBuffersGeometry(state.native_window, width as i32, height as i32, 1);
+        }
+    })
+    .is_some();
+
+    if ready {
+        send_event(EventMsg::InputEvent(InputEvent::resized_physical(
+            width,
+            height,
+            display_scale,
+        )));
+    }
+}
+
+// ============================================================================
 // Surface setup channel — JNI writes ANativeWindow info here; run() reads it
 // ============================================================================
 
@@ -846,11 +954,11 @@ pub(crate) fn run(args: AndroidRunArgs) {
     // Phase 8: send initial resize event
     let _ = args
         .event_tx
-        .send(EventMsg::InputEvent(InputEvent::Resized {
-            width: pixel_width,
-            height: pixel_height,
-            scale_factor: surface_info.scale,
-        }));
+        .send(EventMsg::InputEvent(InputEvent::resized_physical(
+            pixel_width,
+            pixel_height,
+            surface_info.scale,
+        )));
 
     // Phase 9: render loop
     let mut session = SceneRenderer::new();
@@ -864,6 +972,7 @@ pub(crate) fn run(args: AndroidRunArgs) {
 
     let mut frame_count: u64 = 0;
     let mut last_log = Instant::now();
+    let mut text_input_sync = AndroidTextInputSessionSync::default();
 
     eprintln!("[emerge_skia] android::run: render loop started");
 
@@ -883,11 +992,15 @@ pub(crate) fn run(args: AndroidRunArgs) {
                 scene,
                 version,
                 animate,
+                ime_enabled,
+                ime_cursor_area,
+                ime_text_state,
                 ..
             }) => {
                 render_state.set_scene(*scene);
                 render_state.render_version = version;
                 render_state.animate = animate;
+                text_input_sync.sync(ime_enabled, ime_cursor_area, *ime_text_state);
                 has_scene = true;
             }
             Some(crate::actors::RenderMsg::Stop) => {
@@ -962,6 +1075,21 @@ pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativeOnSurfaceCreat
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativeOnSurfaceChanged(
+    _env: JNIEnvPtr,
+    _class: JClass,
+    width: i32,
+    height: i32,
+    density: f32,
+) {
+    eprintln!(
+        "[emerge_skia] nativeOnSurfaceChanged: {}x{} density={}",
+        width, height, density
+    );
+    publish_surface_resize(width as u32, height as u32, density);
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativeOnTouchEvent(
     _env: JNIEnvPtr,
     _class: JClass,
@@ -1001,6 +1129,159 @@ pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativeOnTouchMove(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativePollImeOp(
+    _env: JNIEnvPtr,
+    _class: JClass,
+) -> i32 {
+    ANDROID_IME_COMMAND
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take())
+        .map(|command| android_ime_op_code(&command))
+        .unwrap_or(ANDROID_IME_OP_NONE)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativePollImeContent(
+    env: JNIEnvPtr,
+    _class: JClass,
+) -> JString {
+    let content = ANDROID_IME_SESSION
+        .lock()
+        .ok()
+        .map(|guard| guard.content.clone())
+        .unwrap_or_default();
+    unsafe { jni_new_string_utf(env, &content) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativePollImeCursor(
+    _env: JNIEnvPtr,
+    _class: JClass,
+) -> i32 {
+    ANDROID_IME_SESSION
+        .lock()
+        .ok()
+        .map(|guard| guard.cursor as i32)
+        .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativePollImeSelectionAnchor(
+    _env: JNIEnvPtr,
+    _class: JClass,
+) -> i32 {
+    ANDROID_IME_SESSION
+        .lock()
+        .ok()
+        .map(|guard| {
+            guard
+                .selection_anchor
+                .map(|anchor| anchor as i32)
+                .unwrap_or(-1)
+        })
+        .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativePollImeMultiline(
+    _env: JNIEnvPtr,
+    _class: JClass,
+) -> i32 {
+    ANDROID_IME_SESSION
+        .lock()
+        .ok()
+        .map(|guard| if guard.multiline { 1 } else { 0 })
+        .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativePollImeAnchorX(
+    _env: JNIEnvPtr,
+    _class: JClass,
+) -> f32 {
+    ANDROID_IME_SESSION
+        .lock()
+        .ok()
+        .map(|guard| guard.anchor.x)
+        .unwrap_or(0.0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativePollImeAnchorY(
+    _env: JNIEnvPtr,
+    _class: JClass,
+) -> f32 {
+    ANDROID_IME_SESSION
+        .lock()
+        .ok()
+        .map(|guard| guard.anchor.y)
+        .unwrap_or(0.0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativePollImeAnchorW(
+    _env: JNIEnvPtr,
+    _class: JClass,
+) -> f32 {
+    ANDROID_IME_SESSION
+        .lock()
+        .ok()
+        .map(|guard| guard.anchor.width)
+        .unwrap_or(0.0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativePollImeAnchorH(
+    _env: JNIEnvPtr,
+    _class: JClass,
+) -> f32 {
+    ANDROID_IME_SESSION
+        .lock()
+        .ok()
+        .map(|guard| guard.anchor.height)
+        .unwrap_or(0.0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativeOnTextCommit(
+    env: JNIEnvPtr,
+    _class: JClass,
+    text: JString,
+) {
+    let text = unsafe { jni_string(env, text) };
+    if text.is_empty() {
+        return;
+    }
+    send_event(EventMsg::InputEvent(InputEvent::TextCommit {
+        text,
+        mods: 0,
+    }));
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativeOnKey(
+    _env: JNIEnvPtr,
+    _class: JClass,
+    key_code: i32,
+    action: i32,
+) {
+    let Some(key) = map_android_key(key_code) else {
+        return;
+    };
+    let action = match action {
+        0 => ACTION_RELEASE,
+        1 => ACTION_PRESS,
+        _ => return,
+    };
+    send_event(EventMsg::InputEvent(InputEvent::Key {
+        key,
+        action,
+        mods: 0,
+    }));
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativeOnSurfaceDestroyed(
     _env: JNIEnvPtr,
     _class: JClass,
@@ -1034,6 +1315,23 @@ pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativeGetRenderHeigh
 // ============================================================================
 // JNI string extraction helper (raw JNIEnv function table access)
 // ============================================================================
+
+/// Create a Java String from a UTF-8 Rust string via JNI (NewStringUTF slot 167).
+unsafe fn jni_new_string_utf(env: JNIEnvPtr, s: &str) -> JString {
+    const NEW_STRING_UTF: usize = 167;
+
+    unsafe {
+        let functions: *const *const std::ffi::c_void =
+            std::ptr::read_volatile(env as *const *const *const std::ffi::c_void);
+        let new_string_utf_ptr: *const std::ffi::c_void =
+            std::ptr::read_volatile(functions.add(NEW_STRING_UTF));
+        let new_string_utf: extern "system" fn(JNIEnvPtr, *const c_char) -> JString =
+            std::mem::transmute(new_string_utf_ptr);
+
+        let c_str = CString::new(s).unwrap_or_default();
+        new_string_utf(env, c_str.as_ptr())
+    }
+}
 
 /// Extract a Rust String from a JNI jstring using the JNIEnv function table.
 /// Uses function pointer table indices: GetStringUTFChars=169, ReleaseStringUTFChars=170.

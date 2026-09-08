@@ -841,6 +841,8 @@ struct DirectEventRuntime {
     scroll_line_pixels: f32,
     native_log: Arc<NativeLogRelay>,
     stats: Option<Arc<RendererStatsCollector>>,
+    /// Latest resize for Elixir observers; flushed when input_target is registered.
+    pending_observer_resize: Option<(u32, u32, f32)>,
 }
 
 impl DirectEventRuntime {
@@ -898,6 +900,7 @@ impl DirectEventRuntime {
             scroll_line_pixels: SCROLL_LINE_PIXELS,
             native_log,
             stats,
+            pending_observer_resize: None,
         }
     }
 
@@ -970,6 +973,35 @@ impl DirectEventRuntime {
         if let Some(pid) = self.input_target {
             send_running_message(pid);
         }
+
+        self.try_flush_observer_resize();
+    }
+
+    fn try_flush_observer_resize(&mut self) {
+        let Some((width, height, scale_factor)) = self.pending_observer_resize else {
+            return;
+        };
+        let Some(pid) = self.input_target else {
+            return;
+        };
+
+        let event = InputEvent::Resized {
+            width,
+            height,
+            scale_factor,
+            layout_scale: 1.0,
+        };
+
+        if !self.input_handler.accepts(&event) {
+            return;
+        }
+
+        if let Some(sink) = self.host_event_sink.as_deref() {
+            sink.send_raw_input(&event);
+        }
+
+        send_input_event(pid, &event);
+        self.pending_observer_resize = None;
     }
 
     fn record_event_resolve_duration(&self, duration: Duration) {
@@ -1280,12 +1312,23 @@ impl DirectEventRuntime {
             self.listener_lane.is_stale(),
             self.listener_lane.buffered_inputs.len()
         );
-        forward_observer_input(
-            &event,
-            &self.input_handler,
-            &self.input_target,
-            self.host_event_sink.as_deref(),
-        );
+        if let InputEvent::Resized {
+            width,
+            height,
+            scale_factor,
+            ..
+        } = event
+        {
+            self.pending_observer_resize = Some((width, height, scale_factor));
+            self.try_flush_observer_resize();
+        } else {
+            forward_observer_input(
+                &event,
+                &self.input_handler,
+                &self.input_target,
+                self.host_event_sink.as_deref(),
+            );
+        }
         self.clear_text_commit_suppressions_for_event(&event);
 
         if self.listener_lane.is_stale() {
@@ -3610,18 +3653,25 @@ mod tests {
     }
 
     #[test]
+    fn direct_runtime_buffers_resize_until_input_target_is_set() {
+        let mut runtime = DirectEventRuntime::new(false);
+        let (tree_tx, _tree_rx) = crossbeam_channel::bounded(8);
+
+        runtime.handle_input_event(
+            InputEvent::resized_physical(1080, 2400, 2.75),
+            &tree_tx,
+            false,
+        );
+
+        assert_eq!(runtime.pending_observer_resize, Some((1080, 2400, 2.75)));
+        assert!(runtime.input_target.is_none());
+    }
+
+    #[test]
     fn listener_lane_state_coalesces_resize_events_to_latest() {
         let mut lane = ListenerLaneState::initially_stale();
-        lane.buffer_input(InputEvent::Resized {
-            width: 320,
-            height: 180,
-            scale_factor: 1.0,
-        });
-        lane.buffer_input(InputEvent::Resized {
-            width: 640,
-            height: 360,
-            scale_factor: 1.5,
-        });
+        lane.buffer_input(InputEvent::resized(320, 180, 1.0));
+        lane.buffer_input(InputEvent::resized(640, 360, 1.5));
         lane.buffer_input(InputEvent::CursorPos { x: 10.0, y: 20.0 });
 
         let buffered = lane.mark_fresh_and_take_buffered();
@@ -3631,7 +3681,8 @@ mod tests {
             InputEvent::Resized {
                 width: 640,
                 height: 360,
-                scale_factor
+                scale_factor,
+                ..
             } if (scale_factor - 1.5).abs() < f32::EPSILON
         ));
         assert!(matches!(

@@ -239,6 +239,7 @@ mod tests {
                     window_wake: BackendWakeHandle::noop(),
                     initial_width: width,
                     initial_height: height,
+                    initial_scale: 1.0,
                 },
                 initial_tree,
             );

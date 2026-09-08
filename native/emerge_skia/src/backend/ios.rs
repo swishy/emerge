@@ -414,20 +414,20 @@ pub(crate) fn run(args: IosRunArgs) {
     // Phase 2: register event channel
     set_event_tx(args.event_tx.clone());
 
-    // Phase 3: signal startup success
-    // Extract logical_size before moving startup_info
-    let logical_size = (startup_info.width, startup_info.height);
-    let startup_scale = startup_info.scale;
+    // Extract pixel dimensions before moving startup_info
+    let pixel_size = (startup_info.width, startup_info.height);
+    let _startup_scale = startup_info.scale;
     let _ = args.proxy_tx.send(Ok(startup_info));
 
     // Phase 3b: send initial resize event so tree actor uses screen dimensions
+    let display_scale = with_ios_state(|s| s.scale).unwrap_or(1.0);
     let _ = args
         .event_tx
-        .send(EventMsg::InputEvent(InputEvent::Resized {
-            width: logical_size.0,
-            height: logical_size.1,
-            scale_factor: startup_scale,
-        }));
+        .send(EventMsg::InputEvent(InputEvent::resized_physical(
+            pixel_size.0,
+            pixel_size.1,
+            display_scale,
+        )));
 
     // Phase 4: NIF render thread — receives RenderMsg from tree actor
     let mut session = IosSession {

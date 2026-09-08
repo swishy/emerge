@@ -1257,11 +1257,11 @@ impl WaylandApp {
 
         if geometry_changed {
             self.queue_redraw();
-            self.send_input_event(InputEvent::Resized {
-                width: self.geometry.buffer_size.0,
-                height: self.geometry.buffer_size.1,
-                scale_factor: self.geometry.scale_factor(),
-            });
+            self.send_input_event(InputEvent::resized(
+                self.geometry.buffer_size.0,
+                self.geometry.buffer_size.1,
+                self.geometry.scale_factor(),
+            ));
             self.text_input.sync(&self.window, &self.geometry);
         }
 

@@ -1706,11 +1706,11 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
             logged_mode_info = true;
         }
         if last_dimensions != Some(dimensions) {
-            let _ = event_tx.send(EventMsg::InputEvent(InputEvent::Resized {
-                width: dimensions.0,
-                height: dimensions.1,
-                scale_factor: 1.0,
-            }));
+            let _ = event_tx.send(EventMsg::InputEvent(InputEvent::resized(
+                dimensions.0,
+                dimensions.1,
+                1.0,
+            )));
             last_dimensions = Some(dimensions);
         }
 

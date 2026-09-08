@@ -80,10 +80,18 @@ pub enum InputEvent {
     CursorEntered { entered: bool },
 
     /// Window resized
+    ///
+    /// `scale_factor` is the device/display scale delivered to Elixir observers
+    /// (`{:resized, {width, height, scale_factor}}`).
+    ///
+    /// `layout_scale` is applied by the tree layout engine. Use `1.0` when
+    /// `width`/`height` are already physical pixels (mobile backends and apps
+    /// that pre-scale with `dp/1`).
     Resized {
         width: u32,
         height: u32,
         scale_factor: f32,
+        layout_scale: f32,
     },
 
     /// Window focused/unfocused
@@ -367,6 +375,26 @@ impl Default for InputHandler {
 // ============================================================================
 
 impl InputEvent {
+    /// Resize event where display and layout share the same scale (desktop/Wayland).
+    pub fn resized(width: u32, height: u32, scale_factor: f32) -> Self {
+        Self::Resized {
+            width,
+            height,
+            scale_factor,
+            layout_scale: scale_factor,
+        }
+    }
+
+    /// Physical-pixel resize: display scale for Elixir, layout scale fixed at 1.0.
+    pub fn resized_physical(width: u32, height: u32, display_scale: f32) -> Self {
+        Self::Resized {
+            width,
+            height,
+            scale_factor: display_scale,
+            layout_scale: 1.0,
+        }
+    }
+
     pub fn normalize_scroll(self) -> InputEvent {
         self.normalize_scroll_with_line_pixels(SCROLL_LINE_PIXELS)
     }
@@ -462,6 +490,7 @@ impl Encoder for InputEvent {
                 width,
                 height,
                 scale_factor,
+                ..
             } => (resized(), (*width, *height, *scale_factor)).encode(env),
 
             InputEvent::Focused {

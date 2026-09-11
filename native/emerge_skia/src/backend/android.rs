@@ -81,6 +81,11 @@ fn promote_self_to_global_scope() {
         let path = unsafe { CStr::from_ptr(info.dli_fname) }
             .to_string_lossy()
             .into_owned();
+        // Rustler 0.38+ checks this path on Android so it can resolve
+        // `enif_*` symbols from the already-loaded app library.
+        unsafe {
+            std::env::set_var("RUSTLER_BEAM_LIBRARY_PATH", path.as_str());
+        }
         let handle = unsafe { dlopen(info.dli_fname, RTLD_NOW | RTLD_GLOBAL) };
 
         if handle.is_null() {
@@ -96,7 +101,9 @@ fn promote_self_to_global_scope() {
                 "nativeStart: dlopen RTLD_GLOBAL failed for {path}: {error}"
             ));
         } else {
-            android_log(&format!("nativeStart: promoted {path} to RTLD_GLOBAL"));
+            android_log(&format!(
+                "nativeStart: promoted {path} to RTLD_GLOBAL and set RUSTLER_BEAM_LIBRARY_PATH"
+            ));
         }
     });
 }
@@ -593,6 +600,12 @@ unsafe impl Send for SurfaceInfo {}
 static ANDROID_SURFACE_TX: Mutex<Option<std::sync::mpsc::Sender<SurfaceInfo>>> = Mutex::new(None);
 static ANDROID_PENDING_SURFACE: Mutex<Option<SurfaceInfo>> = Mutex::new(None);
 
+fn clear_surface_tx() {
+    if let Ok(mut guard) = ANDROID_SURFACE_TX.lock() {
+        *guard = None;
+    }
+}
+
 fn set_surface_tx(tx: std::sync::mpsc::Sender<SurfaceInfo>) {
     if let Ok(mut guard) = ANDROID_SURFACE_TX.lock() {
         *guard = Some(tx.clone());
@@ -614,12 +627,18 @@ fn release_surface_info(info: SurfaceInfo) {
 }
 
 fn publish_surface(info: SurfaceInfo) {
-    if let Ok(guard) = ANDROID_SURFACE_TX.lock()
+    if let Ok(mut guard) = ANDROID_SURFACE_TX.lock()
         && let Some(ref tx) = *guard
     {
         if let Err(err) = tx.send(info) {
-            eprintln!("[emerge_skia] publish_surface: surface receiver dropped");
-            release_surface_info(err.0);
+            eprintln!("[emerge_skia] publish_surface: surface receiver dropped; storing pending surface");
+            *guard = None;
+
+            if let Ok(mut pending) = ANDROID_PENDING_SURFACE.lock() {
+                if let Some(old) = pending.replace(err.0) {
+                    release_surface_info(old);
+                }
+            }
         }
         return;
     }
@@ -786,6 +805,44 @@ fn create_skia_context() -> Result<skia_safe::gpu::DirectContext, String> {
 // Rendering — runs on the NIF thread
 // ============================================================================
 
+fn create_android_state(surface_info: SurfaceInfo) -> Result<AndroidGlobalState, String> {
+    let (egl_display, egl_context, egl_surface) = setup_egl(
+        surface_info.native_window,
+        surface_info.width as i32,
+        surface_info.height as i32,
+    )?;
+
+    let skia_context = match create_skia_context() {
+        Ok(ctx) => ctx,
+        Err(reason) => {
+            unsafe {
+                eglDestroyContext(egl_display, egl_context);
+                eglDestroySurface(egl_display, egl_surface);
+                eglTerminate(egl_display);
+            }
+            return Err(reason);
+        }
+    };
+
+    Ok(AndroidGlobalState {
+        native_window: surface_info.native_window,
+        egl_display,
+        egl_context,
+        egl_surface,
+        skia_context: Mutex::new(skia_context),
+        width: surface_info.width,
+        height: surface_info.height,
+        scale: surface_info.scale,
+    })
+}
+
+fn take_pending_surface() -> Option<SurfaceInfo> {
+    ANDROID_PENDING_SURFACE
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take())
+}
+
 fn render_and_present(renderer: &mut SceneRenderer, state: &RenderState) -> Result<(), String> {
     with_android_state_mut(|android_state| {
         let w = android_state.width.max(1) as i32;
@@ -886,34 +943,13 @@ pub(crate) fn run(args: AndroidRunArgs) {
         "[emerge_skia] android::run: received surface {}x{} scale={}",
         surface_info.width, surface_info.height, surface_info.scale
     );
+    clear_surface_tx();
 
     // Phase 3: create EGL context and surface
-    let (egl_display, egl_context, egl_surface) = match setup_egl(
-        surface_info.native_window,
-        surface_info.width as i32,
-        surface_info.height as i32,
-    ) {
-        Ok(ok) => ok,
+    let initial_state = match create_android_state(surface_info) {
+        Ok(state) => state,
         Err(reason) => {
-            eprintln!("[emerge_skia] android::run: EGL setup failed: {}", reason);
-            let _ = args.proxy_tx.send(Err(reason));
-            return;
-        }
-    };
-
-    // Phase 4: create Skia DirectContext (EGL context must be current)
-    let skia_context = match create_skia_context() {
-        Ok(ctx) => ctx,
-        Err(reason) => {
-            eprintln!(
-                "[emerge_skia] android::run: Skia context creation failed: {}",
-                reason
-            );
-            unsafe {
-                eglDestroyContext(egl_display, egl_context);
-                eglDestroySurface(egl_display, egl_surface);
-                eglTerminate(egl_display);
-            }
+            eprintln!("[emerge_skia] android::run: initial surface setup failed: {}", reason);
             let _ = args.proxy_tx.send(Err(reason));
             return;
         }
@@ -924,20 +960,10 @@ pub(crate) fn run(args: AndroidRunArgs) {
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     // Phase 6: store global state
-    set_android_state(AndroidGlobalState {
-        native_window: surface_info.native_window,
-        egl_display,
-        egl_context,
-        egl_surface,
-        skia_context: Mutex::new(skia_context),
-        width: surface_info.width,
-        height: surface_info.height,
-        scale: surface_info.scale,
-    });
-
-    // Calculate pixel dimensions (Android surface provides pixel dimensions directly)
-    let pixel_width = surface_info.width;
-    let pixel_height = surface_info.height;
+    let pixel_width = initial_state.width;
+    let pixel_height = initial_state.height;
+    let pixel_scale = initial_state.scale;
+    set_android_state(initial_state);
 
     // Phase 7: signal startup success
     let _ = args.proxy_tx.send(Ok(WindowBackendStartupInfo {
@@ -957,7 +983,7 @@ pub(crate) fn run(args: AndroidRunArgs) {
         .send(EventMsg::InputEvent(InputEvent::resized_physical(
             pixel_width,
             pixel_height,
-            surface_info.scale,
+            pixel_scale,
         )));
 
     // Phase 9: render loop
@@ -986,6 +1012,31 @@ pub(crate) fn run(args: AndroidRunArgs) {
         } else {
             args.render_rx.recv().ok()
         };
+
+        if let Some(surface_info) = take_pending_surface() {
+            if let Some(old_state) = take_android_state() {
+                drop(old_state);
+            }
+
+            match create_android_state(surface_info) {
+                Ok(state) => {
+                    let width = state.width;
+                    let height = state.height;
+                    let scale = state.scale;
+                    set_android_state(state);
+                    let _ = args.event_tx.send(EventMsg::InputEvent(
+                        InputEvent::resized_physical(width, height, scale),
+                    ));
+                    eprintln!(
+                        "[emerge_skia] android::run: rebound surface {}x{} scale={}",
+                        width, height, scale
+                    );
+                }
+                Err(reason) => {
+                    eprintln!("[emerge_skia] android::run: surface rebind failed: {reason}");
+                }
+            }
+        }
 
         match msg {
             Some(crate::actors::RenderMsg::Scene {
@@ -1184,6 +1235,43 @@ pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativePollImeSelecti
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativePollImePreedit(
+    env: JNIEnvPtr,
+    _class: JClass,
+) -> JString {
+    let preedit = ANDROID_IME_SESSION
+        .lock()
+        .ok()
+        .and_then(|guard| guard.preedit.clone())
+        .unwrap_or_default();
+    unsafe { jni_new_string_utf(env, &preedit) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativePollImePreeditCursorStart(
+    _env: JNIEnvPtr,
+    _class: JClass,
+) -> i32 {
+    ANDROID_IME_SESSION
+        .lock()
+        .ok()
+        .and_then(|guard| guard.preedit_cursor.map(|(start, _)| start as i32))
+        .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativePollImePreeditCursorEnd(
+    _env: JNIEnvPtr,
+    _class: JClass,
+) -> i32 {
+    ANDROID_IME_SESSION
+        .lock()
+        .ok()
+        .and_then(|guard| guard.preedit_cursor.map(|(_, ending)| ending as i32))
+        .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativePollImeMultiline(
     _env: JNIEnvPtr,
     _class: JClass,
@@ -1256,6 +1344,57 @@ pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativeOnTextCommit(
     send_event(EventMsg::InputEvent(InputEvent::TextCommit {
         text,
         mods: 0,
+    }));
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativeOnTextPreedit(
+    env: JNIEnvPtr,
+    _class: JClass,
+    text: JString,
+    cursor_start: i32,
+    cursor_end: i32,
+) {
+    let text = unsafe { jni_string(env, text) };
+    if text.is_empty() {
+        send_event(EventMsg::InputEvent(InputEvent::TextPreeditClear));
+        return;
+    }
+
+    let cursor = if cursor_start >= 0 && cursor_end >= 0 {
+        Some((cursor_start as u32, cursor_end as u32))
+    } else {
+        None
+    };
+
+    send_event(EventMsg::InputEvent(InputEvent::TextPreedit {
+        text,
+        cursor,
+    }));
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativeOnTextPreeditClear(
+    _env: JNIEnvPtr,
+    _class: JClass,
+) {
+    send_event(EventMsg::InputEvent(InputEvent::TextPreeditClear));
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emerge_android_EmergeBridge_nativeOnDeleteSurrounding(
+    _env: JNIEnvPtr,
+    _class: JClass,
+    before_length: i32,
+    after_length: i32,
+) {
+    if before_length < 0 || after_length < 0 {
+        return;
+    }
+
+    send_event(EventMsg::InputEvent(InputEvent::DeleteSurrounding {
+        before_length: before_length as u32,
+        after_length: after_length as u32,
     }));
 }
 

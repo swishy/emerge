@@ -1074,6 +1074,8 @@ pub struct TextInputSession {
     pub content: String,
     pub cursor: u32,
     pub selection_anchor: Option<u32>,
+    pub preedit: Option<String>,
+    pub preedit_cursor: Option<(u32, u32)>,
     pub multiline: bool,
     pub anchor: TextInputSessionAnchor,
 }
@@ -1091,6 +1093,8 @@ impl TextInputSession {
             content: state.content.clone(),
             cursor: state.cursor,
             selection_anchor: state.selection_anchor,
+            preedit: state.preedit.clone(),
+            preedit_cursor: state.preedit_cursor,
             multiline: state.multiline,
             anchor: TextInputSessionAnchor {
                 x,

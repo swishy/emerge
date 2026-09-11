@@ -70,7 +70,7 @@ android = []
 mic_capture = []
 fbdev = []
 [dependencies]
-rustler = "0.37"
+rustler = "=0.38.0"
 objc2 = { version = "0.6", optional = true }
 objc2-foundation = { version = "0.3", features = ["NSArray", "NSAttributedString", "NSDate", "NSRange", "NSString", "NSRunLoop"], optional = true }
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSCell", "NSControl", "NSEvent", "NSGraphics", "NSImage", "NSImageView", "NSPasteboard", "NSResponder", "NSRunningApplication", "NSTextInputClient", "NSTrackingArea", "NSView", "NSWindow"], optional = true }
@@ -114,5 +114,3 @@ glutin_egl_sys = "0.7"
 evdev = { version = "0.13", optional = true }
 arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"], optional = true }
 
-[patch.crates-io]
-rustler = { path = "vendor/rustler-0.37.3" }

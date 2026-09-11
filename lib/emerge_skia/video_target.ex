@@ -1,6 +1,10 @@
 defmodule EmergeSkia.VideoTarget do
   @moduledoc """
-  Handle for a renderer-owned video target.
+  Legacy compatibility struct for renderer-owned video targets.
+
+  `EmergeSkia.video_target/2` still returns this struct for backwards
+  compatibility. Higher-level Emerge APIs normalize both this legacy value and
+  `%Emerge.VideoTarget{}` through `Emerge.VideoTarget`.
 
   `id` is serialized into the UI tree, while `ref` is passed to native submit APIs.
   """

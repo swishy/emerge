@@ -33,6 +33,7 @@ use crate::{
     clipboard::{ClipboardManager, ClipboardTarget},
     input::{ACTION_PRESS, InputEvent, InputHandler, SCROLL_LINE_PIXELS},
     keys::CanonicalKey,
+    native_log::NativeLogRelay,
     stats::RendererStatsCollector,
     tree::{
         element::{NodeId, SliderValueOrigin, TextInputContentOrigin},
@@ -69,6 +70,7 @@ struct EventRuntimeDriver {
     runtime: DirectEventRuntime,
     tree_tx: Sender<TreeMsg>,
     log_render: bool,
+    native_log: Arc<NativeLogRelay>,
 }
 
 impl EventRuntimeDriver {
@@ -78,6 +80,7 @@ impl EventRuntimeDriver {
         backend_wake: BackendWakeHandle,
         tree_tx: Sender<TreeMsg>,
         log_render: bool,
+        native_log: Arc<NativeLogRelay>,
         stats: Option<Arc<RendererStatsCollector>>,
     ) -> Self {
         Self {
@@ -85,32 +88,18 @@ impl EventRuntimeDriver {
                 system_clipboard,
                 backend_cursor_tx,
                 backend_wake,
+                Arc::clone(&native_log),
                 stats,
             ),
             tree_tx,
             log_render,
+            native_log,
         }
     }
 
-    fn new_with_host_sink(
-        system_clipboard: bool,
-        backend_cursor_tx: Option<Sender<CursorIcon>>,
-        backend_wake: BackendWakeHandle,
-        host_event_sink: Arc<dyn HostEventSink>,
-        tree_tx: Sender<TreeMsg>,
-        log_render: bool,
-        stats: Option<Arc<RendererStatsCollector>>,
-    ) -> Self {
-        Self {
-            runtime: DirectEventRuntime::new_with_host_sink(
-                system_clipboard,
-                backend_cursor_tx,
-                backend_wake,
-                host_event_sink,
-                stats,
-            ),
-            tree_tx,
-            log_render,
+    fn log_event_diagnostic(&self, build: impl FnOnce() -> String) {
+        if self.log_render {
+            self.native_log.info("event_runtime", build());
         }
     }
 
@@ -181,20 +170,56 @@ impl EventRuntimeDriver {
         event_rx: &Receiver<EventMsg>,
         pending_message: &mut Option<EventMsg>,
     ) -> bool {
+        let message_label = event_msg_label(&message);
+        self.log_event_diagnostic(|| {
+            format!(
+                "actor message received\n  message: {message_label}\n  {}",
+                self.runtime.diagnostic_summary(),
+            )
+        });
+
         match message {
             EventMsg::InputEvent(event) => {
                 let events = drain_fresh_input_events(event, event_rx, pending_message);
+                self.log_event_diagnostic(|| {
+                    format!(
+                        "input batch drained\n  initial: {message_label}\n  count: {}\n  pending_message: {}\n  labels: {}\n  {}",
+                        events.len(),
+                        pending_message
+                            .as_ref()
+                            .map(event_msg_label)
+                            .unwrap_or("none"),
+                        events
+                            .iter()
+                            .map(input_event_label)
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        self.runtime.diagnostic_summary(),
+                    )
+                });
                 events
                     .into_iter()
                     .for_each(|event| self.handle_input(event));
                 true
             }
             EventMsg::RegistryUpdate { rebuild } => {
-                let rebuild = if self.runtime.should_preserve_registry_transitions() {
-                    rebuild
-                } else {
-                    coalesce_registry_updates(rebuild, event_rx, pending_message).0
-                };
+                let (rebuild, coalesced_count) =
+                    if self.runtime.should_preserve_registry_transitions() {
+                        (rebuild, 0)
+                    } else {
+                        coalesce_registry_updates(rebuild, event_rx, pending_message)
+                    };
+                self.log_event_diagnostic(|| {
+                    format!(
+                        "registry update drained\n  coalesced_count: {coalesced_count}\n  pending_message: {}\n  preserve_transitions: {}\n  {}",
+                        pending_message
+                            .as_ref()
+                            .map(event_msg_label)
+                            .unwrap_or("none"),
+                        self.runtime.should_preserve_registry_transitions(),
+                        self.runtime.diagnostic_summary(),
+                    )
+                });
                 self.install_rebuild(rebuild);
                 true
             }
@@ -202,18 +227,35 @@ impl EventRuntimeDriver {
                 presented_at,
                 predicted_next_present_at,
             } => {
+                self.log_event_diagnostic(|| {
+                    format!(
+                        "present timing received\n  predicted_delta: {:.3} ms\n  {}",
+                        predicted_next_present_at
+                            .saturating_duration_since(presented_at)
+                            .as_secs_f64()
+                            * 1_000.0,
+                        self.runtime.diagnostic_summary(),
+                    )
+                });
                 self.handle_present_timing(presented_at, predicted_next_present_at);
                 true
             }
             EventMsg::SetInputMask(mask) => {
+                self.log_event_diagnostic(|| format!("set input mask\n  mask: {mask}"));
                 self.set_input_mask(mask);
                 true
             }
             EventMsg::SetInputTarget(target) => {
+                self.log_event_diagnostic(|| {
+                    format!("set input target\n  present: {}", target.is_some())
+                });
                 self.set_input_target(target);
                 true
             }
-            EventMsg::Stop => false,
+            EventMsg::Stop => {
+                self.log_event_diagnostic(|| "stop received".to_string());
+                false
+            }
         }
     }
 }
@@ -250,15 +292,20 @@ impl HostEventRuntime {
         backend_cursor_tx: Option<Sender<CursorIcon>>,
     ) -> Self {
         let (tree_tx, tree_rx) = crossbeam_channel::bounded(512);
-        let mut driver = EventRuntimeDriver::new_with_host_sink(
-            system_clipboard,
-            backend_cursor_tx,
-            BackendWakeHandle::noop(),
-            sink,
-            tree_tx.clone(),
+        let native_log = Arc::new(NativeLogRelay::default());
+        let mut driver = EventRuntimeDriver {
+            runtime: DirectEventRuntime::new_with_host_sink(
+                system_clipboard,
+                backend_cursor_tx,
+                BackendWakeHandle::noop(),
+                sink,
+                Arc::clone(&native_log),
+                stats,
+            ),
+            tree_tx: tree_tx.clone(),
             log_render,
-            stats,
-        );
+            native_log,
+        };
         driver.set_scroll_line_pixels(scroll_line_pixels);
 
         Self { driver, tree_rx }
@@ -477,7 +524,12 @@ impl PendingDispatchEffects {
                     return self;
                 }
 
-                if event.kind != ElementEventKind::MouseMove {
+                if !matches!(
+                    event.kind,
+                    ElementEventKind::MouseMove
+                        | ElementEventKind::MouseEnter
+                        | ElementEventKind::MouseLeave
+                ) {
                     self.elixir_event_requires_rebuild = true;
                 }
                 runtime.send_elixir_event(event);
@@ -500,6 +552,8 @@ impl PendingDispatchEffects {
         log_render: bool,
         dispatch_mode: DispatchMode,
     ) {
+        let runtime_change_count = self.runtime_changes.len();
+        let synthetic_input_batch_count = self.synthetic_inputs.len();
         runtime.apply_runtime_changes_and_recompose_if_needed(self.runtime_changes);
         if let Some(icon) = self.requested_cursor {
             runtime.apply_cursor_request(icon);
@@ -512,9 +566,35 @@ impl PendingDispatchEffects {
             runtime.inject_synthetic_inputs(events, tree_tx, log_render);
         }
 
-        if self.elixir_event_requires_rebuild && self.tree_msgs.is_empty() {
+        let tree_msg_requires_stale = self.tree_msgs.iter().any(tree_msg_requires_listener_stale);
+        if self.elixir_event_requires_rebuild && !tree_msg_requires_stale {
             self.tree_msgs.push(TreeMsg::RebuildRegistry);
         }
+
+        runtime.log_event_diagnostic(log_render, || {
+            format!(
+                concat!(
+                    "dispatch effects flush\n",
+                    "  mode: {:?}\n",
+                    "  runtime_changes: {}\n",
+                    "  synthetic_batches: {}\n",
+                    "  tree_msgs: {} [{}]\n",
+                    "  elixir_event_requires_rebuild: {}\n",
+                    "  tree_msg_requires_stale: {}\n",
+                    "  mark_stale: {}\n",
+                    "  {}"
+                ),
+                dispatch_mode,
+                runtime_change_count,
+                synthetic_input_batch_count,
+                self.tree_msgs.len(),
+                format_tree_msg_labels(&self.tree_msgs),
+                self.elixir_event_requires_rebuild,
+                tree_msg_requires_stale,
+                self.elixir_event_requires_rebuild || tree_msg_requires_stale,
+                runtime.diagnostic_summary(),
+            )
+        });
 
         crate::debug_trace::hover_trace!(
             "event_dispatch",
@@ -530,11 +610,83 @@ impl PendingDispatchEffects {
             runtime.listener_lane.is_stale()
         );
 
-        if self.elixir_event_requires_rebuild || !self.tree_msgs.is_empty() {
+        if !self.tree_msgs.is_empty() {
             send_tree_messages(tree_tx, self.tree_msgs, log_render);
+        }
+        if self.elixir_event_requires_rebuild || tree_msg_requires_stale {
             runtime.listener_lane.mark_stale();
+            runtime.log_event_diagnostic(log_render, || {
+                format!(
+                    "listener lane marked stale\n  mode: {:?}\n  {}",
+                    dispatch_mode,
+                    runtime.diagnostic_summary(),
+                )
+            });
         }
     }
+}
+
+fn tree_msg_requires_listener_stale(msg: &TreeMsg) -> bool {
+    msg.requires_listener_registry_response()
+}
+
+fn input_event_label(event: &InputEvent) -> &'static str {
+    match event {
+        InputEvent::CursorPos { .. } => "cursor_pos",
+        InputEvent::CursorButton { .. } => "cursor_button",
+        InputEvent::CursorScroll { .. } => "cursor_scroll",
+        InputEvent::CursorScrollLines { .. } => "cursor_scroll_lines",
+        InputEvent::Key { .. } => "key",
+        InputEvent::TextCommit { .. } => "text_commit",
+        InputEvent::TextPreedit { .. } => "text_preedit",
+        InputEvent::TextPreeditClear => "text_preedit_clear",
+        InputEvent::DeleteSurrounding { .. } => "delete_surrounding",
+        InputEvent::CursorEntered { .. } => "cursor_entered",
+        InputEvent::Resized { .. } => "resized",
+        InputEvent::Focused { .. } => "focused",
+    }
+}
+
+fn tree_msg_label(msg: &TreeMsg) -> &'static str {
+    match msg {
+        TreeMsg::UploadTree { .. } => "upload_tree",
+        TreeMsg::PatchTree { .. } => "patch_tree",
+        TreeMsg::Resize { .. } => "resize",
+        TreeMsg::ScrollRequest { .. } => "scroll_request",
+        TreeMsg::ScrollbarThumbDragX { .. } => "scrollbar_thumb_drag_x",
+        TreeMsg::ScrollbarThumbDragY { .. } => "scrollbar_thumb_drag_y",
+        TreeMsg::SetScrollbarXHover { .. } => "set_scrollbar_x_hover",
+        TreeMsg::SetScrollbarYHover { .. } => "set_scrollbar_y_hover",
+        TreeMsg::SetMouseOverActive { .. } => "set_mouse_over_active",
+        TreeMsg::SetMouseDownActive { .. } => "set_mouse_down_active",
+        TreeMsg::SetFocusedActive { .. } => "set_focused_active",
+        TreeMsg::SetTextInputContent { .. } => "set_text_input_content",
+        TreeMsg::SetTextInputRuntime { .. } => "set_text_input_runtime",
+        TreeMsg::SetSliderValue { .. } => "set_slider_value",
+        TreeMsg::AnimationPulse { .. } => "animation_pulse",
+        TreeMsg::Batch(_) => "batch",
+        TreeMsg::RebuildRegistry => "rebuild_registry",
+        TreeMsg::AssetStateChanged => "asset_state_changed",
+        TreeMsg::Stop => "stop",
+    }
+}
+
+fn event_msg_label(msg: &EventMsg) -> &'static str {
+    match msg {
+        EventMsg::InputEvent(event) => input_event_label(event),
+        EventMsg::PresentTiming { .. } => "present_timing",
+        EventMsg::RegistryUpdate { .. } => "registry_update",
+        EventMsg::SetInputMask(_) => "set_input_mask",
+        EventMsg::SetInputTarget(_) => "set_input_target",
+        EventMsg::Stop => "stop",
+    }
+}
+
+fn format_tree_msg_labels(msgs: &[TreeMsg]) -> String {
+    msgs.iter()
+        .map(tree_msg_label)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Runtime dispatch context passed into listener computation.
@@ -687,19 +839,29 @@ struct DirectEventRuntime {
     inertial_scroll: Option<InertialScrollState>,
     suppress_drag_release_inertia: bool,
     scroll_line_pixels: f32,
+    native_log: Arc<NativeLogRelay>,
     stats: Option<Arc<RendererStatsCollector>>,
+    /// Latest resize for Elixir observers; flushed when input_target is registered.
+    pending_observer_resize: Option<(u32, u32, f32)>,
 }
 
 impl DirectEventRuntime {
     #[cfg(test)]
     fn new(system_clipboard: bool) -> Self {
-        Self::new_with_backend_cursor(system_clipboard, None, BackendWakeHandle::noop(), None)
+        Self::new_with_backend_cursor(
+            system_clipboard,
+            None,
+            BackendWakeHandle::noop(),
+            Arc::new(NativeLogRelay::default()),
+            None,
+        )
     }
 
     fn new_with_backend_cursor(
         system_clipboard: bool,
         backend_cursor_tx: Option<Sender<CursorIcon>>,
         backend_wake: BackendWakeHandle,
+        native_log: Arc<NativeLogRelay>,
         stats: Option<Arc<RendererStatsCollector>>,
     ) -> Self {
         let base_registry = registry_builder::Registry::default();
@@ -736,7 +898,9 @@ impl DirectEventRuntime {
             inertial_scroll: None,
             suppress_drag_release_inertia: false,
             scroll_line_pixels: SCROLL_LINE_PIXELS,
+            native_log,
             stats,
+            pending_observer_resize: None,
         }
     }
 
@@ -752,12 +916,47 @@ impl DirectEventRuntime {
         backend_cursor_tx: Option<Sender<CursorIcon>>,
         backend_wake: BackendWakeHandle,
         host_event_sink: Arc<dyn HostEventSink>,
+        native_log: Arc<NativeLogRelay>,
         stats: Option<Arc<RendererStatsCollector>>,
     ) -> Self {
-        let mut runtime =
-            Self::new_with_backend_cursor(system_clipboard, backend_cursor_tx, backend_wake, stats);
+        let mut runtime = Self::new_with_backend_cursor(
+            system_clipboard,
+            backend_cursor_tx,
+            backend_wake,
+            native_log,
+            stats,
+        );
         runtime.host_event_sink = Some(host_event_sink);
         runtime
+    }
+
+    fn log_event_diagnostic(&self, log_render: bool, build: impl FnOnce() -> String) {
+        if log_render {
+            self.native_log.info("event_runtime", build());
+        }
+    }
+
+    fn diagnostic_summary(&self) -> String {
+        format!(
+            concat!(
+                "lane: stale={} buffered={} hover_stack={} cursor_in_window={} last_cursor={} focused={:?} ",
+                "overlays: pointer_active={} virtual_key={} inertial_scroll={} text_patches={} slider_patches={} next_timeout={}"
+            ),
+            self.listener_lane.is_stale(),
+            self.listener_lane.buffered_inputs.len(),
+            self.hover_stack.len(),
+            self.cursor_in_window,
+            self.last_cursor_pos.is_some(),
+            self.focused_id,
+            self.has_active_pointer_overlay(),
+            self.runtime_overlay.virtual_key.is_some(),
+            self.inertial_scroll.is_some(),
+            self.pending_text_patches.len(),
+            self.pending_slider_patches.len(),
+            self.next_event_timeout()
+                .map(|duration| format!("{:.3} ms", duration.as_secs_f64() * 1_000.0))
+                .unwrap_or_else(|| "none".to_string()),
+        )
     }
 
     fn set_scroll_line_pixels(&mut self, scroll_line_pixels: f32) {
@@ -774,6 +973,35 @@ impl DirectEventRuntime {
         if let Some(pid) = self.input_target {
             send_running_message(pid);
         }
+
+        self.try_flush_observer_resize();
+    }
+
+    fn try_flush_observer_resize(&mut self) {
+        let Some((width, height, scale_factor)) = self.pending_observer_resize else {
+            return;
+        };
+        let Some(pid) = self.input_target else {
+            return;
+        };
+
+        let event = InputEvent::Resized {
+            width,
+            height,
+            scale_factor,
+            layout_scale: 1.0,
+        };
+
+        if !self.input_handler.accepts(&event) {
+            return;
+        }
+
+        if let Some(sink) = self.host_event_sink.as_deref() {
+            sink.send_raw_input(&event);
+        }
+
+        send_input_event(pid, &event);
+        self.pending_observer_resize = None;
     }
 
     fn record_event_resolve_duration(&self, duration: Duration) {
@@ -1068,6 +1296,13 @@ impl DirectEventRuntime {
         log_render: bool,
     ) {
         let event = event.normalize_scroll_with_line_pixels(self.scroll_line_pixels);
+        let label = input_event_label(&event);
+        self.log_event_diagnostic(log_render, || {
+            format!(
+                "input begin\n  event: {label}\n  {}",
+                self.diagnostic_summary(),
+            )
+        });
         self.record_pointer_snapshot(&event);
         self.cancel_inertial_scroll_for_input(&event);
         crate::debug_trace::hover_trace!(
@@ -1077,20 +1312,45 @@ impl DirectEventRuntime {
             self.listener_lane.is_stale(),
             self.listener_lane.buffered_inputs.len()
         );
-        forward_observer_input(
-            &event,
-            &self.input_handler,
-            &self.input_target,
-            self.host_event_sink.as_deref(),
-        );
+        if let InputEvent::Resized {
+            width,
+            height,
+            scale_factor,
+            ..
+        } = event
+        {
+            self.pending_observer_resize = Some((width, height, scale_factor));
+            self.try_flush_observer_resize();
+        } else {
+            forward_observer_input(
+                &event,
+                &self.input_handler,
+                &self.input_target,
+                self.host_event_sink.as_deref(),
+            );
+        }
         self.clear_text_commit_suppressions_for_event(&event);
 
         if self.listener_lane.is_stale() {
+            let buffered_before = self.listener_lane.buffered_inputs.len();
             self.listener_lane.buffer_input(event);
+            self.log_event_diagnostic(log_render, || {
+                format!(
+                    "input buffered while listener lane stale\n  event: {label}\n  buffered_before: {buffered_before}\n  buffered_after: {}\n  {}",
+                    self.listener_lane.buffered_inputs.len(),
+                    self.diagnostic_summary(),
+                )
+            });
             return;
         }
 
         self.dispatch_event(event, tree_tx, log_render, DispatchMode::Normal);
+        self.log_event_diagnostic(log_render, || {
+            format!(
+                "input end\n  event: {label}\n  {}",
+                self.diagnostic_summary(),
+            )
+        });
     }
 
     fn handle_text_input_command(
@@ -1208,18 +1468,43 @@ impl DirectEventRuntime {
         tree_tx: &Sender<TreeMsg>,
         log_render: bool,
     ) {
-        let _stale_before_install = self.listener_lane.is_stale();
+        let stale_before_install = self.listener_lane.is_stale();
+        let buffered_before_install = self.listener_lane.buffered_inputs.len();
+        self.log_event_diagnostic(log_render, || {
+            format!(
+                "registry update begin\n  stale_before: {stale_before_install}\n  buffered_before: {buffered_before_install}\n  {}",
+                self.diagnostic_summary(),
+            )
+        });
         self.listener_lane.stale = false;
         self.install_rebuild(rebuild, tree_tx, log_render);
-        let _stale_after_install = self.listener_lane.is_stale();
+        let stale_after_install = self.listener_lane.is_stale();
+        self.log_event_diagnostic(log_render, || {
+            format!(
+                "registry update installed\n  stale_after_install: {stale_after_install}\n  {}",
+                self.diagnostic_summary(),
+            )
+        });
         if self.listener_lane.is_stale() {
             return;
         }
 
         let buffered = self.listener_lane.mark_fresh_and_take_buffered();
-        let _buffered_count = buffered.len();
+        let buffered_count = buffered.len();
+        self.log_event_diagnostic(log_render, || {
+            format!(
+                "registry update replay buffered\n  buffered_count: {buffered_count}\n  {}",
+                self.diagnostic_summary(),
+            )
+        });
         self.replay_buffered(buffered, tree_tx, log_render);
-        let _stale_after_replay = self.listener_lane.is_stale();
+        let stale_after_replay = self.listener_lane.is_stale();
+        self.log_event_diagnostic(log_render, || {
+            format!(
+                "registry update replay done\n  stale_after_replay: {stale_after_replay}\n  {}",
+                self.diagnostic_summary(),
+            )
+        });
 
         if !self.listener_lane.is_stale() && !self.has_active_pointer_overlay() {
             self.redispatch_last_cursor_pos(tree_tx, log_render);
@@ -1241,6 +1526,10 @@ impl DirectEventRuntime {
             focus_on_mount,
         } = rebuild;
 
+        let text_input_count = text_inputs.len();
+        let slider_count = sliders.len();
+        let scrollbar_count = scrollbars.len();
+
         self.prune_expired_pending_text_patches();
         self.prune_expired_pending_slider_patches();
         self.base_registry = base_registry;
@@ -1255,10 +1544,12 @@ impl DirectEventRuntime {
                 .is_some_and(|focused_id| focused_id == &suppression.element_id)
         });
 
+        let pending_text_patch_ttl = self.pending_text_patch_ttl();
         let mut changed_tree = reconcile_text_input_states(
             &text_inputs,
             &mut self.text_states,
             &mut self.pending_text_patches,
+            pending_text_patch_ttl,
             &self.focused_id,
             tree_tx,
             log_render,
@@ -1294,6 +1585,26 @@ impl DirectEventRuntime {
         if changed_tree {
             self.listener_lane.mark_stale();
         }
+
+        self.log_event_diagnostic(log_render, || {
+            format!(
+                concat!(
+                    "registry rebuild applied\n",
+                    "  text_inputs: {}\n",
+                    "  sliders: {}\n",
+                    "  scrollbars: {}\n",
+                    "  focused: {:?}\n",
+                    "  changed_tree: {}\n",
+                    "  {}"
+                ),
+                text_input_count,
+                slider_count,
+                scrollbar_count,
+                self.focused_id,
+                changed_tree,
+                self.diagnostic_summary(),
+            )
+        });
     }
 
     fn replay_buffered(
@@ -1302,8 +1613,27 @@ impl DirectEventRuntime {
         tree_tx: &Sender<TreeMsg>,
         log_render: bool,
     ) {
+        let event_count = events.len();
+        self.log_event_diagnostic(log_render, || {
+            format!(
+                "buffered replay begin\n  count: {event_count}\n  labels: {}\n  {}",
+                events
+                    .iter()
+                    .map(input_event_label)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                self.diagnostic_summary(),
+            )
+        });
         for event in events {
             if self.listener_lane.is_stale() {
+                self.log_event_diagnostic(log_render, || {
+                    format!(
+                        "buffered replay paused because lane became stale\n  event: {}\n  {}",
+                        input_event_label(&event),
+                        self.diagnostic_summary(),
+                    )
+                });
                 self.listener_lane.buffer_input(event);
                 continue;
             }
@@ -1313,6 +1643,9 @@ impl DirectEventRuntime {
             };
             self.dispatch_event(event, tree_tx, log_render, dispatch_mode);
         }
+        self.log_event_diagnostic(log_render, || {
+            format!("buffered replay end\n  {}", self.diagnostic_summary(),)
+        });
     }
 
     fn recompose_overlay_registry(&mut self) {
@@ -1332,11 +1665,15 @@ impl DirectEventRuntime {
 
     fn handle_timers(&mut self, tree_tx: &Sender<TreeMsg>, log_render: bool) {
         let now = Instant::now();
+        self.log_event_diagnostic(log_render, || {
+            format!("timers begin\n  {}", self.diagnostic_summary())
+        });
 
         if self
             .virtual_key_deadline
             .is_some_and(|deadline| deadline <= now)
         {
+            self.log_event_diagnostic(log_render, || "virtual key timer due".to_string());
             self.handle_virtual_key_timer(tree_tx, log_render);
         }
 
@@ -1345,8 +1682,12 @@ impl DirectEventRuntime {
             .as_ref()
             .is_some_and(|inertia| inertia.watchdog_deadline <= now)
         {
+            self.log_event_diagnostic(log_render, || "inertial scroll watchdog due".to_string());
             self.step_inertial_scroll(now, tree_tx, log_render);
         }
+        self.log_event_diagnostic(log_render, || {
+            format!("timers end\n  {}", self.diagnostic_summary())
+        });
     }
 
     fn handle_present_timing(
@@ -1498,6 +1839,7 @@ impl DirectEventRuntime {
         dispatch_mode: DispatchMode,
     ) {
         let started_at = Instant::now();
+        let event_label = input_event_label(&event);
         let input = ListenerInput::Raw(event);
         let actions = {
             let mut ctx = RuntimeListenerComputeCtx {
@@ -1513,6 +1855,16 @@ impl DirectEventRuntime {
             registry_builder::LayeredRegistryView::new(&self.overlay_registry, &self.base_registry)
                 .first_match(&input, &[], &mut ctx)
         };
+        let action_count = actions.len();
+
+        self.log_event_diagnostic(log_render, || {
+            format!(
+                "dispatch resolved\n  event: {event_label}\n  mode: {:?}\n  actions: {action_count}\n  resolve_time: {:.3} ms\n  {}",
+                dispatch_mode,
+                started_at.elapsed().as_secs_f64() * 1_000.0,
+                self.diagnostic_summary(),
+            )
+        });
 
         if !actions.is_empty() {
             self.apply_listener_actions(actions, tree_tx, log_render, dispatch_mode);
@@ -1588,12 +1940,14 @@ impl DirectEventRuntime {
                 matcher_kind,
                 emit_click,
                 emit_press_pointer,
+                clear_mouse_down,
             } => {
                 self.runtime_overlay.click_press = Some(registry_builder::ClickPressTracker {
                     element_id,
                     matcher_kind,
                     emit_click,
                     emit_press_pointer,
+                    clear_mouse_down,
                 });
             }
             RuntimeChange::StartVirtualKeyTracker { tracker } => {
@@ -1617,6 +1971,7 @@ impl DirectEventRuntime {
                 origin_x,
                 origin_y,
                 swipe_handlers,
+                scroll_candidate,
             } => {
                 self.suppress_drag_release_inertia = false;
                 self.runtime_overlay.drag = registry_builder::DragTrackerState::Candidate {
@@ -1625,6 +1980,7 @@ impl DirectEventRuntime {
                     origin_x,
                     origin_y,
                     swipe_handlers,
+                    scroll_candidate,
                 };
             }
             RuntimeChange::PromoteDragTracker {
@@ -1633,6 +1989,7 @@ impl DirectEventRuntime {
                 last_x,
                 last_y,
                 locked_axis,
+                scroll_mode,
             } => {
                 self.suppress_drag_release_inertia = false;
                 self.cancel_inertial_scroll();
@@ -1642,6 +1999,7 @@ impl DirectEventRuntime {
                     last_x,
                     last_y,
                     locked_axis,
+                    scroll_mode,
                 };
                 self.sync_drag_motion_start(element_id, locked_axis, last_x, last_y, now);
             }
@@ -1779,21 +2137,8 @@ impl DirectEventRuntime {
     }
 
     fn enqueue_pending_text_patch(&mut self, element_id: NodeId, content: String) {
-        let now = Instant::now();
         let ttl = self.pending_text_patch_ttl();
-        let queue = self.pending_text_patches.entry(element_id).or_default();
-        prune_expired_pending_text_patch_queue(queue, now);
-
-        if let Some(existing) = queue.back_mut()
-            && existing.content == content
-        {
-            existing.expires_at = now + ttl;
-        } else {
-            queue.push_back(PendingTextPatch {
-                content,
-                expires_at: now + ttl,
-            });
-        }
+        enqueue_pending_text_patch_value(&mut self.pending_text_patches, element_id, content, ttl);
     }
 
     fn enqueue_pending_slider_patch(&mut self, element_id: NodeId, value: f64) {
@@ -2027,7 +2372,37 @@ fn send_runtime_update(
         },
         log_render,
     );
-    true
+    // Runtime-only text state is paint/IME state and does not need a listener
+    // registry round trip. Returning false keeps registry reconciliation from
+    // leaving the listener lane stale when this is the only preservation update.
+    false
+}
+
+fn send_pending_content_update(
+    tree_tx: &Sender<TreeMsg>,
+    log_render: bool,
+    pending_text_patches: &mut HashMap<NodeId, VecDeque<PendingTextPatch>>,
+    pending_text_patch_ttl: Duration,
+    element_id: &NodeId,
+    content: String,
+) -> bool {
+    if refresh_pending_text_patch_match(
+        pending_text_patches,
+        element_id,
+        content.as_str(),
+        pending_text_patch_ttl,
+    ) {
+        return false;
+    }
+
+    let changed_tree = send_content_update(tree_tx, log_render, element_id, content.clone());
+    enqueue_pending_text_patch_value(
+        pending_text_patches,
+        *element_id,
+        content,
+        pending_text_patch_ttl,
+    );
+    changed_tree
 }
 
 fn send_content_update(
@@ -2071,6 +2446,57 @@ fn prune_expired_pending_text_patch_queue(queue: &mut VecDeque<PendingTextPatch>
     {
         queue.pop_front();
     }
+}
+
+fn enqueue_pending_text_patch_value(
+    pending_text_patches: &mut HashMap<NodeId, VecDeque<PendingTextPatch>>,
+    element_id: NodeId,
+    content: String,
+    ttl: Duration,
+) {
+    let now = Instant::now();
+    let queue = pending_text_patches.entry(element_id).or_default();
+    prune_expired_pending_text_patch_queue(queue, now);
+
+    if let Some(existing) = queue.back_mut()
+        && existing.content == content
+    {
+        existing.expires_at = now + ttl;
+    } else {
+        queue.push_back(PendingTextPatch {
+            content,
+            expires_at: now + ttl,
+        });
+    }
+}
+
+fn refresh_pending_text_patch_match(
+    pending_text_patches: &mut HashMap<NodeId, VecDeque<PendingTextPatch>>,
+    element_id: &NodeId,
+    content: &str,
+    ttl: Duration,
+) -> bool {
+    let now = Instant::now();
+    let matched = pending_text_patches
+        .get_mut(element_id)
+        .and_then(|queue| {
+            prune_expired_pending_text_patch_queue(queue, now);
+            let pending = queue
+                .iter_mut()
+                .find(|pending| pending.content == content)?;
+            pending.expires_at = now + ttl;
+            Some(())
+        })
+        .is_some();
+
+    if pending_text_patches
+        .get(element_id)
+        .is_some_and(|queue| queue.is_empty())
+    {
+        pending_text_patches.remove(element_id);
+    }
+
+    matched
 }
 
 fn prune_expired_pending_slider_patch_queue(
@@ -2141,10 +2567,18 @@ fn consume_pending_slider_patch_match(
     matched
 }
 
+struct FocusedTextInputReconcileContext<'a> {
+    pending_text_patches: &'a mut HashMap<NodeId, VecDeque<PendingTextPatch>>,
+    pending_text_patch_ttl: Duration,
+    tree_tx: &'a Sender<TreeMsg>,
+    log_render: bool,
+}
+
 fn reconcile_text_input_states(
     text_inputs: &HashMap<NodeId, TextInputState>,
     states: &mut HashMap<NodeId, TextInputState>,
     pending_text_patches: &mut HashMap<NodeId, VecDeque<PendingTextPatch>>,
+    pending_text_patch_ttl: Duration,
     focused: &Option<NodeId>,
     tree_tx: &Sender<TreeMsg>,
     log_render: bool,
@@ -2161,31 +2595,52 @@ fn reconcile_text_input_states(
         element_id: &NodeId,
         rebuild_state: &TextInputState,
         state: &mut TextInputState,
-        pending_text_patches: &mut HashMap<NodeId, VecDeque<PendingTextPatch>>,
-        tree_tx: &Sender<TreeMsg>,
-        log_render: bool,
+        context: &mut FocusedTextInputReconcileContext<'_>,
     ) -> bool {
         fn preserve_runtime_focused_text_input(
             element_id: &NodeId,
             rebuild_state: &TextInputState,
             state: &mut TextInputState,
-            tree_tx: &Sender<TreeMsg>,
-            log_render: bool,
+            context: &mut FocusedTextInputReconcileContext<'_>,
         ) -> bool {
             let mut changed_tree = false;
 
             state.copy_rebuild_metadata_from(rebuild_state);
+            if state.content == rebuild_state.content {
+                consume_pending_text_patch_match(
+                    context.pending_text_patches,
+                    element_id,
+                    state.content.as_str(),
+                );
+            }
+            let patch_content_matches_runtime = state
+                .patch_content
+                .as_deref()
+                .is_some_and(|patch_content| patch_content == state.content);
             let had_patch_content = state.patch_content.take().is_some();
-            if had_patch_content || state.content != rebuild_state.content {
-                changed_tree |=
-                    send_content_update(tree_tx, log_render, element_id, state.content.clone());
+            // A focused tree patch whose content already matches the runtime
+            // value is just an app echo. Do not send SetTextInputContent
+            // solely to clear patch_content, because stale cached rebuilds can
+            // replay that echo and keep the listener lane/render queue hot.
+            if (state.content != rebuild_state.content || had_patch_content)
+                && !patch_content_matches_runtime
+            {
+                changed_tree |= send_pending_content_update(
+                    context.tree_tx,
+                    context.log_render,
+                    context.pending_text_patches,
+                    context.pending_text_patch_ttl,
+                    element_id,
+                    state.content.clone(),
+                );
             }
 
             state.focused = true;
             state.normalize_runtime();
 
             if text_input_runtime_mismatch(rebuild_state, state) {
-                changed_tree |= send_runtime_update(tree_tx, log_render, element_id, state);
+                changed_tree |=
+                    send_runtime_update(context.tree_tx, context.log_render, element_id, state);
             }
 
             changed_tree
@@ -2196,8 +2651,7 @@ fn reconcile_text_input_states(
             rebuild_state: &TextInputState,
             state: &mut TextInputState,
             patch_content: String,
-            tree_tx: &Sender<TreeMsg>,
-            log_render: bool,
+            context: &mut FocusedTextInputReconcileContext<'_>,
         ) -> bool {
             state.copy_rebuild_metadata_from(rebuild_state);
             state.set_content(patch_content.clone());
@@ -2206,38 +2660,50 @@ fn reconcile_text_input_states(
             state.focused = true;
             state.normalize_runtime();
 
-            let mut changed_tree =
-                send_content_update(tree_tx, log_render, element_id, patch_content);
+            let mut changed_tree = send_pending_content_update(
+                context.tree_tx,
+                context.log_render,
+                context.pending_text_patches,
+                context.pending_text_patch_ttl,
+                element_id,
+                patch_content,
+            );
 
             if text_input_runtime_mismatch(rebuild_state, state) {
-                changed_tree |= send_runtime_update(tree_tx, log_render, element_id, state);
+                changed_tree |=
+                    send_runtime_update(context.tree_tx, context.log_render, element_id, state);
             }
 
             changed_tree
         }
 
         let patch_content = rebuild_state.patch_content.clone();
-        let preserve_runtime = patch_content.as_deref().is_none_or(|patch_content| {
-            consume_pending_text_patch_match(pending_text_patches, element_id, patch_content)
-        });
+        let preserve_runtime = match patch_content.as_deref() {
+            None => true,
+            Some(patch_content) => {
+                // A focused patch is not a tree ack yet: the ack arrives when
+                // the tree's base content matches the runtime content. Keep
+                // pending runtime writes alive until that base-content ack so
+                // stale focused patch rebuilds cannot re-emit the same write.
+                refresh_pending_text_patch_match(
+                    context.pending_text_patches,
+                    element_id,
+                    patch_content,
+                    context.pending_text_patch_ttl,
+                ) || patch_content == state.content
+            }
+        };
 
         if preserve_runtime {
-            preserve_runtime_focused_text_input(
-                element_id,
-                rebuild_state,
-                state,
-                tree_tx,
-                log_render,
-            )
+            preserve_runtime_focused_text_input(element_id, rebuild_state, state, context)
         } else {
-            pending_text_patches.remove(element_id);
+            context.pending_text_patches.remove(element_id);
             accept_tree_patch_focused_text_input(
                 element_id,
                 rebuild_state,
                 state,
                 patch_content.expect("focused patch reconcile requires patch_content"),
-                tree_tx,
-                log_render,
+                context,
             )
         }
     }
@@ -2269,14 +2735,13 @@ fn reconcile_text_input_states(
         let state = states.entry(id).or_insert_with(|| rebuild_state.clone());
 
         if should_focus {
-            changed_tree |= reconcile_focused_text_input(
-                &id,
-                rebuild_state,
-                state,
+            let mut context = FocusedTextInputReconcileContext {
                 pending_text_patches,
+                pending_text_patch_ttl,
                 tree_tx,
                 log_render,
-            );
+            };
+            changed_tree |= reconcile_focused_text_input(&id, rebuild_state, state, &mut context);
         } else {
             reset_unfocused_text_input_from_rebuild(state, rebuild_state);
         }
@@ -2307,8 +2772,10 @@ fn reconcile_slider_states(
     ) -> bool {
         state.copy_rebuild_metadata_from(rebuild_state);
         state.set_value(state.value);
-        let had_patch_value = state.patch_value.take().is_some();
-        let changed_tree = had_patch_value || !f64_values_equal(state.value, rebuild_state.value);
+        let patch_value = state.patch_value.take();
+        let changed_tree = patch_value
+            .is_some_and(|patch_value| !f64_values_equal(patch_value, state.value))
+            || !f64_values_equal(state.value, rebuild_state.value);
         if changed_tree {
             send_slider_value_update(tree_tx, log_render, element_id, state.value)
         } else {
@@ -2599,6 +3066,7 @@ pub(crate) struct SpawnEventActorConfig {
     pub backend_wake: BackendWakeHandle,
     pub scroll_line_pixels: f32,
     pub log_render: bool,
+    pub native_log: Arc<NativeLogRelay>,
     pub system_clipboard: bool,
     pub stats: Option<Arc<RendererStatsCollector>>,
 }
@@ -2611,6 +3079,7 @@ pub(crate) fn spawn_event_actor(config: SpawnEventActorConfig) -> thread::JoinHa
         backend_wake,
         scroll_line_pixels,
         log_render,
+        native_log,
         system_clipboard,
         stats,
     } = config;
@@ -2622,9 +3091,16 @@ pub(crate) fn spawn_event_actor(config: SpawnEventActorConfig) -> thread::JoinHa
             backend_wake,
             tree_tx,
             log_render,
+            native_log,
             stats,
         );
         driver.set_scroll_line_pixels(scroll_line_pixels);
+        driver.log_event_diagnostic(|| {
+            format!(
+                "event actor started\n  scroll_line_pixels: {scroll_line_pixels:.3}\n  system_clipboard: {system_clipboard}\n  {}",
+                driver.runtime.diagnostic_summary(),
+            )
+        });
         let mut pending_message: Option<EventMsg> = None;
 
         loop {
@@ -2644,6 +3120,12 @@ pub(crate) fn spawn_event_actor(config: SpawnEventActorConfig) -> thread::JoinHa
             };
 
             let Some(message) = message else {
+                driver.log_event_diagnostic(|| {
+                    format!(
+                        "event actor timer wake\n  {}",
+                        driver.runtime.diagnostic_summary(),
+                    )
+                });
                 driver.handle_timers();
                 continue;
             };
@@ -2777,6 +3259,35 @@ mod tests {
         );
         state.patch_content = patch_content.map(ToString::to_string);
         state
+    }
+
+    fn text_input_rebuild(
+        input_id: NodeId,
+        state: TextInputState,
+        focused_id: Option<NodeId>,
+    ) -> RegistryRebuildPayload {
+        RegistryRebuildPayload {
+            base_registry: registry_builder::Registry::default(),
+            text_inputs: HashMap::from([(input_id, state)]),
+            sliders: HashMap::new(),
+            scrollbars: HashMap::new(),
+            focused_id,
+            focus_on_mount: None,
+        }
+    }
+
+    fn focused_text_input_rebuild(
+        input_id: NodeId,
+        state: TextInputState,
+    ) -> RegistryRebuildPayload {
+        text_input_rebuild(input_id, state, Some(input_id))
+    }
+
+    fn pending_text_patch(content: &str, expires_at: Instant) -> PendingTextPatch {
+        PendingTextPatch {
+            content: content.to_string(),
+            expires_at,
+        }
     }
 
     fn make_slider_state(value: f64, min: f64, max: f64, step: f64) -> SliderState {
@@ -2999,6 +3510,57 @@ mod tests {
         Element::with_attrs(NodeId::from_term_bytes(vec![id]), kind, Vec::new(), attrs)
     }
 
+    fn fixed_box_attrs(width: f64, height: f64) -> Attrs {
+        Attrs {
+            width: Some(Length::Px(width)),
+            height: Some(Length::Px(height)),
+            ..Attrs::default()
+        }
+    }
+
+    fn width_move_attrs(width: f64, move_x: f64) -> Attrs {
+        Attrs {
+            width: Some(Length::Px(width)),
+            move_x: Some(move_x),
+            ..Attrs::default()
+        }
+    }
+
+    fn on_mouse_down_attrs() -> Attrs {
+        Attrs {
+            on_mouse_down: Some(true),
+            ..Attrs::default()
+        }
+    }
+
+    fn on_mouse_move_attrs() -> Attrs {
+        Attrs {
+            on_mouse_move: Some(true),
+            ..Attrs::default()
+        }
+    }
+
+    fn on_press_attrs() -> Attrs {
+        Attrs {
+            on_press: Some(true),
+            ..Attrs::default()
+        }
+    }
+
+    fn on_focus_attrs() -> Attrs {
+        Attrs {
+            on_focus: Some(true),
+            ..Attrs::default()
+        }
+    }
+
+    fn mouse_down_style_attrs() -> Attrs {
+        Attrs {
+            mouse_down: Some(MouseOverAttrs::default()),
+            ..Attrs::default()
+        }
+    }
+
     fn with_frame(mut element: Element, frame: Frame) -> Element {
         element.layout.frame = Some(frame);
         element
@@ -3013,34 +3575,30 @@ mod tests {
 
         let mut tree = ElementTree::new();
 
-        let mut host_attrs = Attrs::default();
-        host_attrs.width = Some(Length::Px(128.0));
-        host_attrs.height = Some(Length::Px(82.0));
+        let host_attrs = fixed_box_attrs(128.0, 82.0);
         let mut host = make_element(130, ElementKind::El, host_attrs);
         host.nearby.set(NearbySlot::InFront, Some(overlay_id));
 
-        let mut from = Attrs::default();
-        from.width = Some(Length::Px(96.0));
-        from.move_x = Some(-16.0);
+        let from = width_move_attrs(96.0, -16.0);
 
-        let mut to = Attrs::default();
-        to.width = Some(Length::Px(156.0));
-        to.move_x = Some(26.0);
+        let to = width_move_attrs(156.0, 26.0);
 
-        let mut overlay_attrs = Attrs::default();
-        overlay_attrs.width = Some(Length::Px(128.0));
-        overlay_attrs.height = Some(Length::Px(82.0));
-        overlay_attrs.align_x = Some(AlignX::Center);
-        overlay_attrs.align_y = Some(AlignY::Center);
-        overlay_attrs.on_mouse_move = Some(true);
-        overlay_attrs.mouse_over = Some(MouseOverAttrs::default());
-        overlay_attrs.mouse_over_active = Some(hover_active);
-        overlay_attrs.animate = Some(AnimationSpec {
-            keyframes: vec![from, to],
-            duration_ms: 1000.0,
-            curve: AnimationCurve::Linear,
-            repeat: AnimationRepeat::Once,
-        });
+        let overlay_attrs = Attrs {
+            width: Some(Length::Px(128.0)),
+            height: Some(Length::Px(82.0)),
+            align_x: Some(AlignX::Center),
+            align_y: Some(AlignY::Center),
+            on_mouse_move: Some(true),
+            mouse_over: Some(MouseOverAttrs::default()),
+            mouse_over_active: Some(hover_active),
+            animate: Some(AnimationSpec {
+                keyframes: vec![from, to],
+                duration_ms: 1000.0,
+                curve: AnimationCurve::Linear,
+                repeat: AnimationRepeat::Once,
+            }),
+            ..Attrs::default()
+        };
 
         let overlay = make_element(131, ElementKind::El, overlay_attrs);
 
@@ -3095,18 +3653,25 @@ mod tests {
     }
 
     #[test]
+    fn direct_runtime_buffers_resize_until_input_target_is_set() {
+        let mut runtime = DirectEventRuntime::new(false);
+        let (tree_tx, _tree_rx) = crossbeam_channel::bounded(8);
+
+        runtime.handle_input_event(
+            InputEvent::resized_physical(1080, 2400, 2.75),
+            &tree_tx,
+            false,
+        );
+
+        assert_eq!(runtime.pending_observer_resize, Some((1080, 2400, 2.75)));
+        assert!(runtime.input_target.is_none());
+    }
+
+    #[test]
     fn listener_lane_state_coalesces_resize_events_to_latest() {
         let mut lane = ListenerLaneState::initially_stale();
-        lane.buffer_input(InputEvent::Resized {
-            width: 320,
-            height: 180,
-            scale_factor: 1.0,
-        });
-        lane.buffer_input(InputEvent::Resized {
-            width: 640,
-            height: 360,
-            scale_factor: 1.5,
-        });
+        lane.buffer_input(InputEvent::resized(320, 180, 1.0));
+        lane.buffer_input(InputEvent::resized(640, 360, 1.5));
         lane.buffer_input(InputEvent::CursorPos { x: 10.0, y: 20.0 });
 
         let buffered = lane.mark_fresh_and_take_buffered();
@@ -3116,7 +3681,8 @@ mod tests {
             InputEvent::Resized {
                 width: 640,
                 height: 360,
-                scale_factor
+                scale_factor,
+                ..
             } if (scale_factor - 1.5).abs() < f32::EPSILON
         ));
         assert!(matches!(
@@ -3193,8 +3759,15 @@ mod tests {
             }))
             .unwrap();
 
-        let mut driver =
-            EventRuntimeDriver::new(false, None, BackendWakeHandle::noop(), tree_tx, false, None);
+        let mut driver = EventRuntimeDriver::new(
+            false,
+            None,
+            BackendWakeHandle::noop(),
+            tree_tx,
+            false,
+            Arc::new(NativeLogRelay::default()),
+            None,
+        );
         let mut pending = None;
 
         assert!(driver.handle_actor_message(
@@ -3216,8 +3789,15 @@ mod tests {
     fn event_runtime_driver_handles_timers_present_timing_and_stop() {
         let (tree_tx, _tree_rx) = bounded(32);
         let (_event_tx, event_rx) = bounded(8);
-        let mut driver =
-            EventRuntimeDriver::new(false, None, BackendWakeHandle::noop(), tree_tx, false, None);
+        let mut driver = EventRuntimeDriver::new(
+            false,
+            None,
+            BackendWakeHandle::noop(),
+            tree_tx,
+            false,
+            Arc::new(NativeLogRelay::default()),
+            None,
+        );
         let mut pending = None;
         let presented_at = Instant::now();
         let predicted_next_present_at = presented_at + Duration::from_millis(16);
@@ -3519,8 +4099,7 @@ mod tests {
 
     #[test]
     fn direct_runtime_dispatches_mouse_down_style_activation() {
-        let mut attrs = Attrs::default();
-        attrs.mouse_down = Some(MouseOverAttrs::default());
+        let attrs = mouse_down_style_attrs();
         let element = with_interaction(make_element(20, ElementKind::El, attrs));
         let rebuild = RegistryRebuildPayload {
             base_registry: registry_builder::registry_for_elements(&[element]),
@@ -3548,11 +4127,174 @@ mod tests {
             false,
         );
 
-        assert!(runtime.listener_lane.is_stale());
+        assert!(!runtime.listener_lane.is_stale());
         assert!(drain_msgs(&tree_rx).iter().any(|msg| matches!(
             msg,
             TreeMsg::SetMouseDownActive { element_id, active }
                 if *element_id == NodeId::from_term_bytes(vec![20]) && *active
+        )));
+
+        runtime.handle_input_event(
+            InputEvent::CursorButton {
+                button: "left".to_string(),
+                action: crate::input::ACTION_RELEASE,
+                mods: 0,
+                x: 80.0,
+                y: 80.0,
+            },
+            &tree_tx,
+            false,
+        );
+
+        assert!(!runtime.listener_lane.is_stale());
+        assert!(drain_msgs(&tree_rx).iter().any(|msg| matches!(
+            msg,
+            TreeMsg::SetMouseDownActive { element_id, active }
+                if *element_id == NodeId::from_term_bytes(vec![20]) && !*active
+        )));
+    }
+
+    #[test]
+    fn direct_runtime_mouse_event_with_mouse_down_style_requests_rebuild() {
+        let element_id = NodeId::from_term_bytes(vec![23]);
+        let attrs = Attrs {
+            on_mouse_down: Some(true),
+            on_mouse_up: Some(true),
+            mouse_down: Some(MouseOverAttrs::default()),
+            ..Attrs::default()
+        };
+        let element = with_interaction(make_element(23, ElementKind::El, attrs));
+        let rebuild = RegistryRebuildPayload {
+            base_registry: registry_builder::registry_for_elements(&[element]),
+            text_inputs: HashMap::new(),
+            sliders: HashMap::new(),
+            scrollbars: HashMap::new(),
+            focused_id: None,
+            focus_on_mount: None,
+        };
+
+        let (tree_tx, tree_rx) = bounded(64);
+        let mut runtime = DirectEventRuntime::new(false);
+        runtime.handle_registry_update(rebuild.clone(), &tree_tx, false);
+        assert!(!runtime.listener_lane.is_stale());
+
+        runtime.handle_input_event(
+            InputEvent::CursorButton {
+                button: "left".to_string(),
+                action: crate::input::ACTION_PRESS,
+                mods: 0,
+                x: 10.0,
+                y: 10.0,
+            },
+            &tree_tx,
+            false,
+        );
+
+        assert!(runtime.listener_lane.is_stale());
+        let press_msgs = drain_msgs(&tree_rx);
+        assert!(press_msgs.iter().any(|msg| matches!(
+            msg,
+            TreeMsg::SetMouseDownActive { element_id: msg_id, active }
+                if *msg_id == element_id && *active
+        )));
+        assert!(
+            press_msgs
+                .iter()
+                .any(|msg| matches!(msg, TreeMsg::RebuildRegistry))
+        );
+
+        runtime.handle_input_event(
+            InputEvent::CursorButton {
+                button: "left".to_string(),
+                action: crate::input::ACTION_RELEASE,
+                mods: 0,
+                x: 10.0,
+                y: 10.0,
+            },
+            &tree_tx,
+            false,
+        );
+
+        assert!(drain_msgs(&tree_rx).is_empty());
+        runtime.handle_registry_update(rebuild, &tree_tx, false);
+        assert!(runtime.listener_lane.is_stale());
+
+        let release_msgs = drain_msgs(&tree_rx);
+        assert!(release_msgs.iter().any(|msg| matches!(
+            msg,
+            TreeMsg::SetMouseDownActive { element_id: msg_id, active }
+                if *msg_id == element_id && !*active
+        )));
+        assert!(
+            release_msgs
+                .iter()
+                .any(|msg| matches!(msg, TreeMsg::RebuildRegistry))
+        );
+    }
+
+    #[test]
+    fn direct_runtime_virtual_key_release_clears_mouse_down_style() {
+        let element_id = NodeId::from_term_bytes(vec![22]);
+        let attrs = Attrs {
+            mouse_down: Some(MouseOverAttrs::default()),
+            virtual_key: Some(VirtualKeySpec {
+                tap: VirtualKeyTapAction::Text("a".to_string()),
+                hold: VirtualKeyHoldMode::None,
+                hold_ms: 350,
+                repeat_ms: 40,
+            }),
+            ..Attrs::default()
+        };
+        let element = with_interaction(make_element(22, ElementKind::El, attrs));
+        let rebuild = RegistryRebuildPayload {
+            base_registry: registry_builder::registry_for_elements(&[element]),
+            text_inputs: HashMap::new(),
+            sliders: HashMap::new(),
+            scrollbars: HashMap::new(),
+            focused_id: None,
+            focus_on_mount: None,
+        };
+
+        let (tree_tx, tree_rx) = bounded(32);
+        let mut runtime = DirectEventRuntime::new(false);
+        runtime.handle_registry_update(rebuild, &tree_tx, false);
+
+        runtime.handle_input_event(
+            InputEvent::CursorButton {
+                button: "left".to_string(),
+                action: crate::input::ACTION_PRESS,
+                mods: 0,
+                x: 10.0,
+                y: 10.0,
+            },
+            &tree_tx,
+            false,
+        );
+
+        assert!(!runtime.listener_lane.is_stale());
+        assert!(drain_msgs(&tree_rx).iter().any(|msg| matches!(
+            msg,
+            TreeMsg::SetMouseDownActive { element_id: msg_id, active }
+                if *msg_id == element_id && *active
+        )));
+
+        runtime.handle_input_event(
+            InputEvent::CursorButton {
+                button: "left".to_string(),
+                action: crate::input::ACTION_RELEASE,
+                mods: 0,
+                x: 10.0,
+                y: 10.0,
+            },
+            &tree_tx,
+            false,
+        );
+
+        assert!(!runtime.listener_lane.is_stale());
+        assert!(drain_msgs(&tree_rx).iter().any(|msg| matches!(
+            msg,
+            TreeMsg::SetMouseDownActive { element_id: msg_id, active }
+                if *msg_id == element_id && !*active
         )));
     }
 
@@ -3560,9 +4302,11 @@ mod tests {
     fn direct_runtime_on_press_inside_release_clears_mouse_down_style() {
         let element_id = NodeId::from_term_bytes(vec![21]);
 
-        let mut attrs = Attrs::default();
-        attrs.on_press = Some(true);
-        attrs.mouse_down = Some(MouseOverAttrs::default());
+        let attrs = Attrs {
+            on_press: Some(true),
+            mouse_down: Some(MouseOverAttrs::default()),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(21, ElementKind::El, attrs.clone()));
         let rebuild = RegistryRebuildPayload {
             base_registry: registry_builder::registry_for_elements(&[element]),
@@ -3635,13 +4379,14 @@ mod tests {
 
     #[test]
     fn direct_runtime_dispatches_concrete_tab_focus_transition() {
-        let mut first_attrs = Attrs::default();
-        first_attrs.on_focus = Some(true);
-        first_attrs.focused_active = Some(true);
+        let first_attrs = Attrs {
+            on_focus: Some(true),
+            focused_active: Some(true),
+            ..Attrs::default()
+        };
         let first = with_interaction(make_element(30, ElementKind::El, first_attrs));
 
-        let mut second_attrs = Attrs::default();
-        second_attrs.on_focus = Some(true);
+        let second_attrs = on_focus_attrs();
         let second = with_interaction(make_element(31, ElementKind::El, second_attrs));
 
         let rebuild = RegistryRebuildPayload {
@@ -3683,10 +4428,12 @@ mod tests {
 
     #[test]
     fn direct_runtime_hover_without_press_does_not_scroll() {
-        let mut attrs = Attrs::default();
-        attrs.scrollbar_x = Some(true);
-        attrs.scroll_x = Some(10.0);
-        attrs.scroll_x_max = Some(100.0);
+        let attrs = Attrs {
+            scrollbar_x: Some(true),
+            scroll_x: Some(10.0),
+            scroll_x_max: Some(100.0),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(40, ElementKind::El, attrs));
         let rebuild = RegistryRebuildPayload {
             base_registry: registry_builder::registry_for_elements(&[element]),
@@ -3716,9 +4463,11 @@ mod tests {
     fn direct_runtime_on_press_without_scroll_match_stays_press_only_until_release() {
         let element_id = NodeId::from_term_bytes(vec![44]);
 
-        let mut attrs = Attrs::default();
-        attrs.on_press = Some(true);
-        attrs.focused_active = Some(true);
+        let attrs = Attrs {
+            on_press: Some(true),
+            focused_active: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(44, ElementKind::El, attrs));
         let rebuild = RegistryRebuildPayload {
             base_registry: registry_builder::registry_for_elements(&[element]),
@@ -3782,10 +4531,12 @@ mod tests {
 
     #[test]
     fn direct_runtime_scrollable_only_element_drag_scrolls_after_threshold() {
-        let mut attrs = Attrs::default();
-        attrs.scrollbar_x = Some(true);
-        attrs.scroll_x = Some(10.0);
-        attrs.scroll_x_max = Some(100.0);
+        let attrs = Attrs {
+            scrollbar_x: Some(true),
+            scroll_x: Some(10.0),
+            scroll_x_max: Some(100.0),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(43, ElementKind::El, attrs));
         let rebuild = RegistryRebuildPayload {
             base_registry: registry_builder::registry_for_elements(&[element]),
@@ -3833,12 +4584,136 @@ mod tests {
     }
 
     #[test]
+    fn direct_runtime_two_axis_element_drag_scrolls_both_axes_after_threshold() {
+        let attrs = Attrs {
+            scrollbar_x: Some(true),
+            scrollbar_y: Some(true),
+            scroll_x: Some(10.0),
+            scroll_y: Some(20.0),
+            scroll_x_max: Some(100.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
+        let element = with_interaction(make_element(89, ElementKind::El, attrs));
+        let rebuild = RegistryRebuildPayload {
+            base_registry: registry_builder::registry_for_elements(&[element]),
+            text_inputs: HashMap::new(),
+            sliders: HashMap::new(),
+            scrollbars: HashMap::new(),
+            focused_id: None,
+            focus_on_mount: None,
+        };
+
+        let (tree_tx, tree_rx) = bounded(32);
+        let mut runtime = DirectEventRuntime::new(false);
+        runtime.handle_registry_update(rebuild, &tree_tx, false);
+        assert!(!runtime.listener_lane.is_stale());
+
+        runtime.handle_input_event(
+            InputEvent::CursorButton {
+                button: "left".to_string(),
+                action: crate::input::ACTION_PRESS,
+                mods: 0,
+                x: 10.0,
+                y: 10.0,
+            },
+            &tree_tx,
+            false,
+        );
+        assert!(drain_msgs(&tree_rx).is_empty());
+
+        runtime.handle_input_event(InputEvent::CursorPos { x: 30.0, y: 28.0 }, &tree_tx, false);
+        assert!(drain_msgs(&tree_rx).is_empty());
+
+        runtime.handle_input_event(InputEvent::CursorPos { x: 38.0, y: 35.0 }, &tree_tx, false);
+
+        let msgs = drain_msgs(&tree_rx);
+        assert!(msgs.iter().any(|msg| matches!(
+            msg,
+            TreeMsg::ScrollRequest { element_id, dx, dy }
+                if *element_id == NodeId::from_term_bytes(vec![89])
+                    && (*dx - 8.0).abs() < f32::EPSILON
+                    && dy.abs() < f32::EPSILON
+        )));
+        assert!(msgs.iter().any(|msg| matches!(
+            msg,
+            TreeMsg::ScrollRequest { element_id, dx, dy }
+                if *element_id == NodeId::from_term_bytes(vec![89])
+                    && dx.abs() < f32::EPSILON
+                    && (*dy - 7.0).abs() < f32::EPSILON
+        )));
+    }
+
+    #[test]
+    fn direct_runtime_two_axis_drag_at_blocked_edge_scrolls_after_reversing() {
+        let attrs = Attrs {
+            scrollbar_x: Some(true),
+            scrollbar_y: Some(true),
+            scroll_x: Some(0.0),
+            scroll_y: Some(0.0),
+            scroll_x_max: Some(100.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
+        let element = with_interaction(make_element(90, ElementKind::El, attrs));
+        let rebuild = RegistryRebuildPayload {
+            base_registry: registry_builder::registry_for_elements(&[element]),
+            text_inputs: HashMap::new(),
+            sliders: HashMap::new(),
+            scrollbars: HashMap::new(),
+            focused_id: None,
+            focus_on_mount: None,
+        };
+
+        let (tree_tx, tree_rx) = bounded(32);
+        let mut runtime = DirectEventRuntime::new(false);
+        runtime.handle_registry_update(rebuild, &tree_tx, false);
+        assert!(!runtime.listener_lane.is_stale());
+
+        runtime.handle_input_event(
+            InputEvent::CursorButton {
+                button: "left".to_string(),
+                action: crate::input::ACTION_PRESS,
+                mods: 0,
+                x: 10.0,
+                y: 10.0,
+            },
+            &tree_tx,
+            false,
+        );
+        assert!(drain_msgs(&tree_rx).is_empty());
+
+        runtime.handle_input_event(InputEvent::CursorPos { x: 30.0, y: 28.0 }, &tree_tx, false);
+        assert!(drain_msgs(&tree_rx).is_empty());
+
+        runtime.handle_input_event(InputEvent::CursorPos { x: 22.0, y: 20.0 }, &tree_tx, false);
+
+        let msgs = drain_msgs(&tree_rx);
+        assert!(msgs.iter().any(|msg| matches!(
+            msg,
+            TreeMsg::ScrollRequest { element_id, dx, dy }
+                if *element_id == NodeId::from_term_bytes(vec![90])
+                    && (*dx + 8.0).abs() < f32::EPSILON
+                    && dy.abs() < f32::EPSILON
+        )));
+        assert!(msgs.iter().any(|msg| matches!(
+            msg,
+            TreeMsg::ScrollRequest { element_id, dx, dy }
+                if *element_id == NodeId::from_term_bytes(vec![90])
+                    && dx.abs() < f32::EPSILON
+                    && (*dy + 8.0).abs() < f32::EPSILON
+        )));
+    }
+
+    #[test]
     fn direct_runtime_rotated_drag_scroll_uses_local_scroll_axis() {
-        let mut attrs = Attrs::default();
-        attrs.scrollbar_y = Some(true);
-        attrs.scroll_y = Some(20.0);
-        attrs.scroll_y_max = Some(100.0);
-        attrs.layout_rotate = Some(90.0);
+        let attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(20.0),
+            scroll_y_max: Some(100.0),
+            layout_rotate: Some(90.0),
+            ..Attrs::default()
+        };
         let element = with_frame(
             make_element(45, ElementKind::El, attrs),
             Frame {
@@ -3905,6 +4780,7 @@ mod tests {
             last_x: 10.0,
             last_y: 10.0,
             locked_axis: GestureAxis::Horizontal,
+            scroll_mode: registry_builder::DragScrollMode::Locked,
         };
         runtime.sync_drag_motion_start(element_id, GestureAxis::Horizontal, 10.0, 10.0, now);
         runtime.update_drag_motion(40.0, 10.0, now + Duration::from_millis(20));
@@ -4188,17 +5064,21 @@ mod tests {
 
     #[test]
     fn direct_runtime_nested_drag_scroll_prefers_child_over_parent() {
-        let mut parent_attrs = Attrs::default();
-        parent_attrs.scrollbar_y = Some(true);
-        parent_attrs.scroll_y = Some(10.0);
-        parent_attrs.scroll_y_max = Some(100.0);
+        let parent_attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(10.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
         let mut parent = with_interaction(make_element(73, ElementKind::El, parent_attrs));
         parent.children = vec![NodeId::from_term_bytes(vec![74])];
 
-        let mut child_attrs = Attrs::default();
-        child_attrs.scrollbar_y = Some(true);
-        child_attrs.scroll_y = Some(20.0);
-        child_attrs.scroll_y_max = Some(100.0);
+        let child_attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(20.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
         let child = with_interaction(make_element(74, ElementKind::El, child_attrs));
 
         let rebuild = RegistryRebuildPayload {
@@ -4243,17 +5123,21 @@ mod tests {
 
     #[test]
     fn direct_runtime_wheel_scroll_propagates_to_parent_when_child_direction_blocked() {
-        let mut parent_attrs = Attrs::default();
-        parent_attrs.scrollbar_y = Some(true);
-        parent_attrs.scroll_y = Some(10.0);
-        parent_attrs.scroll_y_max = Some(100.0);
+        let parent_attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(10.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
         let mut parent = with_interaction(make_element(75, ElementKind::El, parent_attrs));
         parent.children = vec![NodeId::from_term_bytes(vec![76])];
 
-        let mut child_attrs = Attrs::default();
-        child_attrs.scrollbar_y = Some(true);
-        child_attrs.scroll_y = Some(100.0);
-        child_attrs.scroll_y_max = Some(100.0);
+        let child_attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(100.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
         let child = with_interaction(make_element(76, ElementKind::El, child_attrs));
 
         let rebuild = RegistryRebuildPayload {
@@ -4292,11 +5176,13 @@ mod tests {
 
     #[test]
     fn direct_runtime_batches_multiple_tree_messages_from_single_scroll_dispatch() {
-        let mut attrs = Attrs::default();
-        attrs.scrollbar_x = Some(true);
-        attrs.scrollbar_y = Some(true);
-        attrs.scroll_x_max = Some(50.0);
-        attrs.scroll_y_max = Some(40.0);
+        let attrs = Attrs {
+            scrollbar_x: Some(true),
+            scrollbar_y: Some(true),
+            scroll_x_max: Some(50.0),
+            scroll_y_max: Some(40.0),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(88, ElementKind::El, attrs));
         let rebuild = RegistryRebuildPayload {
             base_registry: registry_builder::registry_for_elements(&[element]),
@@ -4350,17 +5236,21 @@ mod tests {
 
     #[test]
     fn direct_runtime_drag_scroll_propagates_to_parent_when_child_direction_blocked() {
-        let mut parent_attrs = Attrs::default();
-        parent_attrs.scrollbar_y = Some(true);
-        parent_attrs.scroll_y = Some(10.0);
-        parent_attrs.scroll_y_max = Some(100.0);
+        let parent_attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(10.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
         let mut parent = with_interaction(make_element(77, ElementKind::El, parent_attrs));
         parent.children = vec![NodeId::from_term_bytes(vec![78])];
 
-        let mut child_attrs = Attrs::default();
-        child_attrs.scrollbar_y = Some(true);
-        child_attrs.scroll_y = Some(100.0);
-        child_attrs.scroll_y_max = Some(100.0);
+        let child_attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(100.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
         let child = with_interaction(make_element(78, ElementKind::El, child_attrs));
 
         let rebuild = RegistryRebuildPayload {
@@ -4405,9 +5295,11 @@ mod tests {
 
     #[test]
     fn direct_runtime_scrollbar_thumb_press_and_move_drags_thumb() {
-        let mut attrs = Attrs::default();
-        attrs.scrollbar_y = Some(true);
-        attrs.scroll_y = Some(20.0);
+        let attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(20.0),
+            ..Attrs::default()
+        };
         let element = with_frame(
             with_interaction(make_element(79, ElementKind::El, attrs)),
             Frame {
@@ -4462,11 +5354,13 @@ mod tests {
 
     #[test]
     fn direct_runtime_release_then_move_does_not_start_drag_scroll() {
-        let mut attrs = Attrs::default();
-        attrs.on_click = Some(true);
-        attrs.scrollbar_x = Some(true);
-        attrs.scroll_x = Some(10.0);
-        attrs.scroll_x_max = Some(100.0);
+        let attrs = Attrs {
+            on_click: Some(true),
+            scrollbar_x: Some(true),
+            scroll_x: Some(10.0),
+            scroll_x_max: Some(100.0),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(41, ElementKind::El, attrs));
         let rebuild = RegistryRebuildPayload {
             base_registry: registry_builder::registry_for_elements(&[element]),
@@ -4528,8 +5422,7 @@ mod tests {
 
     #[test]
     fn direct_runtime_elixir_only_mouse_move_stays_fresh_without_rebuild() {
-        let mut attrs = Attrs::default();
-        attrs.on_mouse_move = Some(true);
+        let attrs = on_mouse_move_attrs();
         let element = with_interaction(make_element(42, ElementKind::El, attrs));
         let rebuild = RegistryRebuildPayload {
             base_registry: registry_builder::registry_for_elements(&[element]),
@@ -4557,10 +5450,12 @@ mod tests {
 
     #[test]
     fn direct_runtime_text_commit_updates_content() {
-        let mut attrs = Attrs::default();
-        attrs.content = Some("ab".to_string());
-        attrs.text_input_focused = Some(true);
-        attrs.text_input_cursor = Some(2);
+        let attrs = Attrs {
+            content: Some("ab".to_string()),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(2),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(50, ElementKind::TextInput, attrs));
         let rebuild = RegistryRebuildPayload {
             base_registry: registry_builder::registry_for_elements(&[element]),
@@ -4637,6 +5532,105 @@ mod tests {
             msg,
             TreeMsg::SetTextInputRuntime { element_id, cursor, selection_anchor, .. }
                 if *element_id == input_id && *cursor == Some(4) && *selection_anchor == Some(0)
+        )));
+    }
+
+    #[test]
+    fn direct_runtime_text_drag_cursor_updates_do_not_stale_listener_lane() {
+        let input_id = NodeId::from_term_bytes(vec![158]);
+        let attrs = Attrs {
+            content: Some("abcd".to_string()),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(0),
+            focused_active: Some(true),
+            ..Attrs::default()
+        };
+        let element = with_interaction(make_element(158, ElementKind::TextInput, attrs));
+        let rebuild = RegistryRebuildPayload {
+            base_registry: registry_builder::registry_for_elements(&[element]),
+            text_inputs: HashMap::from([(input_id, make_text_input_state("abcd", 0, None, true))]),
+            sliders: HashMap::new(),
+            scrollbars: HashMap::new(),
+            focused_id: Some(input_id),
+            focus_on_mount: None,
+        };
+
+        let (tree_tx, tree_rx) = bounded(64);
+        let mut runtime = DirectEventRuntime::new(false);
+        runtime.handle_registry_update(rebuild, &tree_tx, false);
+        let _ = drain_msgs(&tree_rx);
+        assert!(!runtime.listener_lane.is_stale());
+
+        runtime.handle_input_event(
+            InputEvent::CursorButton {
+                button: "left".to_string(),
+                action: ACTION_PRESS,
+                mods: 0,
+                x: 0.0,
+                y: 10.0,
+            },
+            &tree_tx,
+            false,
+        );
+        assert!(runtime.runtime_overlay.text_drag.is_some());
+        assert!(!runtime.listener_lane.is_stale());
+        let _ = drain_msgs(&tree_rx);
+
+        runtime.handle_input_event(InputEvent::CursorPos { x: 96.0, y: 10.0 }, &tree_tx, false);
+
+        assert!(runtime.runtime_overlay.text_drag.is_some());
+        assert!(!runtime.listener_lane.is_stale());
+        let msgs = drain_msgs(&tree_rx);
+        assert!(msgs.iter().any(|msg| matches!(
+            msg,
+            TreeMsg::SetTextInputRuntime { element_id, selection_anchor, .. }
+                if *element_id == input_id && *selection_anchor == Some(0)
+        )));
+
+        runtime.handle_input_event(
+            InputEvent::CursorButton {
+                button: "left".to_string(),
+                action: ACTION_RELEASE,
+                mods: 0,
+                x: 96.0,
+                y: 10.0,
+            },
+            &tree_tx,
+            false,
+        );
+
+        assert!(runtime.runtime_overlay.text_drag.is_none());
+        assert!(!runtime.listener_lane.is_stale());
+    }
+
+    #[test]
+    fn direct_runtime_reconciled_text_runtime_update_does_not_stale_listener_lane() {
+        let input_id = NodeId::from_term_bytes(vec![159]);
+        let (tree_tx, tree_rx) = bounded(64);
+        let mut runtime = DirectEventRuntime::new(false);
+        runtime.listener_lane.stale = false;
+        runtime.focused_id = Some(input_id);
+        runtime
+            .text_states
+            .insert(input_id, make_text_input_state("abcd", 3, Some(0), true));
+
+        let rebuild = RegistryRebuildPayload {
+            base_registry: registry_builder::Registry::default(),
+            text_inputs: HashMap::from([(input_id, make_text_input_state("abcd", 1, None, true))]),
+            sliders: HashMap::new(),
+            scrollbars: HashMap::new(),
+            focused_id: Some(input_id),
+            focus_on_mount: None,
+        };
+
+        runtime.handle_registry_update(rebuild, &tree_tx, false);
+
+        assert!(!runtime.listener_lane.is_stale());
+        let msgs = drain_msgs(&tree_rx);
+        assert!(msgs.iter().any(|msg| matches!(
+            msg,
+            TreeMsg::SetTextInputRuntime { element_id, cursor, selection_anchor, .. }
+                if *element_id == input_id && *cursor == Some(3) && *selection_anchor == Some(0)
         )));
     }
 
@@ -4778,12 +5772,14 @@ mod tests {
 
     #[test]
     fn direct_runtime_key_down_binding_suppresses_buffered_text_commit() {
-        let mut attrs = Attrs::default();
-        attrs.content = Some("ab".to_string());
-        attrs.text_input_focused = Some(true);
-        attrs.text_input_cursor = Some(2);
-        attrs.focused_active = Some(true);
-        attrs.on_key_down = Some(vec![make_key_down_binding(CanonicalKey::A)]);
+        let attrs = Attrs {
+            content: Some("ab".to_string()),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(2),
+            focused_active: Some(true),
+            on_key_down: Some(vec![make_key_down_binding(CanonicalKey::A)]),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(150, ElementKind::TextInput, attrs));
         let rebuild = RegistryRebuildPayload {
             base_registry: registry_builder::registry_for_elements(&[element]),
@@ -4852,10 +5848,12 @@ mod tests {
 
     #[test]
     fn direct_runtime_multiline_enter_inserts_newline() {
-        let mut attrs = Attrs::default();
-        attrs.content = Some("ab".to_string());
-        attrs.text_input_focused = Some(true);
-        attrs.text_input_cursor = Some(2);
+        let attrs = Attrs {
+            content: Some("ab".to_string()),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(2),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(151, ElementKind::Multiline, attrs));
         let mut state = make_text_input_state("ab", 2, None, true);
         state.multiline = true;
@@ -4894,10 +5892,12 @@ mod tests {
 
     #[test]
     fn direct_runtime_multiline_enter_suppresses_following_text_commit_newline() {
-        let mut attrs = Attrs::default();
-        attrs.content = Some("ab".to_string());
-        attrs.text_input_focused = Some(true);
-        attrs.text_input_cursor = Some(2);
+        let attrs = Attrs {
+            content: Some("ab".to_string()),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(2),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(153, ElementKind::Multiline, attrs));
         let mut state = make_text_input_state("ab", 2, None, true);
         state.multiline = true;
@@ -4955,12 +5955,14 @@ mod tests {
 
     #[test]
     fn direct_runtime_multiline_key_down_binding_suppresses_enter_default() {
-        let mut attrs = Attrs::default();
-        attrs.content = Some("ab".to_string());
-        attrs.text_input_focused = Some(true);
-        attrs.text_input_cursor = Some(2);
-        attrs.focused_active = Some(true);
-        attrs.on_key_down = Some(vec![make_key_down_binding(CanonicalKey::Enter)]);
+        let attrs = Attrs {
+            content: Some("ab".to_string()),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(2),
+            focused_active: Some(true),
+            on_key_down: Some(vec![make_key_down_binding(CanonicalKey::Enter)]),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(152, ElementKind::Multiline, attrs));
         let mut state = make_text_input_state("ab", 2, None, true);
         state.multiline = true;
@@ -5006,12 +6008,14 @@ mod tests {
     #[test]
     fn direct_runtime_single_line_enter_binding_suppresses_buffered_text_commit_after_reset() {
         let input_id = NodeId::from_term_bytes(vec![154]);
-        let mut attrs = Attrs::default();
-        attrs.content = Some("task".to_string());
-        attrs.text_input_focused = Some(true);
-        attrs.text_input_cursor = Some(4);
-        attrs.focused_active = Some(true);
-        attrs.on_key_down = Some(vec![make_key_down_binding(CanonicalKey::Enter)]);
+        let attrs = Attrs {
+            content: Some("task".to_string()),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(4),
+            focused_active: Some(true),
+            on_key_down: Some(vec![make_key_down_binding(CanonicalKey::Enter)]),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(154, ElementKind::TextInput, attrs));
         let initial_rebuild = RegistryRebuildPayload {
             base_registry: registry_builder::registry_for_elements(std::slice::from_ref(&element)),
@@ -5107,19 +6111,23 @@ mod tests {
 
     #[test]
     fn direct_runtime_virtual_key_release_commits_text_to_focused_input() {
-        let mut text_attrs = Attrs::default();
-        text_attrs.content = Some("ab".to_string());
-        text_attrs.text_input_focused = Some(true);
-        text_attrs.text_input_cursor = Some(2);
+        let text_attrs = Attrs {
+            content: Some("ab".to_string()),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(2),
+            ..Attrs::default()
+        };
         let text_input = with_interaction(make_element(80, ElementKind::TextInput, text_attrs));
 
-        let mut key_attrs = Attrs::default();
-        key_attrs.virtual_key = Some(VirtualKeySpec {
-            tap: VirtualKeyTapAction::Text("c".to_string()),
-            hold: VirtualKeyHoldMode::None,
-            hold_ms: 350,
-            repeat_ms: 40,
-        });
+        let key_attrs = Attrs {
+            virtual_key: Some(VirtualKeySpec {
+                tap: VirtualKeyTapAction::Text("c".to_string()),
+                hold: VirtualKeyHoldMode::None,
+                hold_ms: 350,
+                repeat_ms: 40,
+            }),
+            ..Attrs::default()
+        };
         let soft_key = with_interaction_rect(
             make_element(81, ElementKind::El, key_attrs),
             0.0,
@@ -5193,25 +6201,29 @@ mod tests {
 
     #[test]
     fn direct_runtime_virtual_key_text_and_key_respects_key_down_suppression() {
-        let mut text_attrs = Attrs::default();
-        text_attrs.content = Some("ab".to_string());
-        text_attrs.text_input_focused = Some(true);
-        text_attrs.text_input_cursor = Some(2);
-        text_attrs.focused_active = Some(true);
-        text_attrs.on_key_down = Some(vec![make_key_down_binding(CanonicalKey::A)]);
+        let text_attrs = Attrs {
+            content: Some("ab".to_string()),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(2),
+            focused_active: Some(true),
+            on_key_down: Some(vec![make_key_down_binding(CanonicalKey::A)]),
+            ..Attrs::default()
+        };
         let text_input = with_interaction(make_element(180, ElementKind::TextInput, text_attrs));
 
-        let mut key_attrs = Attrs::default();
-        key_attrs.virtual_key = Some(VirtualKeySpec {
-            tap: VirtualKeyTapAction::TextAndKey {
-                text: "a".to_string(),
-                key: CanonicalKey::A,
-                mods: 0,
-            },
-            hold: VirtualKeyHoldMode::None,
-            hold_ms: 350,
-            repeat_ms: 40,
-        });
+        let key_attrs = Attrs {
+            virtual_key: Some(VirtualKeySpec {
+                tap: VirtualKeyTapAction::TextAndKey {
+                    text: "a".to_string(),
+                    key: CanonicalKey::A,
+                    mods: 0,
+                },
+                hold: VirtualKeyHoldMode::None,
+                hold_ms: 350,
+                repeat_ms: 40,
+            }),
+            ..Attrs::default()
+        };
         let soft_key = with_interaction_rect(
             make_element(181, ElementKind::El, key_attrs),
             0.0,
@@ -5281,19 +6293,23 @@ mod tests {
 
     #[test]
     fn direct_runtime_virtual_key_repeat_stops_after_slide_off_until_repress() {
-        let mut text_attrs = Attrs::default();
-        text_attrs.content = Some("ab".to_string());
-        text_attrs.text_input_focused = Some(true);
-        text_attrs.text_input_cursor = Some(2);
+        let text_attrs = Attrs {
+            content: Some("ab".to_string()),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(2),
+            ..Attrs::default()
+        };
         let text_input = with_interaction(make_element(82, ElementKind::TextInput, text_attrs));
 
-        let mut key_attrs = Attrs::default();
-        key_attrs.virtual_key = Some(VirtualKeySpec {
-            tap: VirtualKeyTapAction::Text("x".to_string()),
-            hold: VirtualKeyHoldMode::Repeat,
-            hold_ms: 350,
-            repeat_ms: 40,
-        });
+        let key_attrs = Attrs {
+            virtual_key: Some(VirtualKeySpec {
+                tap: VirtualKeyTapAction::Text("x".to_string()),
+                hold: VirtualKeyHoldMode::Repeat,
+                hold_ms: 350,
+                repeat_ms: 40,
+            }),
+            ..Attrs::default()
+        };
         let soft_key = with_interaction_rect(
             make_element(83, ElementKind::El, key_attrs),
             0.0,
@@ -5412,10 +6428,12 @@ mod tests {
 
     #[test]
     fn direct_runtime_backspace_updates_content() {
-        let mut attrs = Attrs::default();
-        attrs.content = Some("ab".to_string());
-        attrs.text_input_focused = Some(true);
-        attrs.text_input_cursor = Some(2);
+        let attrs = Attrs {
+            content: Some("ab".to_string()),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(2),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(51, ElementKind::TextInput, attrs));
         let rebuild = RegistryRebuildPayload {
             base_registry: registry_builder::registry_for_elements(&[element]),
@@ -5464,10 +6482,12 @@ mod tests {
     #[test]
     fn direct_runtime_focused_text_commit_survives_followup_rebuild() {
         let input_id = NodeId::from_term_bytes(vec![53]);
-        let mut attrs = Attrs::default();
-        attrs.content = Some("ab".to_string());
-        attrs.text_input_focused = Some(true);
-        attrs.text_input_cursor = Some(2);
+        let attrs = Attrs {
+            content: Some("ab".to_string()),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(2),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(53, ElementKind::TextInput, attrs));
 
         let rebuild_ab = RegistryRebuildPayload {
@@ -5547,24 +6567,17 @@ mod tests {
     #[test]
     fn focused_tree_patch_matching_pending_value_preserves_runtime_content() {
         let input_id = NodeId::from_term_bytes(vec![55]);
-        let rebuild_abc = RegistryRebuildPayload {
-            base_registry: registry_builder::Registry::default(),
-            text_inputs: HashMap::from([(
-                input_id,
-                make_text_input_state_with_patch(
-                    "abc",
-                    Some("abc"),
-                    TextInputContentOrigin::Event,
-                    3,
-                    None,
-                    true,
-                ),
-            )]),
-            sliders: HashMap::new(),
-            scrollbars: HashMap::new(),
-            focused_id: Some(input_id),
-            focus_on_mount: None,
-        };
+        let rebuild_abc = focused_text_input_rebuild(
+            input_id,
+            make_text_input_state_with_patch(
+                "abc",
+                Some("abc"),
+                TextInputContentOrigin::Event,
+                3,
+                None,
+                true,
+            ),
+        );
 
         let (tree_tx, tree_rx) = bounded(32);
         let mut runtime = DirectEventRuntime::new(false);
@@ -5576,18 +6589,12 @@ mod tests {
         runtime.pending_text_patches.insert(
             input_id,
             VecDeque::from([
-                PendingTextPatch {
-                    content: "ab".to_string(),
-                    expires_at: Instant::now() + ttl,
-                },
-                PendingTextPatch {
-                    content: "abc".to_string(),
-                    expires_at: Instant::now() + ttl,
-                },
+                pending_text_patch("ab", Instant::now() + ttl),
+                pending_text_patch("abc", Instant::now() + ttl),
             ]),
         );
 
-        runtime.handle_registry_update(rebuild_abc, &tree_tx, false);
+        runtime.handle_registry_update(rebuild_abc.clone(), &tree_tx, false);
 
         let session = runtime
             .text_states
@@ -5597,7 +6604,16 @@ mod tests {
         assert_eq!(session.cursor, 3);
         assert_eq!(session.patch_content, None);
         assert!(!runtime.pending_text_patches.contains_key(&input_id));
-        assert!(drain_msgs(&tree_rx).iter().any(|msg| matches!(
+        assert!(!runtime.listener_lane.is_stale());
+        assert!(drain_msgs(&tree_rx).iter().all(|msg| !matches!(
+            msg,
+            TreeMsg::SetTextInputContent { element_id, content }
+                if *element_id == input_id && content == "abc"
+        )));
+
+        runtime.handle_registry_update(rebuild_abc, &tree_tx, false);
+        assert!(!runtime.listener_lane.is_stale());
+        assert!(drain_msgs(&tree_rx).iter().all(|msg| !matches!(
             msg,
             TreeMsg::SetTextInputContent { element_id, content }
                 if *element_id == input_id && content == "abc"
@@ -5607,24 +6623,17 @@ mod tests {
     #[test]
     fn focused_tree_patch_non_pending_value_is_accepted() {
         let input_id = NodeId::from_term_bytes(vec![56]);
-        let rebuild_remote = RegistryRebuildPayload {
-            base_registry: registry_builder::Registry::default(),
-            text_inputs: HashMap::from([(
-                input_id,
-                make_text_input_state_with_patch(
-                    "abc",
-                    Some("server"),
-                    TextInputContentOrigin::Event,
-                    3,
-                    None,
-                    true,
-                ),
-            )]),
-            sliders: HashMap::new(),
-            scrollbars: HashMap::new(),
-            focused_id: Some(input_id),
-            focus_on_mount: None,
-        };
+        let rebuild_remote = focused_text_input_rebuild(
+            input_id,
+            make_text_input_state_with_patch(
+                "abc",
+                Some("server"),
+                TextInputContentOrigin::Event,
+                3,
+                None,
+                true,
+            ),
+        );
 
         let (tree_tx, tree_rx) = bounded(32);
         let mut runtime = DirectEventRuntime::new(false);
@@ -5635,10 +6644,7 @@ mod tests {
         let ttl = runtime.pending_text_patch_ttl();
         runtime.pending_text_patches.insert(
             input_id,
-            VecDeque::from([PendingTextPatch {
-                content: "abc".to_string(),
-                expires_at: Instant::now() + ttl,
-            }]),
+            VecDeque::from([pending_text_patch("abc", Instant::now() + ttl)]),
         );
 
         runtime.handle_registry_update(rebuild_remote, &tree_tx, false);
@@ -5650,35 +6656,95 @@ mod tests {
         assert_eq!(session.content, "server");
         assert_eq!(session.content_origin, TextInputContentOrigin::Event);
         assert_eq!(session.patch_content, None);
-        assert!(!runtime.pending_text_patches.contains_key(&input_id));
+        assert!(runtime.pending_text_patches.contains_key(&input_id));
         assert!(drain_msgs(&tree_rx).iter().any(|msg| matches!(
             msg,
             TreeMsg::SetTextInputContent { element_id, content }
                 if *element_id == input_id && content == "server"
         )));
+
+        let acknowledged =
+            focused_text_input_rebuild(input_id, make_text_input_state("server", 3, None, true));
+        runtime.handle_registry_update(acknowledged, &tree_tx, false);
+        assert!(!runtime.pending_text_patches.contains_key(&input_id));
+        assert!(!runtime.listener_lane.is_stale());
+    }
+
+    #[test]
+    fn focused_tree_patch_accept_does_not_echo_forever_on_stale_rebuild() {
+        let input_id = NodeId::from_term_bytes(vec![156]);
+        let reset_rebuild = focused_text_input_rebuild(
+            input_id,
+            make_text_input_state_with_patch(
+                "abc",
+                Some(""),
+                TextInputContentOrigin::Event,
+                3,
+                None,
+                true,
+            ),
+        );
+        let stale_old_rebuild =
+            focused_text_input_rebuild(input_id, make_text_input_state("abc", 3, None, true));
+        let acknowledged_rebuild =
+            focused_text_input_rebuild(input_id, make_text_input_state("", 0, None, true));
+
+        let (tree_tx, tree_rx) = bounded(32);
+        let mut runtime = DirectEventRuntime::new(false);
+        runtime.focused_id = Some(input_id);
+        runtime
+            .text_states
+            .insert(input_id, make_text_input_state("abc", 3, None, true));
+
+        runtime.handle_registry_update(reset_rebuild.clone(), &tree_tx, false);
+        assert!(runtime.listener_lane.is_stale());
+        assert!(drain_msgs(&tree_rx).iter().any(|msg| matches!(
+            msg,
+            TreeMsg::SetTextInputContent { element_id, content }
+                if *element_id == input_id && content.is_empty()
+        )));
+
+        runtime.handle_registry_update(reset_rebuild, &tree_tx, false);
+        assert!(!runtime.listener_lane.is_stale());
+        assert!(drain_msgs(&tree_rx).iter().all(|msg| !matches!(
+            msg,
+            TreeMsg::SetTextInputContent { element_id, .. } if *element_id == input_id
+        )));
+
+        runtime.handle_registry_update(stale_old_rebuild.clone(), &tree_tx, false);
+        assert!(!runtime.listener_lane.is_stale());
+        assert!(drain_msgs(&tree_rx).iter().all(|msg| !matches!(
+            msg,
+            TreeMsg::SetTextInputContent { element_id, .. } if *element_id == input_id
+        )));
+
+        runtime.handle_registry_update(stale_old_rebuild, &tree_tx, false);
+        assert!(!runtime.listener_lane.is_stale());
+        assert!(drain_msgs(&tree_rx).iter().all(|msg| !matches!(
+            msg,
+            TreeMsg::SetTextInputContent { element_id, .. } if *element_id == input_id
+        )));
+
+        runtime.handle_registry_update(acknowledged_rebuild, &tree_tx, false);
+        assert!(!runtime.pending_text_patches.contains_key(&input_id));
+        assert!(!runtime.listener_lane.is_stale());
+        assert!(drain_msgs(&tree_rx).is_empty());
     }
 
     #[test]
     fn focused_tree_patch_accepts_value_after_pending_expiration() {
         let input_id = NodeId::from_term_bytes(vec![57]);
-        let rebuild_remote = RegistryRebuildPayload {
-            base_registry: registry_builder::Registry::default(),
-            text_inputs: HashMap::from([(
-                input_id,
-                make_text_input_state_with_patch(
-                    "abc",
-                    Some("server"),
-                    TextInputContentOrigin::Event,
-                    3,
-                    None,
-                    true,
-                ),
-            )]),
-            sliders: HashMap::new(),
-            scrollbars: HashMap::new(),
-            focused_id: Some(input_id),
-            focus_on_mount: None,
-        };
+        let rebuild_remote = focused_text_input_rebuild(
+            input_id,
+            make_text_input_state_with_patch(
+                "abc",
+                Some("server"),
+                TextInputContentOrigin::Event,
+                3,
+                None,
+                true,
+            ),
+        );
 
         let (tree_tx, tree_rx) = bounded(32);
         let mut runtime = DirectEventRuntime::new(false);
@@ -5688,10 +6754,10 @@ mod tests {
             .insert(input_id, make_text_input_state("abc", 3, None, true));
         runtime.pending_text_patches.insert(
             input_id,
-            VecDeque::from([PendingTextPatch {
-                content: "abc".to_string(),
-                expires_at: Instant::now() - Duration::from_millis(1),
-            }]),
+            VecDeque::from([pending_text_patch(
+                "abc",
+                Instant::now() - Duration::from_millis(1),
+            )]),
         );
 
         runtime.handle_registry_update(rebuild_remote, &tree_tx, false);
@@ -5704,12 +6770,18 @@ mod tests {
                 .content,
             "server"
         );
-        assert!(!runtime.pending_text_patches.contains_key(&input_id));
+        assert!(runtime.pending_text_patches.contains_key(&input_id));
         assert!(drain_msgs(&tree_rx).iter().any(|msg| matches!(
             msg,
             TreeMsg::SetTextInputContent { element_id, content }
                 if *element_id == input_id && content == "server"
         )));
+
+        let acknowledged =
+            focused_text_input_rebuild(input_id, make_text_input_state("server", 3, None, true));
+        runtime.handle_registry_update(acknowledged, &tree_tx, false);
+        assert!(!runtime.pending_text_patches.contains_key(&input_id));
+        assert!(!runtime.listener_lane.is_stale());
     }
 
     #[test]
@@ -5762,6 +6834,54 @@ mod tests {
             TreeMsg::SetSliderValue { element_id, value }
                 if *element_id == slider_id && (*value - 60.0).abs() < f64::EPSILON
         )));
+    }
+
+    #[test]
+    fn slider_tree_patch_matching_current_value_does_not_echo_back_to_tree() {
+        let slider_id = NodeId::from_term_bytes(vec![60]);
+        let rebuild_echo = RegistryRebuildPayload {
+            base_registry: registry_builder::Registry::default(),
+            text_inputs: HashMap::new(),
+            sliders: HashMap::from([(
+                slider_id,
+                make_slider_state_with_patch(
+                    60.0,
+                    Some(60.0),
+                    SliderValueOrigin::Event,
+                    0.0,
+                    100.0,
+                    5.0,
+                ),
+            )]),
+            scrollbars: HashMap::new(),
+            focused_id: None,
+            focus_on_mount: None,
+        };
+
+        let (tree_tx, tree_rx) = bounded(32);
+        let mut runtime = DirectEventRuntime::new(false);
+        runtime
+            .slider_states
+            .insert(slider_id, make_slider_state(60.0, 0.0, 100.0, 5.0));
+        let ttl = runtime.pending_text_patch_ttl();
+        runtime.pending_slider_patches.insert(
+            slider_id,
+            VecDeque::from([PendingSliderPatch {
+                value: 60.0,
+                expires_at: Instant::now() + ttl,
+            }]),
+        );
+
+        runtime.handle_registry_update(rebuild_echo, &tree_tx, false);
+
+        let state = runtime
+            .slider_states
+            .get(&slider_id)
+            .expect("slider state preserved");
+        assert!((state.value - 60.0).abs() < f64::EPSILON);
+        assert_eq!(state.patch_value, None);
+        assert!(!runtime.pending_slider_patches.contains_key(&slider_id));
+        assert!(drain_msgs(&tree_rx).is_empty());
     }
 
     #[test]
@@ -5856,10 +6976,12 @@ mod tests {
 
     #[test]
     fn direct_runtime_delete_surrounding_updates_content() {
-        let mut attrs = Attrs::default();
-        attrs.content = Some("abcd".to_string());
-        attrs.text_input_focused = Some(true);
-        attrs.text_input_cursor = Some(2);
+        let attrs = Attrs {
+            content: Some("abcd".to_string()),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(2),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(54, ElementKind::TextInput, attrs));
         let rebuild = RegistryRebuildPayload {
             base_registry: registry_builder::registry_for_elements(&[element]),
@@ -5904,11 +7026,13 @@ mod tests {
     }
 
     #[test]
-    fn direct_runtime_hover_leave_clears_hover_state_after_rebuild() {
-        let mut attrs = Attrs::default();
-        attrs.mouse_over = Some(MouseOverAttrs::default());
-        attrs.mouse_over_active = Some(false);
-        let element = with_interaction(make_element(52, ElementKind::El, attrs.clone()));
+    fn direct_runtime_hover_leave_clears_hover_state_without_rebuild() {
+        let attrs = Attrs {
+            mouse_over: Some(MouseOverAttrs::default()),
+            mouse_over_active: Some(false),
+            ..Attrs::default()
+        };
+        let element = with_interaction(make_element(52, ElementKind::El, attrs));
         let rebuild = RegistryRebuildPayload {
             base_registry: registry_builder::registry_for_elements(&[element]),
             text_inputs: HashMap::new(),
@@ -5922,25 +7046,12 @@ mod tests {
         let mut runtime = DirectEventRuntime::new(false);
         runtime.handle_registry_update(rebuild, &tree_tx, false);
         runtime.handle_input_event(InputEvent::CursorPos { x: 10.0, y: 10.0 }, &tree_tx, false);
-        assert!(runtime.listener_lane.is_stale());
+        assert!(!runtime.listener_lane.is_stale());
         assert!(drain_msgs(&tree_rx).iter().any(|msg| matches!(
             msg,
             TreeMsg::SetMouseOverActive { element_id, active }
                 if *element_id == NodeId::from_term_bytes(vec![52]) && *active
         )));
-
-        attrs.mouse_over_active = Some(true);
-        let active_element = with_interaction(make_element(52, ElementKind::El, attrs));
-        let active_rebuild = RegistryRebuildPayload {
-            base_registry: registry_builder::registry_for_elements(&[active_element]),
-            text_inputs: HashMap::new(),
-            sliders: HashMap::new(),
-            scrollbars: HashMap::new(),
-            focused_id: None,
-            focus_on_mount: None,
-        };
-        runtime.handle_registry_update(active_rebuild, &tree_tx, false);
-        assert!(!runtime.listener_lane.is_stale());
 
         runtime.handle_input_event(
             InputEvent::CursorEntered { entered: false },
@@ -5948,7 +7059,7 @@ mod tests {
             false,
         );
 
-        assert!(runtime.listener_lane.is_stale());
+        assert!(!runtime.listener_lane.is_stale());
         assert!(drain_msgs(&tree_rx).iter().any(|msg| matches!(
             msg,
             TreeMsg::SetMouseOverActive { element_id, active }
@@ -5961,14 +7072,15 @@ mod tests {
         let parent_id = NodeId::from_term_bytes(vec![62]);
         let child_id = NodeId::from_term_bytes(vec![63]);
 
-        let mut parent_attrs = Attrs::default();
-        parent_attrs.mouse_over = Some(MouseOverAttrs::default());
-        parent_attrs.mouse_over_active = Some(false);
+        let parent_attrs = Attrs {
+            mouse_over: Some(MouseOverAttrs::default()),
+            mouse_over_active: Some(false),
+            ..Attrs::default()
+        };
         let mut parent = with_interaction(make_element(62, ElementKind::El, parent_attrs));
         parent.children = vec![child_id];
 
-        let mut child_attrs = Attrs::default();
-        child_attrs.on_mouse_move = Some(true);
+        let child_attrs = on_mouse_move_attrs();
         let child = with_interaction(make_element(63, ElementKind::El, child_attrs));
 
         let rebuild = RegistryRebuildPayload {
@@ -5986,7 +7098,7 @@ mod tests {
         runtime.handle_input_event(InputEvent::CursorPos { x: 10.0, y: 10.0 }, &tree_tx, false);
 
         let msgs = drain_msgs(&tree_rx);
-        assert!(runtime.listener_lane.is_stale());
+        assert!(!runtime.listener_lane.is_stale());
         assert_eq!(hover_stack_ids(&runtime).last().copied(), Some(parent_id));
         assert!(msgs.iter().any(|msg| matches!(
             msg,
@@ -6006,15 +7118,19 @@ mod tests {
         let parent_id = NodeId::from_term_bytes(vec![64]);
         let child_id = NodeId::from_term_bytes(vec![65]);
 
-        let mut parent_attrs = Attrs::default();
-        parent_attrs.mouse_over = Some(MouseOverAttrs::default());
-        parent_attrs.mouse_over_active = Some(false);
+        let parent_attrs = Attrs {
+            mouse_over: Some(MouseOverAttrs::default()),
+            mouse_over_active: Some(false),
+            ..Attrs::default()
+        };
         let mut parent = with_interaction(make_element(64, ElementKind::El, parent_attrs));
         parent.children = vec![child_id];
 
-        let mut child_attrs = Attrs::default();
-        child_attrs.mouse_over = Some(MouseOverAttrs::default());
-        child_attrs.mouse_over_active = Some(false);
+        let child_attrs = Attrs {
+            mouse_over: Some(MouseOverAttrs::default()),
+            mouse_over_active: Some(false),
+            ..Attrs::default()
+        };
         let child = with_interaction(make_element(65, ElementKind::El, child_attrs));
 
         let rebuild = RegistryRebuildPayload {
@@ -6032,7 +7148,7 @@ mod tests {
         runtime.handle_input_event(InputEvent::CursorPos { x: 10.0, y: 10.0 }, &tree_tx, false);
 
         let msgs = drain_msgs(&tree_rx);
-        assert!(runtime.listener_lane.is_stale());
+        assert!(!runtime.listener_lane.is_stale());
         assert_eq!(hover_stack_ids(&runtime).last().copied(), Some(child_id));
         assert!(msgs.iter().any(|msg| matches!(
             msg,
@@ -6051,15 +7167,19 @@ mod tests {
         let parent_id = NodeId::from_term_bytes(vec![66]);
         let child_id = NodeId::from_term_bytes(vec![67]);
 
-        let mut parent_attrs = Attrs::default();
-        parent_attrs.mouse_over = Some(MouseOverAttrs::default());
-        parent_attrs.mouse_over_active = Some(false);
+        let parent_attrs = Attrs {
+            mouse_over: Some(MouseOverAttrs::default()),
+            mouse_over_active: Some(false),
+            ..Attrs::default()
+        };
         let mut parent = with_interaction(make_element(66, ElementKind::El, parent_attrs.clone()));
         parent.children = vec![child_id];
 
-        let mut child_attrs = Attrs::default();
-        child_attrs.mouse_over = Some(MouseOverAttrs::default());
-        child_attrs.mouse_over_active = Some(false);
+        let child_attrs = Attrs {
+            mouse_over: Some(MouseOverAttrs::default()),
+            mouse_over_active: Some(false),
+            ..Attrs::default()
+        };
         let child = with_interaction_rect(
             make_element(67, ElementKind::El, child_attrs.clone()),
             40.0,
@@ -6092,27 +7212,6 @@ mod tests {
                 if *element_id == parent_id && *active
         )));
 
-        let mut active_parent_attrs = parent_attrs;
-        active_parent_attrs.mouse_over_active = Some(true);
-        let mut active_parent =
-            with_interaction(make_element(66, ElementKind::El, active_parent_attrs));
-        active_parent.children = vec![child_id];
-        let active_child = with_interaction_rect(
-            make_element(67, ElementKind::El, child_attrs),
-            40.0,
-            0.0,
-            40.0,
-            40.0,
-        );
-        let active_rebuild = RegistryRebuildPayload {
-            base_registry: registry_builder::registry_for_elements(&[active_parent, active_child]),
-            text_inputs: HashMap::new(),
-            sliders: HashMap::new(),
-            scrollbars: HashMap::new(),
-            focused_id: None,
-            focus_on_mount: None,
-        };
-        runtime.handle_registry_update(active_rebuild, &tree_tx, false);
         assert!(!runtime.listener_lane.is_stale());
         assert!(drain_msgs(&tree_rx).is_empty());
 
@@ -6125,7 +7224,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(runtime.listener_lane.is_stale());
+        assert!(!runtime.listener_lane.is_stale());
         assert_eq!(hover_stack_ids(&runtime).last().copied(), Some(child_id));
         assert_eq!(hover_msgs, vec![(child_id, true)]);
     }
@@ -6135,9 +7234,11 @@ mod tests {
         let parent_id = NodeId::from_term_bytes(vec![68]);
         let child_id = NodeId::from_term_bytes(vec![69]);
 
-        let mut parent_attrs = Attrs::default();
-        parent_attrs.on_mouse_leave = Some(true);
-        parent_attrs.mouse_over_active = Some(true);
+        let parent_attrs = Attrs {
+            on_mouse_leave: Some(true),
+            mouse_over_active: Some(true),
+            ..Attrs::default()
+        };
         let mut parent = with_interaction_rect(
             make_element(68, ElementKind::El, parent_attrs),
             0.0,
@@ -6147,9 +7248,11 @@ mod tests {
         );
         parent.children = vec![child_id];
 
-        let mut child_attrs = Attrs::default();
-        child_attrs.mouse_over = Some(MouseOverAttrs::default());
-        child_attrs.mouse_over_active = Some(false);
+        let child_attrs = Attrs {
+            mouse_over: Some(MouseOverAttrs::default()),
+            mouse_over_active: Some(false),
+            ..Attrs::default()
+        };
         let child = with_interaction_rect(
             make_element(69, ElementKind::El, child_attrs),
             16.0,
@@ -6182,7 +7285,7 @@ mod tests {
             })
             .collect();
 
-        assert!(runtime.listener_lane.is_stale());
+        assert!(!runtime.listener_lane.is_stale());
         assert_eq!(hover_stack_ids(&runtime).last().copied(), Some(child_id));
         assert_eq!(hover_msgs, vec![(child_id, true)]);
     }
@@ -6191,9 +7294,11 @@ mod tests {
     fn direct_runtime_registry_rebuild_replays_static_cursor_into_new_hover_target() {
         let element_id = NodeId::from_term_bytes(vec![57]);
 
-        let mut attrs = Attrs::default();
-        attrs.mouse_over = Some(MouseOverAttrs::default());
-        attrs.mouse_over_active = Some(false);
+        let attrs = Attrs {
+            mouse_over: Some(MouseOverAttrs::default()),
+            mouse_over_active: Some(false),
+            ..Attrs::default()
+        };
 
         let initial = with_interaction_rect(
             make_element(57, ElementKind::El, attrs.clone()),
@@ -6237,7 +7342,7 @@ mod tests {
 
         runtime.handle_registry_update(moved_rebuild, &tree_tx, false);
 
-        assert!(runtime.listener_lane.is_stale());
+        assert!(!runtime.listener_lane.is_stale());
         assert!(drain_msgs(&tree_rx).iter().any(|msg| matches!(
             msg,
             TreeMsg::SetMouseOverActive { element_id: id, active }
@@ -6255,8 +7360,7 @@ mod tests {
             40.0,
         );
 
-        let mut pressable_attrs = Attrs::default();
-        pressable_attrs.on_press = Some(true);
+        let pressable_attrs = on_press_attrs();
         let pressable = with_interaction_rect(
             make_element(171, ElementKind::El, pressable_attrs),
             60.0,
@@ -6265,8 +7369,7 @@ mod tests {
             40.0,
         );
 
-        let mut mouse_down_attrs = Attrs::default();
-        mouse_down_attrs.on_mouse_down = Some(true);
+        let mouse_down_attrs = on_mouse_down_attrs();
         let mouse_down_only = with_interaction_rect(
             make_element(172, ElementKind::El, mouse_down_attrs),
             120.0,
@@ -6338,6 +7441,7 @@ mod tests {
             false,
             Some(cursor_tx),
             BackendWakeHandle::noop(),
+            Arc::new(NativeLogRelay::default()),
             None,
         );
         runtime.handle_registry_update(rebuild, &tree_tx, false);
@@ -6364,8 +7468,7 @@ mod tests {
 
     #[test]
     fn host_runtime_sends_cursor_icons_to_backend_transport() {
-        let mut pressable_attrs = Attrs::default();
-        pressable_attrs.on_press = Some(true);
+        let pressable_attrs = on_press_attrs();
         let pressable = with_interaction_rect(
             make_element(174, ElementKind::El, pressable_attrs),
             0.0,
@@ -6427,9 +7530,11 @@ mod tests {
             focus_on_mount: None,
         };
 
-        let mut moved_attrs = Attrs::default();
-        moved_attrs.on_mouse_move = Some(true);
-        moved_attrs.on_press = Some(true);
+        let moved_attrs = Attrs {
+            on_mouse_move: Some(true),
+            on_press: Some(true),
+            ..Attrs::default()
+        };
         let moved = with_interaction_rect(
             make_element(172, ElementKind::El, moved_attrs),
             60.0,
@@ -6466,9 +7571,11 @@ mod tests {
     fn direct_runtime_registry_rebuild_replays_static_cursor_out_of_old_hover_target() {
         let element_id = NodeId::from_term_bytes(vec![58]);
 
-        let mut attrs = Attrs::default();
-        attrs.mouse_over = Some(MouseOverAttrs::default());
-        attrs.mouse_over_active = Some(false);
+        let attrs = Attrs {
+            mouse_over: Some(MouseOverAttrs::default()),
+            mouse_over_active: Some(false),
+            ..Attrs::default()
+        };
         let element = with_interaction_rect(
             make_element(58, ElementKind::El, attrs.clone()),
             0.0,
@@ -6490,7 +7597,7 @@ mod tests {
         runtime.handle_registry_update(rebuild, &tree_tx, false);
         runtime.handle_input_event(InputEvent::CursorPos { x: 10.0, y: 10.0 }, &tree_tx, false);
 
-        assert!(runtime.listener_lane.is_stale());
+        assert!(!runtime.listener_lane.is_stale());
         assert!(drain_msgs(&tree_rx).iter().any(|msg| matches!(
             msg,
             TreeMsg::SetMouseOverActive { element_id: id, active }
@@ -6536,7 +7643,7 @@ mod tests {
 
         runtime.handle_registry_update(moved_away_rebuild, &tree_tx, false);
 
-        assert!(runtime.listener_lane.is_stale());
+        assert!(!runtime.listener_lane.is_stale());
         assert!(drain_msgs(&tree_rx).iter().any(|msg| matches!(
             msg,
             TreeMsg::SetMouseOverActive { element_id: id, active }
@@ -6561,14 +7668,13 @@ mod tests {
 
         runtime.handle_registry_update(mid_rebuild, &tree_tx, false);
 
-        assert!(runtime.listener_lane.is_stale());
+        assert!(!runtime.listener_lane.is_stale());
         assert!(drain_msgs(&tree_rx).iter().any(|msg| matches!(
             msg,
             TreeMsg::SetMouseOverActive { element_id, active }
                 if *element_id == overlay_id && *active
         )));
 
-        runtime.listener_lane.stale = false;
         runtime.handle_registry_update(late_rebuild, &tree_tx, false);
         assert!(!runtime.listener_lane.is_stale());
     }
@@ -6637,8 +7743,8 @@ mod tests {
                 "probe {label} should activate hover exactly once"
             );
             assert!(
-                runtime.listener_lane.is_stale(),
-                "probe {label} should mark lane stale after activation"
+                !runtime.listener_lane.is_stale(),
+                "probe {label} should stay fresh after runtime-tracked hover activation"
             );
         }
     }
@@ -6717,16 +7823,18 @@ mod tests {
             .count();
 
         assert_eq!(clears, 1);
-        assert!(runtime.listener_lane.is_stale());
+        assert!(!runtime.listener_lane.is_stale());
     }
 
     #[test]
     fn direct_runtime_registry_rebuild_skips_cursor_replay_when_pointer_left_window() {
         let element_id = NodeId::from_term_bytes(vec![59]);
 
-        let mut attrs = Attrs::default();
-        attrs.mouse_over = Some(MouseOverAttrs::default());
-        attrs.mouse_over_active = Some(false);
+        let attrs = Attrs {
+            mouse_over: Some(MouseOverAttrs::default()),
+            mouse_over_active: Some(false),
+            ..Attrs::default()
+        };
         let element = with_interaction_rect(
             make_element(59, ElementKind::El, attrs.clone()),
             0.0,
@@ -6747,7 +7855,7 @@ mod tests {
         let mut runtime = DirectEventRuntime::new(false);
         runtime.handle_registry_update(rebuild, &tree_tx, false);
         runtime.handle_input_event(InputEvent::CursorPos { x: 10.0, y: 10.0 }, &tree_tx, false);
-        assert!(runtime.listener_lane.is_stale());
+        assert!(!runtime.listener_lane.is_stale());
         let _ = drain_msgs(&tree_rx);
 
         let mut active_attrs = attrs;
@@ -6774,7 +7882,7 @@ mod tests {
             &tree_tx,
             false,
         );
-        assert!(runtime.listener_lane.is_stale());
+        assert!(!runtime.listener_lane.is_stale());
         let _ = drain_msgs(&tree_rx);
 
         let inactive_element = with_interaction_rect(
@@ -6810,8 +7918,7 @@ mod tests {
 
     #[test]
     fn direct_runtime_registry_rebuild_suppresses_synthetic_mouse_move() {
-        let mut attrs = Attrs::default();
-        attrs.on_mouse_move = Some(true);
+        let attrs = on_mouse_move_attrs();
 
         let initial = with_interaction_rect(
             make_element(60, ElementKind::El, attrs.clone()),
@@ -6862,10 +7969,12 @@ mod tests {
     fn direct_runtime_registry_rebuild_keeps_hovered_cursor_fresh_when_move_is_synthetic() {
         let element_id = NodeId::from_term_bytes(vec![61]);
 
-        let mut attrs = Attrs::default();
-        attrs.mouse_over = Some(MouseOverAttrs::default());
-        attrs.on_mouse_move = Some(true);
-        attrs.mouse_over_active = Some(false);
+        let attrs = Attrs {
+            mouse_over: Some(MouseOverAttrs::default()),
+            on_mouse_move: Some(true),
+            mouse_over_active: Some(false),
+            ..Attrs::default()
+        };
 
         let initial = with_interaction_rect(
             make_element(61, ElementKind::El, attrs.clone()),
@@ -6908,7 +8017,7 @@ mod tests {
 
         runtime.handle_registry_update(moved_rebuild.clone(), &tree_tx, false);
 
-        assert!(runtime.listener_lane.is_stale());
+        assert!(!runtime.listener_lane.is_stale());
         assert!(drain_msgs(&tree_rx).iter().any(|msg| matches!(
             msg,
             TreeMsg::SetMouseOverActive { element_id: id, active }
@@ -6942,9 +8051,11 @@ mod tests {
 
     #[test]
     fn direct_runtime_unhovered_scrollable_elsewhere_does_not_mask_menu_hover_leave() {
-        let mut menu_attrs = Attrs::default();
-        menu_attrs.mouse_over = Some(MouseOverAttrs::default());
-        menu_attrs.mouse_over_active = Some(true);
+        let menu_attrs = Attrs {
+            mouse_over: Some(MouseOverAttrs::default()),
+            mouse_over_active: Some(true),
+            ..Attrs::default()
+        };
         let menu = with_interaction_rect(
             make_element(54, ElementKind::El, menu_attrs),
             0.0,
@@ -6961,9 +8072,11 @@ mod tests {
             10.0,
         );
 
-        let mut scrollable_attrs = Attrs::default();
-        scrollable_attrs.scrollbar_y = Some(true);
-        scrollable_attrs.scroll_y = Some(10.0);
+        let scrollable_attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(10.0),
+            ..Attrs::default()
+        };
         let scrollable = with_frame(
             with_interaction_rect(
                 make_element(56, ElementKind::El, scrollable_attrs),
@@ -6998,7 +8111,7 @@ mod tests {
 
         runtime.handle_input_event(InputEvent::CursorPos { x: 10.0, y: 50.0 }, &tree_tx, false);
 
-        assert!(runtime.listener_lane.is_stale());
+        assert!(!runtime.listener_lane.is_stale());
         assert!(drain_msgs(&tree_rx).iter().any(|msg| matches!(
             msg,
             TreeMsg::SetMouseOverActive { element_id, active }

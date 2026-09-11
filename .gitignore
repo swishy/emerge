@@ -25,8 +25,37 @@ emerge_skia-*.tar
 # Rust build artifacts
 /native/*/target/
 
+# Clang module cache artifacts (__.SYMDEF)
+/native/*/__.SYMDEF
+**/__.SYMDEF
+
 # Compiled NIF
 /priv/native/
 
+# Vendored Rust dependencies (e.g. patched rustler)
+/native/*/vendor/
+
+# Scratch planning docs
+/plans/
+
 # Local Codex session files
 /.codex
+
+# macOS
+.DS_Store
+
+# Editor swap files
+*.swp
+*.swo
+
+# Language server artifacts
+/.elixir_ls/
+
+# iOS generated assets (Xcode project, frameworks, bundled OTP)
+/ios/Frameworks/
+/ios/Emerge/erlang/
+/ios/**/xcuserdata/
+
+# IDE
+/.idea/
+*.iml

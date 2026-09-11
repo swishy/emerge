@@ -4,18 +4,18 @@ defmodule EmergeSkia.Transport.Native do
   @behaviour EmergeSkia.Transport
 
   alias EmergeSkia.Assets
-  alias EmergeSkia.Native
 
   @impl true
   def start_session(native_opts, asset_config) do
-    case Native.start_opts(Map.delete(native_opts, :macos_backend)) do
+    cleaned = Map.delete(native_opts, :macos_backend)
+    case EmergeSkia.Native.start_opts(cleaned) do
       ref when is_reference(ref) ->
         case Assets.initialize_renderer_assets(ref, asset_config) do
           :ok ->
             {:ok, ref}
 
           {:error, reason} ->
-            _ = Native.stop(ref)
+            _ = EmergeSkia.Native.stop(ref)
             {:error, reason}
         end
 
@@ -26,57 +26,57 @@ defmodule EmergeSkia.Transport.Native do
 
   @impl true
   def stop_session(renderer) do
-    Native.stop(renderer)
+    EmergeSkia.Native.stop(renderer)
   end
 
   @impl true
   def session_running?(renderer) do
-    Native.is_running(renderer)
+    EmergeSkia.Native.is_running(renderer)
   end
 
   @impl true
   def set_input_target(renderer, pid) do
-    Native.set_input_target(renderer, pid)
+    EmergeSkia.Native.set_input_target(renderer, pid)
   end
 
   @impl true
   def set_log_target(renderer, pid) do
-    Native.set_log_target(renderer, pid)
+    EmergeSkia.Native.set_log_target(renderer, pid)
   end
 
   @impl true
   def stats(renderer, command) do
-    Native.stats(renderer, command)
+    EmergeSkia.Native.stats(renderer, command)
   end
 
   @impl true
   def set_input_mask(renderer, mask) do
-    Native.set_input_mask(renderer, mask)
+    EmergeSkia.Native.set_input_mask(renderer, mask)
   end
 
   @impl true
   def upload_tree(renderer, full_bin) do
-    Native.renderer_upload(renderer, full_bin)
+    EmergeSkia.Native.renderer_upload(renderer, full_bin)
   end
 
   @impl true
   def patch_tree(renderer, patch_bin) do
-    Native.renderer_patch(renderer, patch_bin)
+    EmergeSkia.Native.renderer_patch(renderer, patch_bin)
   end
 
   @impl true
   def measure_text(text, font_size) do
-    Native.measure_text(text, font_size)
+    EmergeSkia.Native.measure_text(text, font_size)
   end
 
   @impl true
   def load_font(family, weight, italic, data) do
-    Native.load_font_nif(family, weight, italic, data)
+    EmergeSkia.Native.load_font_nif(family, weight, italic, data)
   end
 
   @impl true
   def configure_assets(renderer, asset_config) do
-    Native.configure_assets_nif(
+    EmergeSkia.Native.configure_assets_nif(
       renderer,
       [asset_config.priv_dir],
       asset_config.runtime_enabled,
@@ -89,12 +89,12 @@ defmodule EmergeSkia.Transport.Native do
 
   @impl true
   def render_tree_to_pixels(full_bin, raster_opts, asset_config) do
-    Native.render_tree_to_pixels_nif(full_bin, offscreen_opts(raster_opts, asset_config))
+    EmergeSkia.Native.render_tree_to_pixels_nif(full_bin, offscreen_opts(raster_opts, asset_config))
   end
 
   @impl true
   def render_tree_to_png(full_bin, raster_opts, asset_config) do
-    Native.render_tree_to_png_nif(full_bin, offscreen_opts(raster_opts, asset_config))
+    EmergeSkia.Native.render_tree_to_png_nif(full_bin, offscreen_opts(raster_opts, asset_config))
   end
 
   defp offscreen_opts(raster_opts, asset_config) do

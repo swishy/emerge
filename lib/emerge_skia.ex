@@ -69,7 +69,7 @@ defmodule EmergeSkia do
 
   @type renderer :: reference() | Renderer.t()
   @type color :: non_neg_integer()
-  @type video_target :: VideoTarget.t()
+  @type video_target :: Emerge.VideoTarget.compatible_t()
 
   @default_asset_timeout_ms 30_000
 
@@ -79,8 +79,9 @@ defmodule EmergeSkia do
   ## Options
 
   - `otp_app` - OTP application used to resolve logical assets from its `priv` dir (**required**)
-   - `backend` - Backend selection (`:wayland`, `:drm`, or `:macos`). Defaults to `:wayland` for Linux desktop builds, `:macos` on Darwin, and `:drm` for Nerves-style builds. The requested backend must also be present in `config :emerge, compiled_backends: [...]`.
+   - `backend` - Backend selection (`:wayland`, `:drm`, `:macos`, `:ios`, `:android`, or `:fbdev`). Defaults to `:wayland` for Linux desktop builds, `:macos` on Darwin, `:ios` on iOS, `:android` on Android, and `:drm` for Nerves-style builds. The requested backend must also be present in `config :emerge, compiled_backends: [...]`.
    - `macos_backend` - macOS surface backend selection (`:auto`, `:metal`, or `:raster`). Defaults to `:auto` and is only supported with `backend: :macos`.
+   - `fbdev_path` - fbdev framebuffer device path (default: `/dev/fb0`). Only used with `backend: :fbdev`.
   - `title` - Window title (default: "Emerge")
   - `width` - Window width in pixels (default: 800)
   - `height` - Window height in pixels (default: 600)
@@ -89,7 +90,9 @@ defmodule EmergeSkia do
   - `hw_cursor` - Enable hardware cursor when available (default: true)
   - `drm_cursor` - Optional DRM-only cursor overrides for `default`, `text`, and `pointer`
   - `input_log` - Log DRM input devices on startup (default: false)
-  - `render_log` - Log DRM render/present diagnostics (default: false)
+  - `render_log` - Log native backend render/present diagnostics, including Wayland present
+    and event-runtime traces. On Wayland, also writes an out-of-band watchdog file to
+    `/tmp/emerge-wayland-watchdog-<pid>.log` (default: false)
   - `close_signal_log` - Log detailed Wayland window-close diagnostics to stderr (default: false)
   - `stats` - Enable renderer stats collection without periodic logging (default: false)
   - `renderer_stats_log` - Enable renderer stats collection and log all current stat families every 5 seconds, including frame rate, split render timings, split patch-to-present pipeline timing, layout-cache counters, and renderer-cache counters. Slow Wayland render frames also include a scene primitive summary and per-frame renderer-cache counters. (default: false)
@@ -110,10 +113,13 @@ defmodule EmergeSkia do
   - `fonts` (default: `[]`)
 
   `renderer_cache` options:
-  - `max_new_payloads_per_frame` (default: `1`)
-  - `clean_subtree.max_entries` (default: `128`)
-  - `clean_subtree.max_bytes` (default: `33_554_432`)
-  - `clean_subtree.max_entry_bytes` (default: `4_194_304`)
+  - `enabled` (default: `true`, GPU backends only)
+  - `max_new_payloads_per_frame` (default: `16`)
+  - `paint_layer.max_entries` (default: `512`)
+  - `paint_layer.max_bytes` (default: `671_088_640`)
+  - `paint_layer.max_entry_bytes` (default: `268_435_456`)
+  - `paint_layer.min_visible_before_store` (default: `1`)
+  - `paint_layer.max_stale_frames` (default: `120`)
 
   Set a renderer-cache limit to `0` to prevent new stores for that dimension.
 
@@ -131,8 +137,9 @@ defmodule EmergeSkia do
   the built-in `mocu-black-right` theme.
 
   Compile-time backend selection is configured separately with
-  `config :emerge, compiled_backends: [...]`. If omitted, desktop builds assume
-  `[:wayland]` and Nerves-style builds assume `[:drm]`.
+   `config :emerge, compiled_backends: [...]`. If omitted, desktop builds assume
+   `[:wayland]` and Nerves-style builds assume `[:drm]`. SH-4A builds using the
+   `:fbdev` backend should configure `compiled_backends: [:fbdev]` explicitly.
   """
   @spec start(keyword()) :: {:ok, renderer()} | {:error, term()}
   def start(opts) when is_list(opts) do
@@ -205,6 +212,9 @@ defmodule EmergeSkia do
   @doc """
   Create a renderer-owned video target.
 
+  The returned compatibility struct can be passed directly to `Emerge.UI.video/2`
+  or normalized into `Emerge.VideoTarget` with `Emerge.VideoTarget.from_skia/1`.
+
   V1 supports fixed-size `:prime` targets only on Prime-capable backends
   (`:wayland` and `:drm`).
   """
@@ -252,7 +262,9 @@ defmodule EmergeSkia do
   Submit a DRM Prime descriptor to a video target.
   """
   @spec submit_prime(video_target(), map()) :: :ok | {:error, term()}
-  def submit_prime(%VideoTarget{mode: :prime, ref: ref}, desc) when is_map(desc) do
+  def submit_prime(target, desc) when is_map(desc) do
+    %{mode: :prime, ref: ref} = Emerge.VideoTarget.normalize!(target)
+
     Native.video_target_submit_prime(ref, desc)
     |> normalize_native_ok()
   end
@@ -326,6 +338,28 @@ defmodule EmergeSkia do
           :ok | {:error, term()}
   def load_font_file(name, weight, italic, path) do
     Assets.load_font_file(name, weight, italic, path)
+  end
+
+  @doc """
+  Register SVG content supplied at runtime under a logical asset id.
+
+  Unlike `svg/2` asset files loaded from disk, this lets an application generate
+  SVG markup on the fly (gauges, charts, data-driven vectors) and render it
+  through the same Skia/usvg pipeline. The registered asset is referenced from a
+  tree by its id and resolves without filesystem access, including in the
+  offscreen `render_to_pixels/2` and `render_to_png/2` paths:
+
+      :ok = EmergeSkia.register_svg("gauge:power", power_gauge_svg(kw))
+      svg([width(px(360)), height(px(360))], {:id, "gauge:power"})
+
+  Re-registering the same id replaces the cached asset. Returns the intrinsic
+  `{:ok, {width, height}}` of the parsed SVG, or `{:error, reason}` if the
+  markup fails to parse.
+  """
+  @spec register_svg(String.t(), iodata()) ::
+          {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, String.t()}
+  def register_svg(id, svg) when is_binary(id) do
+    Native.register_svg_nif(id, IO.iodata_to_binary(svg))
   end
 
   # ===========================================================================
@@ -646,6 +680,36 @@ defmodule EmergeSkia do
     renderer
     |> Transport.for_renderer()
     |> apply(:stats, [renderer, command])
+  end
+
+  @doc """
+  Resolve a hostname to IP addresses.
+
+  Used by the iOS host resolver and Mahiuka ECU connection.
+  Defaults to IPv4. Returns `{:ok, [tuple()]}` on success.
+  """
+  @spec resolve_host(String.t()) :: {:ok, [tuple()]} | {:error, term()}
+  def resolve_host(name) do
+    resolve_host(name, :inet)
+  end
+
+  @doc """
+  Resolve a hostname to IP addresses for a given address family.
+  """
+  @spec resolve_host(String.t(), :inet | :inet6) :: {:ok, [tuple()]} | {:error, term()}
+  def resolve_host(name, family) do
+    family_str = Atom.to_string(family)
+
+    case Native.resolve_host_nif(name, family_str) do
+      {:ok, octets_list} ->
+        {:ok, Enum.map(octets_list, &List.to_tuple/1)}
+
+      {:error, reason} when is_binary(reason) ->
+        {:error, reason}
+
+      _ ->
+        {:error, :nxdomain}
+    end
   end
 
   defp normalize_native_ok({:ok, _}), do: :ok

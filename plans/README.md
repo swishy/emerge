@@ -1,17 +1,17 @@
 # Plans
 
-Last updated: 2026-05-07.
+Last updated: 2026-05-20.
 
 This directory tracks active implementation notes and durable background
-research for native layout, renderer, and input/runtime work. Files with an
-`active-` prefix are reserved for currently open implementation slices.
+research for native layout, renderer, and input/runtime work.
 
-There are currently no active implementation plans. Completed active plans have
-been folded into this index or the durable reference notes below.
+Active implementation plan: none.
+
+Files with an `active-` prefix are reserved for open implementation slices.
+When a slice completes, fold the useful details into this index or one of the
+durable reference notes below, then remove the completed implementation log.
 
 ## Files
-
-No `active-*.md` files are present right now.
 
 ### `layout-caching-roadmap.md`
 
@@ -32,12 +32,44 @@ This preserves the useful findings from Taffy, Yoga, Flutter, Slint, Iced, and
 Servo. It is intentionally more detailed than the roadmap because it records why
 certain design directions fit Emerge.
 
+### `elixir-reconciliation-optimization.md`
+
+Completed Elixir runtime update optimization notes, including the assigned-tree
+free viewport patch path, incremental event-registry reconciliation, benchmark
+methodology, and measured speedups against the previous public update path.
+
+### `biaxial-drag-scroll.md`
+
+Completed input-runtime note for two-axis drag scrolling after threshold
+activation, including the retained primary axis for inertia and split active
+scroll dispatch for scroll containers that can move in both axes.
+
+### `skia-ddl-paint-layer-note.md`
+
+Durable renderer note about future Skia Deferred Display List / picture
+recording options for paint-layer preparation. It records that paint layers
+could eventually be recorded in parallel, while GPU raster/upload/composition
+must stay serialized through the Skia GPU context.
+
+### `platform-runtime-architecture-differences.md`
+
+Explanatory note comparing Linux/Wayland actor-backed runtime orchestration with
+macOS host-session orchestration. Use it when investigating platform parity,
+event/tree registry synchronization, or convergence work.
+
 ## Folded Work
 
 The old `completed/` directory and implementation-tied investigations were
 removed after their useful state was folded into this index and the reference
 documents below. Recently folded slices:
 
+- Wayland suspend/resume and shutdown hardening, including render-log-gated
+  Wayland/event-runtime diagnostics, direct watchdog evidence that suspend
+  freezes were caused by the viewport heartbeat watchdog issuing a false stop,
+  liveness checks that poll `renderer.running?/1` before stopping, synchronous
+  `EmergeSkia.stop/1` native thread teardown, supervisor shutdown waiting for
+  viewport renderer cleanup, immediate Wayland surface unmap on shutdown, and
+  macOS stop-session timeout alignment
 - first-class `Emerge.UI.Input.slider/2`, including `Slider.config/1`, standard
   Emerge element slots for track, filled track, and thumb, typed float change
   events, text-input-style controlled reconciliation, rotated hit testing,
@@ -55,12 +87,64 @@ documents below. Recently folded slices:
 - frame-latency pacing and animation-cadence fixes
 - renderer-cache engine investigation and Flutter comparison findings that have
   already landed
+- renderer-diff parent-shell and clean-subtree scroll cache active plans; their
+  benchmark evidence remains useful, but the separate algorithms were removed
+  from active planning because they encode the wrong mental model for Emerge's
+  tree-derived cache boundaries
+- paint-layer cache boundary simplification, including removal of stale
+  parent-shell / clean-subtree / scroll-item cache-family code, one
+  tree-derived `RenderNode::PaintLayer` model, one shared paint-layer payload
+  cache, paint-layer stats naming, benchmark deduplication, and final cleanup
+  validation
 - macOS/Linux runtime convergence after the macOS hover refresh bug, including
   shared tree updates, event runtime driving, input normalization, present
   timing, cursor state, render timing stats, render-state scene installation,
   and macOS pipeline stats parity
 - cleanup of runtime-convergence scaffolding, including shared pipeline timing
   helpers and reduced macOS host wrapper-only tests
+- renderer refactor cleanup after paint-layer cache work, including deletion of
+  unused cache-boundary facts, consolidation of direct/cache/fixed paint-layer
+  traversal, shared paint-layer hashing, shared cache stat accounting helpers,
+  focused paint-layer cache proof benchmarks for scrolling and animation, and
+  rich Borders showcase Criterion coverage; full `./ci-tests.sh` passed on
+  2026-05-13
+- renderer-cache audit fixes, including clipped non-cacheable parent layers
+  still rendering child paint layers, `max_stale_frames` honoring stale eviction
+  policy/stats, `min_visible_before_store` avoiding one-frame admission churn,
+  and cleanup of pending screenshot/debug artifacts; validation passed on
+  2026-05-15
+- offscreen paint-layer cache-hit fixes, including payload-clip-aware fixed
+  static hashing/resource generation, visible fixed-segment preparation,
+  offscreen dynamic redraw skipping, scroll-away/scroll-back moving payload
+  retention, and Criterion proof for the layout-animation scroll viewport case;
+  full `./ci-tests.sh` passed on 2026-05-13
+- layout/refresh optimization after composited paint-layer rendering,
+  including exact emerge_demo showcase fixtures, retained nearby render
+  fragments, shared registry listener storage, offscreen virtual-key culling,
+  Scaled Press registry rebuild fixes, slider glow/thumb regression tests, and
+  the final benchmark gate recheck; full `./ci-tests.sh all` passed on
+  2026-05-15
+- code-bloat reduction after retained layout/refresh and paint-layer cache work,
+  including removal of dead renderer cache stats/API plumbing, Hex package
+  native-test exclusion, stale layout benchmark wrapper consolidation,
+  canonical `RenderPaintLayer` content cleanup, shared paint-layer/fingerprint
+  hash helpers, retained cache-layer overlap audit, and final validation; full
+  `./ci-tests.sh all` passed on 2026-05-18
+- review-finding cleanup after code-bloat reduction, including stats schema
+  version 15, pixel-level dirty-descendant paint refresh coverage, ordered
+  paint-layer content splitting after child paint-layer boundaries, and removal
+  of stale duplicate `uncached` layout benchmark labels; full
+  `./ci-tests.sh all` passed on 2026-05-18
+- Elixir reconciliation/runtime update optimization, including the runtime
+  binary patch path that skips assigned-tree construction, reusable
+  event-registry extraction, incremental per-vnode event registry updates,
+  update-path benchmarks, and parity coverage for event-heavy mutations;
+  validation passed on 2026-05-20
+- biaxial drag scrolling for oversized two-axis scroll containers, preserving a
+  primary gesture axis for inertia while active drag movement dispatches X and Y
+  scroll components independently, plus Wayland stale-registry fixes for no-op
+  scroll responses, reliable registry delivery, and listener-free overlay nearby
+  blockers; validation passed on 2026-05-20
 
 ## Current repo state
 
@@ -94,9 +178,12 @@ The native layout-caching foundation is in place:
 - detached nearby layout cache restore is scoped by host id, slot, host frame,
   subtree signature, and scale so changed-host or changed-slot reinserts
   relayout instead of reusing stale absolute frames
-- non-registry nearby remove/restored-show changes classify as paint/render
-  damage so warmed code-preview hover toggles can use refresh-only scheduling
-  and cached registry reuse
+- behind-content non-registry nearby remove/restored-show changes classify as
+  paint/render damage so warmed decorative toggles can use refresh-only
+  scheduling and cached registry reuse; overlay nearby slots (`above`,
+  `below`, `on_left`, `on_right`, `in_front`) classify as registry-relevant
+  because their roots emit front-nearby interaction blockers even without
+  explicit listeners
 - subtree-measure cache keys use compact child topology dependency versions and
   intentionally ignore nearby topology; resolve/cache-render keys still include
   nearby topology where output can depend on ordering/placement
@@ -107,6 +194,10 @@ The native layout-caching foundation is in place:
   - `renderer_animation_log: true` enables separate Wayland animation cadence
     trace logs without coupling them to renderer stats logs
   - `Native.stats/2` and `EmergeSkia.stats/2` expose peek/take/reset snapshots
+  - current public stats payload schema is version 15; renderer paint-layer
+    stats keep aggregate admission/cache counters and `prepare`/`draw_hit`
+    timings, but no longer expose removed moved-hit/miss or stale timing
+    breakdown fields
 - macOS and Linux now share retained-tree update semantics through the
   `TreeUpdateEngine`: `TreeMsg` application, animation sample timing,
   frame-attrs preparation, refresh/recompute decisions, cached-registry reuse,
@@ -181,16 +272,22 @@ The native layout-caching foundation is in place:
   bounds that account for shadows and transforms
 - refresh-only frames can reuse the cached full event registry when registry
   damage is clean
-- refresh scene rendering can reuse clean retained render subtrees
-- `RenderState::set_scene(...)` updates a scene and its derived
-  `has_cache_candidates` flag together, so Wayland, DRM, and macOS cannot
-  silently bypass renderer-cache traversal after installing a cache-candidate
-  scene
-- render-cache regression benchmarks compare cached and uncached refresh paths,
-  including cold full layout+refresh after upload/switch; dirty/full rebuilds do
-  not seed render caches, damaged refreshes with no existing caches use the
-  uncached renderer, scroll-offset subtrees bypass render-cache lookup, and dirty
-  scroll containers do not store large immediately-stale render caches
+- refresh scene rendering emits explicit paint layers from tree facts rather
+  than renderer-side diffing or retained-subtree discovery
+- `RenderPaintLayer` content is canonicalized as `own_nodes` plus ordered
+  `child_refs`; content after the first nested paint-layer boundary is kept in
+  child refs so dirty child layers preserve paint order relative to later clean
+  siblings
+- paint-layer cache proof benchmarks are wired into Criterion for scrolling and
+  animation; each case asserts cache store/hit behavior before measurement. The
+  demo-like rich Borders showcase is also wired into Criterion layout animation
+  and scroll-plus-animation benchmark groups.
+- `RenderState::set_scene(...)` updates a scene and its derived paint-layer
+  presence flag together, so Wayland, DRM, and macOS cannot silently bypass
+  paint-layer cache traversal after installing a cacheable scene
+- render-cache regression benchmarks cover retained refresh paths, including
+  cold full layout+refresh after upload/switch, paint-only animation,
+  scroll-moving paint-layer reuse, and CPU neutral/no-benefit paths
 - event registry rebuilds have a conservative chunk-cache path with full-rebuild
   fallback for damaged/no-retained-cache and escape-nearby cases
 - `animate_exit` removal keeps a cloned ghost subtree in active layout, with
@@ -227,6 +324,8 @@ The native layout-caching foundation is in place:
 - slider layout reserves endpoint thumb space, supports custom SVG/image slots,
   and lets focus/shadow effects bleed outside non-scroll ancestor clips while
   preserving scroll-axis clipping
+- Hex package inputs include required native sources and assets while excluding
+  native Rust tests, benchmark-only fixtures, and external fixture payloads
 
 ## Next recommended implementation order
 
@@ -237,13 +336,13 @@ macOS protocol, add request/notify-specific fixtures for start session, raw
 input notify, element notify, asset config, and offscreen request payloads on
 both the Rust host and Elixir sides.
 
-### 2. Review render-cache children rollout with live traces
+### 2. Tune paint-layer cache only from live traces
 
-The parent/child lifecycle and stale-entry slice is implemented. The next cache
-decision should start from fresh `../emerge_demo` stats: check stale eviction
-churn, suppressed-by-parent counts, and whether current automatic candidates are
-too cheap or too sparse before adding complexity scoring, transform expansion,
-or a new composition-cache boundary.
+The paint-layer cache model is implemented. Any next cache decision should start
+from fresh `../emerge_demo` stats: check moved-hit reuse, stale eviction churn,
+suppressed-by-parent counts, payload budget pressure, and whether current
+paint-layer boundaries are too coarse or too fine before adding heuristics or
+new composition behavior.
 
 ### 3. Watch frame latency traces instead of adding scheduler policy
 

@@ -42,6 +42,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use crate::actors::TreeMsg;
 use crate::clipboard::ClipboardTarget;
@@ -54,8 +55,8 @@ use crate::tree::attrs::{
     BorderRadius, KeyBindingMatch, KeyBindingSpec, Padding, VirtualKeyHoldMode, VirtualKeyTapAction,
 };
 use crate::tree::element::{
-    Element, ElementKind, ElementTree, Frame, NodeId, NodeIx, RenderTopologyDependencyKey,
-    RetainedChildMode, RetainedPaintPhase,
+    Element, ElementKind, ElementTree, Frame, NodeId, NodeIx, RetainedChildMode,
+    RetainedPaintPhase, TopologyDependencyKey,
 };
 use crate::tree::geometry::{
     ClipShape, CornerRadii, Rect, ShapeBounds, clamp_radii, point_hits_shape,
@@ -75,7 +76,135 @@ use super::{
 const RUNTIME_DRAG_DEADZONE: f32 = 10.0;
 const GESTURE_AXIS_DOMINANCE_RATIO: f32 = 1.25;
 const GESTURE_AXIS_MIN_LEAD: f32 = 6.0;
-const REGISTRY_SUBTREE_CACHE_BUDGET: usize = 4;
+const REGISTRY_SUBTREE_CACHE_BUDGET: usize = 48;
+
+#[cfg(any(test, feature = "bench-diagnostics"))]
+thread_local! {
+    static REGISTRY_BUILD_DIAGNOSTICS_ENABLED: Cell<bool> = const { Cell::new(false) };
+    static REGISTRY_BUILD_DIAGNOSTICS: Cell<RegistryBuildDiagnostics> = const {
+        Cell::new(RegistryBuildDiagnostics::empty())
+    };
+}
+
+#[cfg(any(test, feature = "bench-diagnostics"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegistryBuildDiagnostics {
+    pub visits: u64,
+    pub cache_hits: u64,
+    pub cache_stores: u64,
+    pub cache_ineligible: u64,
+    pub cache_damaged: u64,
+    pub cache_misses: u64,
+}
+
+#[cfg(any(test, feature = "bench-diagnostics"))]
+impl RegistryBuildDiagnostics {
+    const fn empty() -> Self {
+        Self {
+            visits: 0,
+            cache_hits: 0,
+            cache_stores: 0,
+            cache_ineligible: 0,
+            cache_damaged: 0,
+            cache_misses: 0,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "bench-diagnostics"))]
+#[doc(hidden)]
+pub fn reset_registry_build_diagnostics_for_benchmark() {
+    REGISTRY_BUILD_DIAGNOSTICS.with(|diagnostics| {
+        diagnostics.set(RegistryBuildDiagnostics::empty());
+    });
+    REGISTRY_BUILD_DIAGNOSTICS_ENABLED.with(|enabled| enabled.set(true));
+}
+
+#[cfg(any(test, feature = "bench-diagnostics"))]
+#[doc(hidden)]
+pub fn take_registry_build_diagnostics_for_benchmark() -> RegistryBuildDiagnostics {
+    REGISTRY_BUILD_DIAGNOSTICS_ENABLED.with(|enabled| enabled.set(false));
+    REGISTRY_BUILD_DIAGNOSTICS.with(Cell::get)
+}
+
+#[cfg(any(test, feature = "bench-diagnostics"))]
+fn update_registry_build_diagnostics(
+    update: impl FnOnce(RegistryBuildDiagnostics) -> RegistryBuildDiagnostics,
+) {
+    REGISTRY_BUILD_DIAGNOSTICS_ENABLED.with(|enabled| {
+        if enabled.get() {
+            REGISTRY_BUILD_DIAGNOSTICS.with(|diagnostics| {
+                diagnostics.set(update(diagnostics.get()));
+            });
+        }
+    });
+}
+
+#[cfg(any(test, feature = "bench-diagnostics"))]
+fn record_registry_visit() {
+    update_registry_build_diagnostics(|mut diagnostics| {
+        diagnostics.visits = diagnostics.visits.saturating_add(1);
+        diagnostics
+    });
+}
+
+#[cfg(not(any(test, feature = "bench-diagnostics")))]
+fn record_registry_visit() {}
+
+#[cfg(any(test, feature = "bench-diagnostics"))]
+fn record_registry_cache_hit() {
+    update_registry_build_diagnostics(|mut diagnostics| {
+        diagnostics.cache_hits = diagnostics.cache_hits.saturating_add(1);
+        diagnostics
+    });
+}
+
+#[cfg(not(any(test, feature = "bench-diagnostics")))]
+fn record_registry_cache_hit() {}
+
+#[cfg(any(test, feature = "bench-diagnostics"))]
+fn record_registry_cache_store() {
+    update_registry_build_diagnostics(|mut diagnostics| {
+        diagnostics.cache_stores = diagnostics.cache_stores.saturating_add(1);
+        diagnostics
+    });
+}
+
+#[cfg(not(any(test, feature = "bench-diagnostics")))]
+fn record_registry_cache_store() {}
+
+#[cfg(any(test, feature = "bench-diagnostics"))]
+fn record_registry_cache_ineligible() {
+    update_registry_build_diagnostics(|mut diagnostics| {
+        diagnostics.cache_ineligible = diagnostics.cache_ineligible.saturating_add(1);
+        diagnostics
+    });
+}
+
+#[cfg(not(any(test, feature = "bench-diagnostics")))]
+fn record_registry_cache_ineligible() {}
+
+#[cfg(any(test, feature = "bench-diagnostics"))]
+fn record_registry_cache_damaged() {
+    update_registry_build_diagnostics(|mut diagnostics| {
+        diagnostics.cache_damaged = diagnostics.cache_damaged.saturating_add(1);
+        diagnostics
+    });
+}
+
+#[cfg(not(any(test, feature = "bench-diagnostics")))]
+fn record_registry_cache_damaged() {}
+
+#[cfg(any(test, feature = "bench-diagnostics"))]
+fn record_registry_cache_miss() {
+    update_registry_build_diagnostics(|mut diagnostics| {
+        diagnostics.cache_misses = diagnostics.cache_misses.saturating_add(1);
+        diagnostics
+    });
+}
+
+#[cfg(not(any(test, feature = "bench-diagnostics")))]
+fn record_registry_cache_miss() {}
 
 /// Listener registry consumed by the event actor.
 ///
@@ -91,7 +220,7 @@ const REGISTRY_SUBTREE_CACHE_BUDGET: usize = 4;
 /// - `Registry::view()` when reading them in dispatch order
 #[derive(Clone, Debug, Default)]
 pub struct Registry {
-    listeners: Vec<Listener>,
+    listeners: Arc<Vec<Listener>>,
 }
 
 impl Registry {
@@ -104,23 +233,22 @@ impl Registry {
         &mut self,
         build: impl FnOnce(&mut PrecedenceEmitter<'_>) -> R,
     ) -> R {
-        let start = self.listeners.len();
-        let result = build(&mut PrecedenceEmitter {
-            listeners: &mut self.listeners,
-        });
-        self.listeners[start..].reverse();
+        let listeners = Arc::make_mut(&mut self.listeners);
+        let start = listeners.len();
+        let result = build(&mut PrecedenceEmitter { listeners });
+        listeners[start..].reverse();
         result
     }
 
     /// Returns a precedence-ordered read view over the registry.
     pub(crate) fn view(&self) -> RegistryView<'_> {
         RegistryView {
-            listeners: &self.listeners,
+            listeners: self.listeners.as_slice(),
         }
     }
 
     fn extend_storage_from(&mut self, other: &Registry) {
-        self.listeners.extend(other.listeners.iter().cloned());
+        Arc::make_mut(&mut self.listeners).extend(other.listeners.iter().cloned());
     }
 
     #[cfg(test)]
@@ -309,6 +437,7 @@ pub struct ClickPressTracker {
     pub matcher_kind: ListenerMatcherKind,
     pub emit_click: bool,
     pub emit_press_pointer: bool,
+    pub clear_mouse_down: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -533,7 +662,7 @@ struct RegistrySubtreeKey {
     hover_stack_hash: u64,
     scene_context_hash: u64,
     scroll_contexts_hash: u64,
-    topology: RenderTopologyDependencyKey,
+    topology: TopologyDependencyKey,
 }
 
 #[derive(Clone, Debug)]
@@ -666,6 +795,18 @@ pub enum GestureAxis {
     Vertical,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DragScrollMode {
+    Locked,
+    Biaxial,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DragScrollActivation {
+    primary_axis: GestureAxis,
+    scroll_mode: DragScrollMode,
+}
+
 /// Drag tracker lifecycle state.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum DragTrackerState {
@@ -677,6 +818,7 @@ pub enum DragTrackerState {
         origin_x: f32,
         origin_y: f32,
         swipe_handlers: SwipeHandlers,
+        scroll_candidate: bool,
     },
     Active {
         element_id: NodeId,
@@ -684,6 +826,7 @@ pub enum DragTrackerState {
         last_x: f32,
         last_y: f32,
         locked_axis: GestureAxis,
+        scroll_mode: DragScrollMode,
     },
 }
 
@@ -768,12 +911,12 @@ fn emit_runtime_overlay_listeners(
         base,
         &runtime.drag,
     ));
-    out.emit_opt(
-        runtime
-            .virtual_key
-            .as_ref()
-            .map(runtime_virtual_key_release_listener),
-    );
+    out.emit_opt(runtime.virtual_key.as_ref().map(|tracker| {
+        runtime_virtual_key_release_listener(
+            tracker,
+            click_press_tracker_for_element(&runtime.click_press, tracker.element_id),
+        )
+    }));
     out.emit_all(runtime_key_press_release_listeners(
         base,
         &runtime.key_presses,
@@ -794,24 +937,24 @@ fn emit_runtime_overlay_listeners(
         base,
         &runtime.drag,
     ));
-    out.emit_opt(
-        runtime
-            .virtual_key
-            .as_ref()
-            .map(runtime_virtual_key_release_anywhere_clear_listener),
-    );
+    out.emit_opt(runtime.virtual_key.as_ref().map(|tracker| {
+        runtime_virtual_key_release_anywhere_clear_listener(
+            tracker,
+            click_press_tracker_for_element(&runtime.click_press, tracker.element_id),
+        )
+    }));
     out.emit_opt(
         runtime
             .click_press
             .as_ref()
             .and_then(|tracker| runtime_click_press_release_anywhere_clear_listener(base, tracker)),
     );
-    out.emit_opt(
-        runtime
-            .virtual_key
-            .as_ref()
-            .and_then(runtime_virtual_key_leave_cancel_listener),
-    );
+    out.emit_opt(runtime.virtual_key.as_ref().and_then(|tracker| {
+        runtime_virtual_key_leave_cancel_listener(
+            tracker,
+            click_press_tracker_for_element(&runtime.click_press, tracker.element_id),
+        )
+    }));
     out.emit_opt(runtime_drag_active_scroll_move_listener(
         base,
         &runtime.drag,
@@ -821,12 +964,12 @@ fn emit_runtime_overlay_listeners(
         &runtime.drag,
     ));
     out.emit_opt(runtime_drag_window_blur_clear_listener(base, &runtime.drag));
-    out.emit_opt(
-        runtime
-            .virtual_key
-            .as_ref()
-            .map(runtime_virtual_key_window_blur_clear_listener),
-    );
+    out.emit_opt(runtime.virtual_key.as_ref().map(|tracker| {
+        runtime_virtual_key_window_blur_clear_listener(
+            tracker,
+            click_press_tracker_for_element(&runtime.click_press, tracker.element_id),
+        )
+    }));
     out.emit_opt(runtime_key_press_window_blur_clear_listener(
         &runtime.key_presses,
     ));
@@ -884,12 +1027,12 @@ fn emit_runtime_overlay_listeners(
         base,
         &runtime.drag,
     ));
-    out.emit_opt(
-        runtime
-            .virtual_key
-            .as_ref()
-            .map(runtime_virtual_key_window_leave_clear_listener),
-    );
+    out.emit_opt(runtime.virtual_key.as_ref().map(|tracker| {
+        runtime_virtual_key_window_leave_clear_listener(
+            tracker,
+            click_press_tracker_for_element(&runtime.click_press, tracker.element_id),
+        )
+    }));
     out.emit_opt(
         runtime
             .swipe
@@ -1065,14 +1208,22 @@ fn runtime_drag_active_scroll_move_listener(
     base: &Registry,
     drag: &DragTrackerState,
 ) -> Option<Listener> {
-    let (element_id, matcher_kind, last_x, last_y, locked_axis) = match drag {
+    let (element_id, matcher_kind, last_x, last_y, locked_axis, scroll_mode) = match drag {
         DragTrackerState::Active {
             element_id,
             matcher_kind,
             last_x,
             last_y,
             locked_axis,
-        } => (element_id, *matcher_kind, *last_x, *last_y, *locked_axis),
+            scroll_mode,
+        } => (
+            element_id,
+            *matcher_kind,
+            *last_x,
+            *last_y,
+            *locked_axis,
+            *scroll_mode,
+        ),
         DragTrackerState::Inactive | DragTrackerState::Candidate { .. } => return None,
     };
 
@@ -1084,6 +1235,7 @@ fn runtime_drag_active_scroll_move_listener(
             last_x,
             last_y,
             locked_axis,
+            scroll_mode,
         },
     })
 }
@@ -1117,22 +1269,25 @@ fn runtime_drag_candidate_threshold_listener(
     base: &Registry,
     drag: &DragTrackerState,
 ) -> Option<Listener> {
-    let (element_id, matcher_kind, origin_x, origin_y, swipe_handlers) = match drag {
-        DragTrackerState::Candidate {
-            element_id,
-            matcher_kind,
-            origin_x,
-            origin_y,
-            swipe_handlers,
-        } => (
-            element_id,
-            *matcher_kind,
-            *origin_x,
-            *origin_y,
-            *swipe_handlers,
-        ),
-        DragTrackerState::Inactive | DragTrackerState::Active { .. } => return None,
-    };
+    let (element_id, matcher_kind, origin_x, origin_y, swipe_handlers, scroll_candidate) =
+        match drag {
+            DragTrackerState::Candidate {
+                element_id,
+                matcher_kind,
+                origin_x,
+                origin_y,
+                swipe_handlers,
+                scroll_candidate,
+            } => (
+                element_id,
+                *matcher_kind,
+                *origin_x,
+                *origin_y,
+                *swipe_handlers,
+                *scroll_candidate,
+            ),
+            DragTrackerState::Inactive | DragTrackerState::Active { .. } => return None,
+        };
 
     runtime_source_listener(base, element_id, matcher_kind)?;
 
@@ -1149,6 +1304,7 @@ fn runtime_drag_candidate_threshold_listener(
             origin_x,
             origin_y,
             swipe_handlers,
+            scroll_candidate,
         },
     })
 }
@@ -1260,6 +1416,7 @@ fn runtime_click_press_release_listener(
             element_id: tracker.element_id,
             emit_click: tracker.emit_click,
             emit_press_pointer: tracker.emit_press_pointer,
+            clear_mouse_down: tracker.clear_mouse_down,
         },
     })
 }
@@ -1320,10 +1477,7 @@ fn runtime_click_press_release_anywhere_clear_listener(
         element_id: Some(tracker.element_id),
         matcher: ListenerMatcher::CursorButtonLeftReleaseAnywhere,
         compute: ListenerCompute::Static {
-            actions: vec![
-                ListenerAction::RuntimeChange(RuntimeChange::ClearClickPressTracker),
-                ListenerAction::RuntimeChange(RuntimeChange::ClearDragTracker),
-            ],
+            actions: click_press_clear_actions(tracker),
         },
     })
 }
@@ -1338,10 +1492,7 @@ fn runtime_click_press_window_blur_clear_listener(
         element_id: Some(tracker.element_id),
         matcher: ListenerMatcher::WindowBlurred,
         compute: ListenerCompute::Static {
-            actions: vec![
-                ListenerAction::RuntimeChange(RuntimeChange::ClearClickPressTracker),
-                ListenerAction::RuntimeChange(RuntimeChange::ClearDragTracker),
-            ],
+            actions: click_press_clear_actions(tracker),
         },
     })
 }
@@ -1356,12 +1507,24 @@ fn runtime_click_press_window_leave_clear_listener(
         element_id: Some(tracker.element_id),
         matcher: ListenerMatcher::WindowCursorLeft,
         compute: ListenerCompute::Static {
-            actions: vec![
-                ListenerAction::RuntimeChange(RuntimeChange::ClearClickPressTracker),
-                ListenerAction::RuntimeChange(RuntimeChange::ClearDragTracker),
-            ],
+            actions: click_press_clear_actions(tracker),
         },
     })
+}
+
+fn click_press_clear_actions(tracker: &ClickPressTracker) -> Vec<ListenerAction> {
+    tracker
+        .clear_mouse_down
+        .then_some(ListenerAction::TreeMsg(TreeMsg::SetMouseDownActive {
+            element_id: tracker.element_id,
+            active: false,
+        }))
+        .into_iter()
+        .chain([
+            ListenerAction::RuntimeChange(RuntimeChange::ClearClickPressTracker),
+            ListenerAction::RuntimeChange(RuntimeChange::ClearDragTracker),
+        ])
+        .collect()
 }
 
 pub(crate) fn synthetic_input_sequence_for_virtual_key_tap(
@@ -1403,7 +1566,27 @@ pub(crate) fn synthetic_input_sequence_for_virtual_key_tap(
     }
 }
 
-fn runtime_virtual_key_release_listener(tracker: &VirtualKeyTracker) -> Listener {
+fn click_press_tracker_for_element(
+    click_press: &Option<ClickPressTracker>,
+    element_id: NodeId,
+) -> Option<&ClickPressTracker> {
+    click_press
+        .as_ref()
+        .filter(|tracker| tracker.element_id == element_id)
+}
+
+fn click_press_clear_actions_for_element(
+    click_press: Option<&ClickPressTracker>,
+) -> Vec<ListenerAction> {
+    click_press
+        .map(click_press_clear_actions)
+        .unwrap_or_default()
+}
+
+fn runtime_virtual_key_release_listener(
+    tracker: &VirtualKeyTracker,
+    click_press: Option<&ClickPressTracker>,
+) -> Listener {
     let mut actions = Vec::new();
 
     if tracker.phase == VirtualKeyPhase::Armed {
@@ -1415,6 +1598,7 @@ fn runtime_virtual_key_release_listener(tracker: &VirtualKeyTracker) -> Listener
     actions.push(ListenerAction::RuntimeChange(
         RuntimeChange::ClearVirtualKeyTracker,
     ));
+    actions.extend(click_press_clear_actions_for_element(click_press));
 
     Listener {
         element_id: Some(tracker.element_id),
@@ -1425,58 +1609,86 @@ fn runtime_virtual_key_release_listener(tracker: &VirtualKeyTracker) -> Listener
     }
 }
 
-fn runtime_virtual_key_release_anywhere_clear_listener(tracker: &VirtualKeyTracker) -> Listener {
+fn runtime_virtual_key_release_anywhere_clear_listener(
+    tracker: &VirtualKeyTracker,
+    click_press: Option<&ClickPressTracker>,
+) -> Listener {
+    let actions = [ListenerAction::RuntimeChange(
+        RuntimeChange::ClearVirtualKeyTracker,
+    )]
+    .into_iter()
+    .chain(click_press_clear_actions_for_element(click_press))
+    .collect();
+
     Listener {
         element_id: Some(tracker.element_id),
         matcher: ListenerMatcher::CursorButtonLeftReleaseAnywhere,
-        compute: ListenerCompute::Static {
-            actions: vec![ListenerAction::RuntimeChange(
-                RuntimeChange::ClearVirtualKeyTracker,
-            )],
-        },
+        compute: ListenerCompute::Static { actions },
     }
 }
 
-fn runtime_virtual_key_leave_cancel_listener(tracker: &VirtualKeyTracker) -> Option<Listener> {
+fn runtime_virtual_key_leave_cancel_listener(
+    tracker: &VirtualKeyTracker,
+    click_press: Option<&ClickPressTracker>,
+) -> Option<Listener> {
     matches!(
         tracker.phase,
         VirtualKeyPhase::Armed | VirtualKeyPhase::Repeating
     )
-    .then(|| Listener {
-        element_id: Some(tracker.element_id),
-        matcher: ListenerMatcher::CursorLocationLeaveBoundary {
-            region: tracker.region.clone(),
-        },
-        compute: ListenerCompute::DispatchBaseSkipThenStatic {
-            skip_matchers: vec![ListenerMatcherKind::HoverLeaveCurrentOwner],
-            actions: vec![ListenerAction::RuntimeChange(
-                RuntimeChange::CancelVirtualKeyTracker,
-            )],
-        },
+    .then(|| {
+        let actions = [ListenerAction::RuntimeChange(
+            RuntimeChange::CancelVirtualKeyTracker,
+        )]
+        .into_iter()
+        .chain(click_press_clear_actions_for_element(click_press))
+        .collect();
+
+        Listener {
+            element_id: Some(tracker.element_id),
+            matcher: ListenerMatcher::CursorLocationLeaveBoundary {
+                region: tracker.region.clone(),
+            },
+            compute: ListenerCompute::DispatchBaseSkipThenStatic {
+                skip_matchers: vec![ListenerMatcherKind::HoverLeaveCurrentOwner],
+                actions,
+            },
+        }
     })
 }
 
-fn runtime_virtual_key_window_blur_clear_listener(tracker: &VirtualKeyTracker) -> Listener {
+fn runtime_virtual_key_window_blur_clear_listener(
+    tracker: &VirtualKeyTracker,
+    click_press: Option<&ClickPressTracker>,
+) -> Listener {
+    let actions = [ListenerAction::RuntimeChange(
+        RuntimeChange::ClearVirtualKeyTracker,
+    )]
+    .into_iter()
+    .chain(click_press_clear_actions_for_element(click_press))
+    .collect();
+
     Listener {
         element_id: Some(tracker.element_id),
         matcher: ListenerMatcher::WindowBlurred,
-        compute: ListenerCompute::DispatchBaseThenStatic {
-            actions: vec![ListenerAction::RuntimeChange(
-                RuntimeChange::ClearVirtualKeyTracker,
-            )],
-        },
+        compute: ListenerCompute::DispatchBaseThenStatic { actions },
     }
 }
 
-fn runtime_virtual_key_window_leave_clear_listener(tracker: &VirtualKeyTracker) -> Listener {
+fn runtime_virtual_key_window_leave_clear_listener(
+    tracker: &VirtualKeyTracker,
+    click_press: Option<&ClickPressTracker>,
+) -> Listener {
+    let actions = [ListenerAction::RuntimeChange(
+        RuntimeChange::ClearVirtualKeyTracker,
+    )]
+    .into_iter()
+    .chain(click_press_clear_actions_for_element(click_press))
+    .collect();
+
     Listener {
         element_id: Some(tracker.element_id),
         matcher: ListenerMatcher::WindowCursorLeft,
-        compute: ListenerCompute::DispatchBaseThenStatic {
-            actions: vec![ListenerAction::RuntimeChange(
-                RuntimeChange::ClearVirtualKeyTracker,
-            )],
-        },
+        compute: ListenerCompute::DispatchBaseThenStatic { actions },
     }
 }
 
@@ -1597,6 +1809,7 @@ pub(crate) struct PointerDragBootstrap {
     element_id: NodeId,
     matcher_kind: ListenerMatcherKind,
     swipe_handlers: SwipeHandlers,
+    scroll_candidate: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2427,6 +2640,7 @@ pub(crate) enum RuntimeChange {
         matcher_kind: ListenerMatcherKind,
         emit_click: bool,
         emit_press_pointer: bool,
+        clear_mouse_down: bool,
     },
     /// Begin virtual-key press tracking.
     StartVirtualKeyTracker { tracker: VirtualKeyTracker },
@@ -2439,6 +2653,7 @@ pub(crate) enum RuntimeChange {
         origin_x: f32,
         origin_y: f32,
         swipe_handlers: SwipeHandlers,
+        scroll_candidate: bool,
     },
     /// Promote drag threshold tracking to an active drag followup.
     PromoteDragTracker {
@@ -2447,6 +2662,7 @@ pub(crate) enum RuntimeChange {
         last_x: f32,
         last_y: f32,
         locked_axis: GestureAxis,
+        scroll_mode: DragScrollMode,
     },
     /// Begin text-selection drag tracking.
     StartTextDragTracker {
@@ -2598,6 +2814,7 @@ pub(crate) enum ListenerCompute {
         element_id: NodeId,
         emit_click: bool,
         emit_press_pointer: bool,
+        clear_mouse_down: bool,
     },
     /// Redispatch base release listeners, then emit a completed swipe gesture.
     SwipeReleaseFollowupToBase { tracker: SwipeTracker },
@@ -2613,6 +2830,7 @@ pub(crate) enum ListenerCompute {
         origin_x: f32,
         origin_y: f32,
         swipe_handlers: SwipeHandlers,
+        scroll_candidate: bool,
     },
     /// Split one physical scroll input into directional redispatches.
     RedispatchScrollInput,
@@ -2639,6 +2857,7 @@ pub(crate) enum ListenerCompute {
         last_x: f32,
         last_y: f32,
         locked_axis: GestureAxis,
+        scroll_mode: DragScrollMode,
     },
     /// Start scrollbar drag tracking from a thumb or track press.
     ScrollbarPressToRuntime {
@@ -2735,6 +2954,7 @@ impl ListenerCompute {
                             origin_x: *x,
                             origin_y: *y,
                             swipe_handlers: pointer_drag.swipe_handlers,
+                            scroll_candidate: pointer_drag.scroll_candidate,
                         })
                     }))
                     .chain(text_cursor_element_id.as_ref().map(|element_id| {
@@ -2788,11 +3008,23 @@ impl ListenerCompute {
                 element_id,
                 emit_click,
                 emit_press_pointer,
+                clear_mouse_down,
             } => match input.raw() {
                 Some(InputEvent::CursorButton { button, action, .. })
                     if button == "left" && *action == ACTION_RELEASE =>
                 {
-                    ctx.dispatch_base(input)
+                    let base_actions = ctx.dispatch_base(input);
+                    let base_clears_mouse_down = base_actions.iter().any(|action| {
+                        matches!(
+                            action,
+                            ListenerAction::TreeMsg(TreeMsg::SetMouseDownActive {
+                                element_id: clear_id,
+                                active: false,
+                            }) if clear_id == element_id
+                        )
+                    });
+
+                    base_actions
                         .into_iter()
                         .chain((*emit_click).then_some({
                             ListenerAction::ElixirEvent(ElixirEvent {
@@ -2808,6 +3040,12 @@ impl ListenerCompute {
                                 payload: None,
                             })
                         }))
+                        .chain((*clear_mouse_down && !base_clears_mouse_down).then_some(
+                            ListenerAction::TreeMsg(TreeMsg::SetMouseDownActive {
+                                element_id: *element_id,
+                                active: false,
+                            }),
+                        ))
                         .chain([
                             ListenerAction::RuntimeChange(RuntimeChange::ClearClickPressTracker),
                             ListenerAction::RuntimeChange(RuntimeChange::ClearDragTracker),
@@ -2866,21 +3104,28 @@ impl ListenerCompute {
                 origin_x,
                 origin_y,
                 swipe_handlers,
+                scroll_candidate,
             } => match input {
                 ListenerInput::Raw(InputEvent::CursorPos { x, y }) => {
                     let dx = *x - *origin_x;
                     let dy = *y - *origin_y;
 
-                    if let Some(locked_axis) =
-                        drag_scroll_activation_axis(*origin_x, *origin_y, *x, *y, ctx)
-                    {
+                    if let Some(activation) = drag_scroll_activation(
+                        *origin_x,
+                        *origin_y,
+                        *x,
+                        *y,
+                        !swipe_handlers.any(),
+                        ctx,
+                    ) {
                         vec![
                             ListenerAction::RuntimeChange(RuntimeChange::PromoteDragTracker {
                                 element_id: *element_id,
                                 matcher_kind: *matcher_kind,
                                 last_x: *x,
                                 last_y: *y,
-                                locked_axis,
+                                locked_axis: activation.primary_axis,
+                                scroll_mode: activation.scroll_mode,
                             }),
                             ListenerAction::RuntimeChange(RuntimeChange::ClearClickPressTracker),
                         ]
@@ -2902,9 +3147,15 @@ impl ListenerCompute {
                             }),
                         ]
                     } else if gesture_axis_intent_from_delta(dx, dy).is_some() {
-                        vec![ListenerAction::RuntimeChange(
-                            RuntimeChange::ClearDragTracker,
-                        )]
+                        if *scroll_candidate && !swipe_handlers.any() {
+                            vec![ListenerAction::RuntimeChange(
+                                RuntimeChange::ClearClickPressTracker,
+                            )]
+                        } else {
+                            vec![ListenerAction::RuntimeChange(
+                                RuntimeChange::ClearDragTracker,
+                            )]
+                        }
                     } else {
                         Vec::new()
                     }
@@ -2929,11 +3180,12 @@ impl ListenerCompute {
                 Some(InputEvent::Resized {
                     width,
                     height,
-                    scale_factor,
+                    layout_scale,
+                    ..
                 }) => vec![ListenerAction::TreeMsg(TreeMsg::Resize {
                     width: *width as f32,
                     height: *height as f32,
-                    scale: *scale_factor,
+                    scale: *layout_scale,
                 })],
                 _ => Vec::new(),
             },
@@ -2948,10 +3200,16 @@ impl ListenerCompute {
                 last_x,
                 last_y,
                 locked_axis,
+                scroll_mode,
             } => match input.raw() {
-                Some(input) => {
-                    drag_scroll_actions_from_input(input, *last_x, *last_y, *locked_axis, ctx)
-                }
+                Some(input) => drag_scroll_actions_from_input(
+                    input,
+                    *last_x,
+                    *last_y,
+                    *locked_axis,
+                    *scroll_mode,
+                    ctx,
+                ),
                 None => Vec::new(),
             },
             ListenerCompute::ScrollbarPressToRuntime { element_id, spec } => match input.raw() {
@@ -3376,7 +3634,7 @@ fn drag_scroll_component_for_region(
     x: f32,
     y: f32,
 ) -> Option<ScrollComponentDelta> {
-    if !region.contains(x, y) {
+    if !(region.contains(x, y) || locked_axis.is_some() && region.contains(from_x, from_y)) {
         return None;
     }
 
@@ -3409,6 +3667,127 @@ fn cursor_scroll_direction_matches(
     }
 }
 
+fn drag_scroll_axis_delta_from_action(action: &ListenerAction, axis: GestureAxis) -> Option<f32> {
+    match action {
+        ListenerAction::TreeMsg(TreeMsg::ScrollRequest { dx, dy, .. }) => match axis {
+            GestureAxis::Horizontal if dx.abs() > f32::EPSILON => Some(*dx),
+            GestureAxis::Vertical if dy.abs() > f32::EPSILON => Some(*dy),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn drag_scroll_axis_request<C: ListenerComputeCtx>(
+    axis: GestureAxis,
+    from_x: f32,
+    from_y: f32,
+    x: f32,
+    y: f32,
+    ctx: &mut C,
+) -> Option<f32> {
+    let input = ListenerInput::DragScroll {
+        locked_axis: Some(axis),
+        from_x,
+        from_y,
+        x,
+        y,
+    };
+
+    ctx.dispatch_base(&input)
+        .iter()
+        .find_map(|action| drag_scroll_axis_delta_from_action(action, axis))
+}
+
+fn drag_scroll_axis_potential<C: ListenerComputeCtx>(
+    axis: GestureAxis,
+    from_x: f32,
+    from_y: f32,
+    x: f32,
+    y: f32,
+    allow_opposite_probe: bool,
+    ctx: &mut C,
+) -> Option<f32> {
+    drag_scroll_axis_request(axis, from_x, from_y, x, y, ctx).or_else(|| {
+        let (opposite_x, opposite_y) =
+            allow_opposite_probe.then(|| opposite_probe_point(from_x, from_y, x, y))??;
+
+        drag_scroll_axis_request(axis, from_x, from_y, opposite_x, opposite_y, ctx)
+    })
+}
+
+fn opposite_probe_point(from_x: f32, from_y: f32, x: f32, y: f32) -> Option<(f32, f32)> {
+    let dx = x - from_x;
+    let dy = y - from_y;
+    let max_delta = dx.abs().max(dy.abs());
+
+    (max_delta > f32::EPSILON).then(|| {
+        let scale = 1.0 / max_delta;
+        (from_x - dx * scale, from_y - dy * scale)
+    })
+}
+
+fn primary_drag_axis(horizontal_delta: f32, vertical_delta: f32) -> GestureAxis {
+    if horizontal_delta.abs() >= vertical_delta.abs() {
+        GestureAxis::Horizontal
+    } else {
+        GestureAxis::Vertical
+    }
+}
+
+fn drag_scroll_activation<C: ListenerComputeCtx>(
+    from_x: f32,
+    from_y: f32,
+    x: f32,
+    y: f32,
+    allow_opposite_probe: bool,
+    ctx: &mut C,
+) -> Option<DragScrollActivation> {
+    if !allow_opposite_probe {
+        return drag_scroll_activation_axis(from_x, from_y, x, y, ctx).map(|primary_axis| {
+            DragScrollActivation {
+                primary_axis,
+                scroll_mode: DragScrollMode::Locked,
+            }
+        });
+    }
+
+    let horizontal_delta = drag_scroll_axis_potential(
+        GestureAxis::Horizontal,
+        from_x,
+        from_y,
+        x,
+        y,
+        allow_opposite_probe,
+        ctx,
+    );
+    let vertical_delta = drag_scroll_axis_potential(
+        GestureAxis::Vertical,
+        from_x,
+        from_y,
+        x,
+        y,
+        allow_opposite_probe,
+        ctx,
+    );
+
+    match (horizontal_delta, vertical_delta) {
+        (Some(dx), Some(dy)) => Some(DragScrollActivation {
+            primary_axis: primary_drag_axis(dx, dy),
+            scroll_mode: DragScrollMode::Biaxial,
+        }),
+        (Some(_), None) => Some(DragScrollActivation {
+            primary_axis: GestureAxis::Horizontal,
+            scroll_mode: DragScrollMode::Locked,
+        }),
+        (None, Some(_)) => Some(DragScrollActivation {
+            primary_axis: GestureAxis::Vertical,
+            scroll_mode: DragScrollMode::Locked,
+        }),
+        (None, None) => None,
+    }
+}
+
 fn drag_scroll_activation_axis<C: ListenerComputeCtx>(
     from_x: f32,
     from_y: f32,
@@ -3425,17 +3804,12 @@ fn drag_scroll_activation_axis<C: ListenerComputeCtx>(
     };
 
     ctx.dispatch_base(&input).into_iter().find_map(|action| {
-        let ListenerAction::TreeMsg(TreeMsg::ScrollRequest { dx, dy, .. }) = action else {
-            return None;
-        };
-
-        if dx.abs() > f32::EPSILON {
-            Some(GestureAxis::Horizontal)
-        } else if dy.abs() > f32::EPSILON {
-            Some(GestureAxis::Vertical)
-        } else {
-            None
-        }
+        drag_scroll_axis_delta_from_action(&action, GestureAxis::Horizontal)
+            .map(|_| GestureAxis::Horizontal)
+            .or_else(|| {
+                drag_scroll_axis_delta_from_action(&action, GestureAxis::Vertical)
+                    .map(|_| GestureAxis::Vertical)
+            })
     })
 }
 
@@ -3703,6 +4077,7 @@ fn drag_scroll_actions_from_input<C: ListenerComputeCtx>(
     last_x: f32,
     last_y: f32,
     locked_axis: GestureAxis,
+    scroll_mode: DragScrollMode,
     ctx: &mut C,
 ) -> Vec<ListenerAction> {
     let InputEvent::CursorPos { x, y } = input else {
@@ -3714,24 +4089,13 @@ fn drag_scroll_actions_from_input<C: ListenerComputeCtx>(
 
     let moved = dx != 0.0 || dy != 0.0;
     let actions = if moved {
-        ctx.dispatch_base(&ListenerInput::DragScroll {
-            locked_axis: Some(locked_axis),
-            from_x: last_x,
-            from_y: last_y,
-            x: *x,
-            y: *y,
-        })
+        drag_scroll_actions_for_mode(ctx, scroll_mode, locked_axis, last_x, last_y, *x, *y)
     } else {
         Vec::new()
     };
-    let axis_delta = actions.iter().find_map(|action| match action {
-        ListenerAction::TreeMsg(TreeMsg::ScrollRequest { dx, dy, .. }) => match locked_axis {
-            GestureAxis::Horizontal if dx.abs() > f32::EPSILON => Some(*dx),
-            GestureAxis::Vertical if dy.abs() > f32::EPSILON => Some(*dy),
-            _ => None,
-        },
-        _ => None,
-    });
+    let axis_delta = actions
+        .iter()
+        .find_map(|action| drag_scroll_axis_delta_from_action(action, locked_axis));
 
     actions
         .into_iter()
@@ -3743,6 +4107,38 @@ fn drag_scroll_actions_from_input<C: ListenerComputeCtx>(
             },
         )))
         .collect()
+}
+
+fn drag_scroll_actions_for_mode<C: ListenerComputeCtx>(
+    ctx: &mut C,
+    scroll_mode: DragScrollMode,
+    locked_axis: GestureAxis,
+    from_x: f32,
+    from_y: f32,
+    x: f32,
+    y: f32,
+) -> Vec<ListenerAction> {
+    match scroll_mode {
+        DragScrollMode::Locked => ctx.dispatch_base(&ListenerInput::DragScroll {
+            locked_axis: Some(locked_axis),
+            from_x,
+            from_y,
+            x,
+            y,
+        }),
+        DragScrollMode::Biaxial => [GestureAxis::Horizontal, GestureAxis::Vertical]
+            .into_iter()
+            .flat_map(|axis| {
+                ctx.dispatch_base(&ListenerInput::DragScroll {
+                    locked_axis: Some(axis),
+                    from_x,
+                    from_y,
+                    x,
+                    y,
+                })
+            })
+            .collect(),
+    }
 }
 
 fn gesture_axis_intent_from_delta(dx: f32, dy: f32) -> Option<GestureAxis> {
@@ -5389,8 +5785,8 @@ fn hover_tracker_for_element(
         HoverTracker {
             element_id: element.id,
             region,
-            enter_actions: hover::inside_actions(element),
-            leave_actions: hover::leave_actions(element),
+            enter_actions: hover::tracker_enter_actions(element),
+            leave_actions: hover::tracker_leave_actions(element),
             cache_hash,
         }
     })
@@ -5905,6 +6301,7 @@ fn accumulate_subtree_rebuild_local(
     hover_stack: &[HoverTracker],
     scene_ctx: crate::tree::scene::SceneContext,
 ) -> Vec<DeferredSubtree> {
+    record_registry_visit();
     let Some(element) = tree.get(element_id) else {
         return Vec::new();
     };
@@ -6034,6 +6431,7 @@ fn accumulate_subtree_rebuild_local_cached(
     scene_ctx: crate::tree::scene::SceneContext,
     cache_budget: &Cell<usize>,
 ) -> Vec<DeferredSubtree> {
+    record_registry_visit();
     let Some(ix) = tree.ix_of(element_id) else {
         return Vec::new();
     };
@@ -6045,6 +6443,11 @@ fn accumulate_subtree_rebuild_local_cached(
     let has_existing_cache = tree
         .get_ix(ix)
         .is_some_and(|element| element.refresh.registry_cache.is_some());
+    if registry_damage {
+        record_registry_cache_damaged();
+    } else if !cache_eligible {
+        record_registry_cache_ineligible();
+    }
     if !registry_damage
         && cache_eligible
         && has_existing_cache
@@ -6067,10 +6470,12 @@ fn accumulate_subtree_rebuild_local_cached(
             });
 
         if let Some(chunk) = cache_hit {
+            record_registry_cache_hit();
             let deferred = chunk.deferred.clone();
             acc.merge_chunk(chunk);
             return deferred;
         }
+        record_registry_cache_miss();
     }
 
     if !registry_damage && cache_eligible && try_take_registry_cache_budget(cache_budget) {
@@ -6097,6 +6502,7 @@ fn accumulate_subtree_rebuild_local_cached(
         if let Some(element) = tree.get_ix_mut(ix) {
             element.refresh.registry_cache = Some(RegistrySubtreeCache { key, chunk });
         }
+        record_registry_cache_store();
         return deferred;
     }
 
@@ -6223,7 +6629,32 @@ fn should_skip_registry_child_subtree(
     child_ix: NodeIx,
     scene_ctx: &crate::tree::scene::SceneContext,
 ) -> bool {
-    should_skip_registry_viewport_subtree(tree, child_ix, scene_ctx)
+    if should_skip_registry_viewport_subtree(tree, child_ix, scene_ctx) {
+        return true;
+    }
+
+    if scene_ctx.front_nearby_root {
+        return false;
+    }
+
+    !registry_child_subtree_affects_rebuild(tree, child_ix)
+}
+
+fn registry_child_subtree_affects_rebuild(tree: &ElementTree, child_ix: NodeIx) -> bool {
+    let Some(element) = tree.get_ix(child_ix) else {
+        return false;
+    };
+
+    if element.refresh.registry_dirty || element.refresh.registry_descendant_dirty {
+        return true;
+    }
+
+    if tree.root_cached_subtree_affects_registry() {
+        return element.refresh.registry_subtree_affects;
+    }
+
+    tree.id_of(child_ix)
+        .is_some_and(|id| tree.subtree_affects_registry(&id))
 }
 
 fn registry_subtree_cache_eligible(tree: &ElementTree, ix: NodeIx) -> bool {
@@ -6246,7 +6677,7 @@ fn registry_subtree_key(
         hover_stack_hash: hash_hover_stack(hover_stack),
         scene_context_hash: hash_scene_context(scene_ctx),
         scroll_contexts_hash: hash_scroll_contexts(scroll_contexts),
-        topology: tree.render_topology_dependency_key_ix(ix),
+        topology: tree.topology_dependency_key_ix(ix),
     }
 }
 
@@ -6260,7 +6691,6 @@ fn hover_tracker_cache_hash(element: &Element, region: &PointerRegion) -> u64 {
     let mut hasher = DefaultHasher::new();
     element.id.hash(&mut hasher);
     element.spec.attrs_raw.hash(&mut hasher);
-    element.runtime.mouse_over_active.hash(&mut hasher);
     hash_pointer_region(&mut hasher, region);
     hasher.finish()
 }
@@ -6568,9 +6998,7 @@ pub(crate) fn assert_registry_rebuild_payloads_equivalent(
 }
 
 pub(crate) fn build_registry_rebuild_cached(tree: &mut ElementTree) -> RegistryRebuildPayload {
-    if tree.has_escape_nearby_mounts()
-        || (tree.has_registry_refresh_damage() && !tree.has_registry_subtree_cache())
-    {
+    if tree.has_scroll_refresh_damage() {
         return build_registry_rebuild(tree);
     }
 
@@ -6589,6 +7017,61 @@ pub(crate) fn build_registry_rebuild_cached(tree: &mut ElementTree) -> RegistryR
     }
 
     finalize_registry_rebuild(acc)
+}
+
+pub(crate) fn refresh_runtime_state_in_cached_rebuild(
+    tree: &ElementTree,
+    cached: &RegistryRebuildPayload,
+) -> Option<RegistryRebuildPayload> {
+    let mut updated: Option<RegistryRebuildPayload> = None;
+
+    for (id, previous) in &cached.text_inputs {
+        let Some(element) = tree.get(id) else {
+            return Some(build_registry_rebuild(tree));
+        };
+        if !element.spec.kind.is_text_input_family() {
+            return Some(build_registry_rebuild(tree));
+        }
+
+        let rect = Rect {
+            x: previous.frame_x,
+            y: previous.frame_y,
+            width: previous.frame_width,
+            height: previous.frame_height,
+        };
+        let next = super::text_input_state(element, rect, previous.screen_to_local);
+        if &next != previous {
+            updated
+                .get_or_insert_with(|| cached.clone())
+                .text_inputs
+                .insert(*id, next);
+        }
+    }
+
+    for (id, previous) in &cached.sliders {
+        let Some(element) = tree.get(id) else {
+            return Some(build_registry_rebuild(tree));
+        };
+        if element.spec.kind != ElementKind::Slider {
+            return Some(build_registry_rebuild(tree));
+        }
+
+        let rect = Rect {
+            x: previous.frame_x,
+            y: previous.frame_y,
+            width: previous.frame_width,
+            height: previous.frame_height,
+        };
+        let next = super::slider_state(element, rect, previous.screen_to_local);
+        if &next != previous {
+            updated
+                .get_or_insert_with(|| cached.clone())
+                .sliders
+                .insert(*id, next);
+        }
+    }
+
+    updated
 }
 
 pub(crate) fn build_registry_rebuild(tree: &ElementTree) -> RegistryRebuildPayload {
@@ -7811,18 +8294,13 @@ mod mouse_events {
 mod hover {
     use super::*;
 
-    pub(super) fn inside_actions(element: &Element) -> Vec<ListenerAction> {
+    pub(super) fn tracker_enter_actions(element: &Element) -> Vec<ListenerAction> {
         let attrs = &element.layout.effective;
         let element_id = element.id;
         let has_hover_style = attrs.mouse_over.is_some();
-        let hover_active = element.runtime.mouse_over_active;
         let on_mouse_enter = attrs.on_mouse_enter.unwrap_or(false);
         let on_mouse_leave = attrs.on_mouse_leave.unwrap_or(false);
         let track_hover_active = has_hover_style || on_mouse_enter || on_mouse_leave;
-
-        if hover_active {
-            return Vec::new();
-        }
 
         [
             on_mouse_enter.then_some({
@@ -7844,18 +8322,13 @@ mod hover {
         .collect()
     }
 
-    pub(super) fn leave_actions(element: &Element) -> Vec<ListenerAction> {
+    pub(super) fn tracker_leave_actions(element: &Element) -> Vec<ListenerAction> {
         let attrs = &element.layout.effective;
         let element_id = element.id;
         let has_hover_style = attrs.mouse_over.is_some();
-        let hover_active = element.runtime.mouse_over_active;
         let on_mouse_leave = attrs.on_mouse_leave.unwrap_or(false);
         let on_mouse_enter = attrs.on_mouse_enter.unwrap_or(false);
         let track_hover_active = has_hover_style || on_mouse_enter || on_mouse_leave;
-
-        if !hover_active {
-            return Vec::new();
-        }
 
         [
             on_mouse_leave.then_some({
@@ -7875,6 +8348,16 @@ mod hover {
         .into_iter()
         .flatten()
         .collect()
+    }
+
+    pub(super) fn leave_actions(element: &Element) -> Vec<ListenerAction> {
+        element
+            .runtime
+            .mouse_over_active
+            .then(|| tracker_leave_actions(element))
+            .into_iter()
+            .flatten()
+            .collect()
     }
 }
 
@@ -7997,9 +8480,10 @@ mod click_press_tracker {
         let attrs = &element.layout.effective;
         let emit_click = attrs.on_click.unwrap_or(false);
         let emit_press_pointer = attrs.on_press.unwrap_or(false);
+        let clear_mouse_down = attrs.mouse_down.is_some();
         let element_id = element.id;
 
-        (emit_click || emit_press_pointer)
+        (emit_click || emit_press_pointer || clear_mouse_down)
             .then(|| {
                 vec![ListenerAction::RuntimeChange(
                     RuntimeChange::StartClickPressTracker {
@@ -8007,6 +8491,7 @@ mod click_press_tracker {
                         matcher_kind,
                         emit_click,
                         emit_press_pointer,
+                        clear_mouse_down,
                     },
                 )]
             })
@@ -8021,15 +8506,17 @@ mod click_press_tracker {
     ) -> Option<PointerDragBootstrap> {
         let attrs = &element.layout.effective;
         let swipe_handlers = swipe_handlers_for_element(element);
+        let scroll_candidate = !scroll_wheel::scroll_directions_for_element(element).is_empty();
         (attrs.on_click.unwrap_or(false)
             || attrs.on_press.unwrap_or(false)
             || swipe_handlers.any()
-            || !scroll_wheel::scroll_directions_for_element(element).is_empty())
-        .then_some(PointerDragBootstrap {
-            element_id: element.id,
-            matcher_kind,
-            swipe_handlers,
-        })
+            || scroll_candidate)
+            .then_some(PointerDragBootstrap {
+                element_id: element.id,
+                matcher_kind,
+                swipe_handlers,
+                scroll_candidate,
+            })
     }
 }
 
@@ -8131,8 +8618,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ClickPressTracker, DragTrackerState, ElixirEvent, GestureAxis, HitGeometry, HoverTracker,
-        KeyPressFollowup, KeyPressTracker, Listener, ListenerAction, ListenerCompute,
+        ClickPressTracker, DragScrollMode, DragTrackerState, ElixirEvent, GestureAxis, HitGeometry,
+        HoverTracker, KeyPressFollowup, KeyPressTracker, Listener, ListenerAction, ListenerCompute,
         ListenerComputeCtx, ListenerInput, ListenerMatcher, ListenerMatcherKind,
         NoopListenerComputeCtx, PointerRegion, RuntimeChange, RuntimeOverlayState, ScrollDirection,
         ScrollbarDragTracker, ScrollbarHitArea, ScrollbarPressSpec, SwipeHandlers, SwipeTracker,
@@ -8169,6 +8656,57 @@ mod tests {
             Vec::new(),
             attrs,
         )
+    }
+
+    fn fixed_box_attrs(width: f64, height: f64) -> Attrs {
+        Attrs {
+            width: Some(Length::Px(width)),
+            height: Some(Length::Px(height)),
+            ..Attrs::default()
+        }
+    }
+
+    fn width_move_attrs(width: f64, move_x: f64) -> Attrs {
+        Attrs {
+            width: Some(Length::Px(width)),
+            move_x: Some(move_x),
+            ..Attrs::default()
+        }
+    }
+
+    fn on_mouse_down_attrs() -> Attrs {
+        Attrs {
+            on_mouse_down: Some(true),
+            ..Attrs::default()
+        }
+    }
+
+    fn on_mouse_move_attrs() -> Attrs {
+        Attrs {
+            on_mouse_move: Some(true),
+            ..Attrs::default()
+        }
+    }
+
+    fn on_click_attrs() -> Attrs {
+        Attrs {
+            on_click: Some(true),
+            ..Attrs::default()
+        }
+    }
+
+    fn on_press_attrs() -> Attrs {
+        Attrs {
+            on_press: Some(true),
+            ..Attrs::default()
+        }
+    }
+
+    fn on_focus_attrs() -> Attrs {
+        Attrs {
+            on_focus: Some(true),
+            ..Attrs::default()
+        }
     }
 
     fn build_pointer_region(visible: bool) -> PointerRegion {
@@ -8322,40 +8860,347 @@ mod tests {
         super::finalize_registry_rebuild(acc)
     }
 
+    #[test]
+    fn cached_deep_child_registry_rebuild_skips_descendant_walk() {
+        let root_id = NodeId::from_u64(72_000);
+        let depth = 32_u64;
+        let leaf_id = NodeId::from_u64(72_000 + depth);
+        let mut tree = ElementTree::new();
+
+        tree.set_root_id(root_id);
+        tree.insert(with_frame(
+            Element::with_attrs(
+                root_id,
+                ElementKind::Column,
+                Vec::new(),
+                fixed_box_attrs(320.0, 80.0),
+            ),
+            Frame {
+                x: 0.0,
+                y: 0.0,
+                width: 320.0,
+                height: 80.0,
+                content_width: 320.0,
+                content_height: 80.0,
+            },
+        ));
+
+        for index in 1..depth {
+            let id = NodeId::from_u64(72_000 + index);
+            tree.insert(with_frame(
+                Element::with_attrs(
+                    id,
+                    ElementKind::Column,
+                    Vec::new(),
+                    fixed_box_attrs(300.0, 60.0),
+                ),
+                Frame {
+                    x: index as f32,
+                    y: index as f32,
+                    width: 300.0,
+                    height: 60.0,
+                    content_width: 300.0,
+                    content_height: 60.0,
+                },
+            ));
+        }
+
+        tree.insert(with_frame(
+            Element::with_attrs(leaf_id, ElementKind::El, Vec::new(), on_mouse_down_attrs()),
+            Frame {
+                x: depth as f32,
+                y: depth as f32,
+                width: 80.0,
+                height: 40.0,
+                content_width: 80.0,
+                content_height: 40.0,
+            },
+        ));
+
+        tree.set_children(&root_id, vec![NodeId::from_u64(72_001)])
+            .unwrap();
+        for index in 1..depth {
+            tree.set_children(
+                &NodeId::from_u64(72_000 + index),
+                vec![NodeId::from_u64(72_000 + index + 1)],
+            )
+            .unwrap();
+        }
+
+        tree.clear_refresh_dirty();
+        let cold_cached = super::build_registry_rebuild_cached(&mut tree);
+        let full = rebuild_payload_for_tree(&tree);
+        super::assert_registry_rebuild_payloads_equivalent(&cold_cached, &full);
+
+        tree.mark_registry_refresh_dirty(&root_id);
+        super::reset_registry_build_diagnostics_for_benchmark();
+        let warm_cached = super::build_registry_rebuild_cached(&mut tree);
+        let diagnostics = super::take_registry_build_diagnostics_for_benchmark();
+
+        super::assert_registry_rebuild_payloads_equivalent(&warm_cached, &full);
+        assert_eq!(
+            diagnostics.visits, 2,
+            "dirty parent registry rebuild should visit only the parent and \
+             the retained clean child subtree root"
+        );
+        assert_eq!(diagnostics.cache_hits, 1);
+    }
+
+    #[test]
+    fn cached_registry_rebuild_dirty_child_ignores_stale_affects_flag() {
+        let root_id = NodeId::from_u64(72_100);
+        let stable_id = NodeId::from_u64(72_101);
+        let target_id = NodeId::from_u64(72_102);
+        let neutral_id = NodeId::from_u64(72_103);
+        let mut tree = ElementTree::new();
+
+        tree.set_root_id(root_id);
+        tree.insert(with_frame(
+            Element::with_attrs(
+                root_id,
+                ElementKind::Column,
+                Vec::new(),
+                fixed_box_attrs(320.0, 160.0),
+            ),
+            Frame {
+                x: 0.0,
+                y: 0.0,
+                width: 320.0,
+                height: 160.0,
+                content_width: 320.0,
+                content_height: 160.0,
+            },
+        ));
+        tree.insert(with_frame(
+            Element::with_attrs(stable_id, ElementKind::El, Vec::new(), on_click_attrs()),
+            Frame {
+                x: 0.0,
+                y: 0.0,
+                width: 120.0,
+                height: 40.0,
+                content_width: 120.0,
+                content_height: 40.0,
+            },
+        ));
+        tree.insert(with_frame(
+            Element::with_attrs(
+                target_id,
+                ElementKind::El,
+                Vec::new(),
+                on_mouse_down_attrs(),
+            ),
+            Frame {
+                x: 0.0,
+                y: 50.0,
+                width: 120.0,
+                height: 40.0,
+                content_width: 120.0,
+                content_height: 40.0,
+            },
+        ));
+        tree.insert(with_frame(
+            Element::with_attrs(
+                neutral_id,
+                ElementKind::Column,
+                Vec::new(),
+                fixed_box_attrs(120.0, 40.0),
+            ),
+            Frame {
+                x: 0.0,
+                y: 100.0,
+                width: 120.0,
+                height: 40.0,
+                content_width: 120.0,
+                content_height: 40.0,
+            },
+        ));
+        tree.set_children(&root_id, vec![stable_id, target_id, neutral_id])
+            .unwrap();
+
+        tree.clear_refresh_dirty();
+        tree.refresh_registry_subtree_affects_cache();
+        assert!(tree.root_cached_subtree_affects_registry());
+        assert!(tree.cached_subtree_affects_registry(&target_id));
+
+        let cold_cached = super::build_registry_rebuild_cached(&mut tree);
+        let full = rebuild_payload_for_tree(&tree);
+        super::assert_registry_rebuild_payloads_equivalent(&cold_cached, &full);
+
+        tree.get_mut(&target_id)
+            .unwrap()
+            .refresh
+            .registry_subtree_affects = false;
+        tree.mark_registry_refresh_dirty(&target_id);
+
+        super::reset_registry_build_diagnostics_for_benchmark();
+        let warm_cached = super::build_registry_rebuild_cached(&mut tree);
+        let diagnostics = super::take_registry_build_diagnostics_for_benchmark();
+        let full_after = rebuild_payload_for_tree(&tree);
+
+        super::assert_registry_rebuild_payloads_equivalent(&warm_cached, &full_after);
+        assert!(
+            diagnostics.visits >= 2,
+            "dirty registry child must be traversed even when its retained \
+             registry_subtree_affects flag is stale"
+        );
+        assert!(
+            diagnostics.cache_hits > 0,
+            "clean siblings should still reuse registry cache entries"
+        );
+    }
+
+    #[test]
+    fn cached_registry_rebuild_handles_escape_nearby_mounts_without_global_fallback() {
+        let root_id = NodeId::from_u64(73_000);
+        let stable_id = NodeId::from_u64(73_001);
+        let host_id = NodeId::from_u64(73_002);
+        let overlay_id = NodeId::from_u64(73_003);
+        let hover_id = NodeId::from_u64(73_004);
+        let mut tree = ElementTree::new();
+
+        tree.set_root_id(root_id);
+        tree.insert(with_frame(
+            Element::with_attrs(
+                root_id,
+                ElementKind::Column,
+                Vec::new(),
+                fixed_box_attrs(320.0, 220.0),
+            ),
+            Frame {
+                x: 0.0,
+                y: 0.0,
+                width: 320.0,
+                height: 220.0,
+                content_width: 320.0,
+                content_height: 220.0,
+            },
+        ));
+        tree.insert(with_frame(
+            Element::with_attrs(
+                stable_id,
+                ElementKind::El,
+                Vec::new(),
+                on_mouse_down_attrs(),
+            ),
+            Frame {
+                x: 0.0,
+                y: 0.0,
+                width: 120.0,
+                height: 40.0,
+                content_width: 120.0,
+                content_height: 40.0,
+            },
+        ));
+
+        let mut host = Element::with_attrs(
+            host_id,
+            ElementKind::El,
+            Vec::new(),
+            fixed_box_attrs(120.0, 40.0),
+        );
+        host.nearby.set(NearbySlot::InFront, Some(overlay_id));
+        tree.insert(with_frame(
+            host,
+            Frame {
+                x: 0.0,
+                y: 50.0,
+                width: 120.0,
+                height: 40.0,
+                content_width: 120.0,
+                content_height: 40.0,
+            },
+        ));
+        tree.insert(with_frame(
+            Element::with_attrs(
+                overlay_id,
+                ElementKind::El,
+                Vec::new(),
+                on_mouse_down_attrs(),
+            ),
+            Frame {
+                x: 0.0,
+                y: 50.0,
+                width: 120.0,
+                height: 40.0,
+                content_width: 120.0,
+                content_height: 40.0,
+            },
+        ));
+        tree.insert(with_frame(
+            Element::with_attrs(
+                hover_id,
+                ElementKind::El,
+                Vec::new(),
+                Attrs {
+                    mouse_over: Some(MouseOverAttrs::default()),
+                    ..fixed_box_attrs(120.0, 40.0)
+                },
+            ),
+            Frame {
+                x: 0.0,
+                y: 100.0,
+                width: 120.0,
+                height: 40.0,
+                content_width: 120.0,
+                content_height: 40.0,
+            },
+        ));
+        tree.set_children(&root_id, vec![stable_id, host_id, hover_id])
+            .unwrap();
+
+        assert!(tree.has_escape_nearby_mounts());
+        tree.clear_refresh_dirty();
+        let cold_cached = super::build_registry_rebuild_cached(&mut tree);
+        let full = rebuild_payload_for_tree(&tree);
+        super::assert_registry_rebuild_payloads_equivalent(&cold_cached, &full);
+
+        tree.mark_registry_refresh_dirty(&hover_id);
+        super::reset_registry_build_diagnostics_for_benchmark();
+        let warm_cached = super::build_registry_rebuild_cached(&mut tree);
+        let diagnostics = super::take_registry_build_diagnostics_for_benchmark();
+        let full_after = rebuild_payload_for_tree(&tree);
+
+        super::assert_registry_rebuild_payloads_equivalent(&warm_cached, &full_after);
+        assert!(
+            diagnostics.visits > 0,
+            "escape nearby mounts should stay on the cached registry path"
+        );
+        assert!(
+            diagnostics.cache_hits > 0,
+            "clean sibling subtrees should still be reused when another branch is dirty"
+        );
+    }
+
     fn animated_width_move_registry_at(sample_ms: u64) -> super::Registry {
         let host_id = NodeId::from_term_bytes(vec![120]);
         let overlay_id = NodeId::from_term_bytes(vec![121]);
 
         let mut tree = crate::tree::element::ElementTree::new();
 
-        let mut host_attrs = Attrs::default();
-        host_attrs.width = Some(Length::Px(128.0));
-        host_attrs.height = Some(Length::Px(82.0));
+        let host_attrs = fixed_box_attrs(128.0, 82.0);
         let mut host = make_element(120, host_attrs);
         host.layout.frame = None;
         host.nearby.set(NearbySlot::InFront, Some(overlay_id));
 
-        let mut from = Attrs::default();
-        from.width = Some(Length::Px(96.0));
-        from.move_x = Some(-16.0);
+        let from = width_move_attrs(96.0, -16.0);
 
-        let mut to = Attrs::default();
-        to.width = Some(Length::Px(156.0));
-        to.move_x = Some(26.0);
+        let to = width_move_attrs(156.0, 26.0);
 
-        let mut overlay_attrs = Attrs::default();
-        overlay_attrs.width = Some(Length::Px(128.0));
-        overlay_attrs.height = Some(Length::Px(82.0));
-        overlay_attrs.align_x = Some(AlignX::Center);
-        overlay_attrs.align_y = Some(AlignY::Center);
-        overlay_attrs.on_mouse_move = Some(true);
-        overlay_attrs.mouse_over = Some(MouseOverAttrs::default());
-        overlay_attrs.animate = Some(AnimationSpec {
-            keyframes: vec![from, to],
-            duration_ms: 1000.0,
-            curve: AnimationCurve::Linear,
-            repeat: AnimationRepeat::Once,
-        });
+        let overlay_attrs = Attrs {
+            width: Some(Length::Px(128.0)),
+            height: Some(Length::Px(82.0)),
+            align_x: Some(AlignX::Center),
+            align_y: Some(AlignY::Center),
+            on_mouse_move: Some(true),
+            mouse_over: Some(MouseOverAttrs::default()),
+            animate: Some(AnimationSpec {
+                keyframes: vec![from, to],
+                duration_ms: 1000.0,
+                curve: AnimationCurve::Linear,
+                repeat: AnimationRepeat::Once,
+            }),
+            ..Attrs::default()
+        };
 
         let overlay = make_element(121, overlay_attrs);
 
@@ -8384,33 +9229,29 @@ mod tests {
 
         let mut tree = crate::tree::element::ElementTree::new();
 
-        let mut host_attrs = Attrs::default();
-        host_attrs.width = Some(Length::Px(128.0));
-        host_attrs.height = Some(Length::Px(82.0));
+        let host_attrs = fixed_box_attrs(128.0, 82.0);
         let mut host = make_element(122, host_attrs);
         host.nearby.set(NearbySlot::InFront, Some(overlay_id));
 
-        let mut from = Attrs::default();
-        from.width = Some(Length::Px(96.0));
-        from.move_x = Some(-16.0);
+        let from = width_move_attrs(96.0, -16.0);
 
-        let mut to = Attrs::default();
-        to.width = Some(Length::Px(156.0));
-        to.move_x = Some(26.0);
+        let to = width_move_attrs(156.0, 26.0);
 
-        let mut overlay_attrs = Attrs::default();
-        overlay_attrs.width = Some(Length::Px(128.0));
-        overlay_attrs.height = Some(Length::Px(82.0));
-        overlay_attrs.align_x = Some(AlignX::Center);
-        overlay_attrs.align_y = Some(AlignY::Center);
-        overlay_attrs.on_mouse_move = Some(true);
-        overlay_attrs.mouse_over = Some(MouseOverAttrs::default());
-        overlay_attrs.animate = Some(AnimationSpec {
-            keyframes: vec![from, to],
-            duration_ms: 1000.0,
-            curve: AnimationCurve::Linear,
-            repeat: AnimationRepeat::Once,
-        });
+        let overlay_attrs = Attrs {
+            width: Some(Length::Px(128.0)),
+            height: Some(Length::Px(82.0)),
+            align_x: Some(AlignX::Center),
+            align_y: Some(AlignY::Center),
+            on_mouse_move: Some(true),
+            mouse_over: Some(MouseOverAttrs::default()),
+            animate: Some(AnimationSpec {
+                keyframes: vec![from, to],
+                duration_ms: 1000.0,
+                curve: AnimationCurve::Linear,
+                repeat: AnimationRepeat::Once,
+            }),
+            ..Attrs::default()
+        };
 
         let overlay = make_element(123, overlay_attrs);
 
@@ -8645,8 +9486,7 @@ mod tests {
 
     #[test]
     fn listeners_for_element_returns_empty_for_invisible_nodes() {
-        let mut attrs = Attrs::default();
-        attrs.on_mouse_down = Some(true);
+        let attrs = on_mouse_down_attrs();
         let element = with_interaction(make_element(1, attrs), false);
 
         let listeners = listeners_for_element(&element);
@@ -8655,8 +9495,7 @@ mod tests {
 
     #[test]
     fn listeners_for_element_returns_empty_when_interaction_missing() {
-        let mut attrs = Attrs::default();
-        attrs.on_mouse_down = Some(true);
+        let attrs = on_mouse_down_attrs();
         let element = make_element(1, attrs);
 
         let listeners = listeners_for_element(&element);
@@ -8665,10 +9504,12 @@ mod tests {
 
     #[test]
     fn listeners_for_element_builds_primary_pointer_listeners() {
-        let mut attrs = Attrs::default();
-        attrs.on_mouse_down = Some(true);
-        attrs.on_mouse_up = Some(true);
-        attrs.on_mouse_move = Some(true);
+        let attrs = Attrs {
+            on_mouse_down: Some(true),
+            on_mouse_up: Some(true),
+            on_mouse_move: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(2, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -8735,12 +9576,14 @@ mod tests {
 
     #[test]
     fn listeners_for_element_slider_press_sets_value_and_starts_drag() {
-        let mut attrs = Attrs::default();
-        attrs.slider_min = Some(0.0);
-        attrs.slider_max = Some(100.0);
-        attrs.slider_value = Some(0.0);
-        attrs.slider_step = Some(5.0);
-        attrs.on_change = Some(true);
+        let attrs = Attrs {
+            slider_min: Some(0.0),
+            slider_max: Some(100.0),
+            slider_value: Some(0.0),
+            slider_step: Some(5.0),
+            on_change: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_slider_element(81, attrs), true);
         let element_id = NodeId::from_term_bytes(vec![81]);
 
@@ -8798,13 +9641,15 @@ mod tests {
 
     #[test]
     fn listeners_for_element_focused_slider_keys_update_value() {
-        let mut attrs = Attrs::default();
-        attrs.focused_active = Some(true);
-        attrs.slider_min = Some(0.0);
-        attrs.slider_max = Some(100.0);
-        attrs.slider_value = Some(50.0);
-        attrs.slider_step = Some(5.0);
-        attrs.on_change = Some(true);
+        let attrs = Attrs {
+            focused_active: Some(true),
+            slider_min: Some(0.0),
+            slider_max: Some(100.0),
+            slider_value: Some(50.0),
+            slider_step: Some(5.0),
+            on_change: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_slider_element(82, attrs), true);
         let element_id = NodeId::from_term_bytes(vec![82]);
         let listeners = listeners_for_element(&element);
@@ -8858,18 +9703,20 @@ mod tests {
 
     #[test]
     fn listeners_for_element_slider_user_key_binding_precedes_builtin_key() {
-        let mut attrs = Attrs::default();
-        attrs.focused_active = Some(true);
-        attrs.slider_min = Some(0.0);
-        attrs.slider_max = Some(100.0);
-        attrs.slider_value = Some(50.0);
-        attrs.slider_step = Some(5.0);
-        attrs.on_key_down = Some(vec![KeyBindingSpec {
-            route: "key_down:arrow_right:exact:0".to_string(),
-            key: CanonicalKey::ArrowRight,
-            mods: 0,
-            match_mode: KeyBindingMatch::Exact,
-        }]);
+        let attrs = Attrs {
+            focused_active: Some(true),
+            slider_min: Some(0.0),
+            slider_max: Some(100.0),
+            slider_value: Some(50.0),
+            slider_step: Some(5.0),
+            on_key_down: Some(vec![KeyBindingSpec {
+                route: "key_down:arrow_right:exact:0".to_string(),
+                key: CanonicalKey::ArrowRight,
+                mods: 0,
+                match_mode: KeyBindingMatch::Exact,
+            }]),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_slider_element(83, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -8897,10 +9744,12 @@ mod tests {
 
     #[test]
     fn listeners_for_element_builds_inside_listener_when_hover_inactive() {
-        let mut attrs = Attrs::default();
-        attrs.on_mouse_enter = Some(true);
-        attrs.mouse_over = Some(MouseOverAttrs::default());
-        attrs.mouse_over_active = Some(false);
+        let attrs = Attrs {
+            on_mouse_enter: Some(true),
+            mouse_over: Some(MouseOverAttrs::default()),
+            mouse_over_active: Some(false),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(3, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -8939,10 +9788,12 @@ mod tests {
 
     #[test]
     fn listeners_for_element_builds_leave_listener_when_hover_active() {
-        let mut attrs = Attrs::default();
-        attrs.on_mouse_leave = Some(true);
-        attrs.mouse_over = Some(MouseOverAttrs::default());
-        attrs.mouse_over_active = Some(true);
+        let attrs = Attrs {
+            on_mouse_leave: Some(true),
+            mouse_over: Some(MouseOverAttrs::default()),
+            mouse_over_active: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(4, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -8975,10 +9826,12 @@ mod tests {
 
     #[test]
     fn listeners_for_element_event_only_hover_tracks_active_for_leave() {
-        let mut attrs = Attrs::default();
-        attrs.on_mouse_enter = Some(true);
-        attrs.on_mouse_leave = Some(true);
-        attrs.mouse_over_active = Some(false);
+        let attrs = Attrs {
+            on_mouse_enter: Some(true),
+            on_mouse_leave: Some(true),
+            mouse_over_active: Some(false),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(22, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -9015,9 +9868,11 @@ mod tests {
 
     #[test]
     fn listeners_for_element_hover_style_without_mouse_move_still_activates_inside() {
-        let mut attrs = Attrs::default();
-        attrs.mouse_over = Some(MouseOverAttrs::default());
-        attrs.mouse_over_active = Some(false);
+        let attrs = Attrs {
+            mouse_over: Some(MouseOverAttrs::default()),
+            mouse_over_active: Some(false),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(24, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -9052,10 +9907,12 @@ mod tests {
 
     #[test]
     fn listeners_for_element_active_hover_keeps_inside_listener_for_default_cursor() {
-        let mut attrs = Attrs::default();
-        attrs.on_mouse_enter = Some(true);
-        attrs.mouse_over = Some(MouseOverAttrs::default());
-        attrs.mouse_over_active = Some(true);
+        let attrs = Attrs {
+            on_mouse_enter: Some(true),
+            mouse_over: Some(MouseOverAttrs::default()),
+            mouse_over_active: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(25, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -9069,9 +9926,11 @@ mod tests {
 
     #[test]
     fn listeners_for_element_event_only_leave_emits_event_and_clears_hover_active() {
-        let mut attrs = Attrs::default();
-        attrs.on_mouse_leave = Some(true);
-        attrs.mouse_over_active = Some(true);
+        let attrs = Attrs {
+            on_mouse_leave: Some(true),
+            mouse_over_active: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(23, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -9136,11 +9995,13 @@ mod tests {
     #[test]
     fn registry_hit_testing_uses_layout_rotate_inverse_geometry() {
         let mut tree = ElementTree::new();
-        let mut attrs = Attrs::default();
-        attrs.width = Some(Length::Px(100.0));
-        attrs.height = Some(Length::Px(40.0));
-        attrs.layout_rotate = Some(45.0);
-        attrs.on_mouse_down = Some(true);
+        let attrs = Attrs {
+            width: Some(Length::Px(100.0)),
+            height: Some(Length::Px(40.0)),
+            layout_rotate: Some(45.0),
+            on_mouse_down: Some(true),
+            ..Attrs::default()
+        };
 
         let root = make_element(125, attrs);
         let root_id = root.id;
@@ -9186,19 +10047,19 @@ mod tests {
     fn slider_pointer_value_uses_layout_rotated_render_frame_geometry() {
         let mut tree = ElementTree::new();
 
-        let mut root_attrs = Attrs::default();
-        root_attrs.width = Some(Length::Px(240.0));
-        root_attrs.height = Some(Length::Px(140.0));
+        let root_attrs = fixed_box_attrs(240.0, 140.0);
         let mut root = make_element(128, root_attrs);
         let root_id = root.id;
 
-        let mut slider_attrs = Attrs::default();
-        slider_attrs.width = Some(Length::Px(180.0));
-        slider_attrs.height = Some(Length::Px(38.0));
-        slider_attrs.layout_rotate = Some(-90.0);
-        slider_attrs.slider_min = Some(0.0);
-        slider_attrs.slider_max = Some(100.0);
-        slider_attrs.slider_value = Some(0.0);
+        let slider_attrs = Attrs {
+            width: Some(Length::Px(180.0)),
+            height: Some(Length::Px(38.0)),
+            layout_rotate: Some(-90.0),
+            slider_min: Some(0.0),
+            slider_max: Some(100.0),
+            slider_value: Some(0.0),
+            ..Attrs::default()
+        };
         let mut slider = make_slider_element(129, slider_attrs);
         let slider_id = slider.id;
         let track_id = NodeId::from_term_bytes(vec![130]);
@@ -9207,17 +10068,19 @@ mod tests {
         slider.children = vec![track_id, filled_id, thumb_id];
         root.children = vec![slider_id];
 
-        let mut track_attrs = Attrs::default();
-        track_attrs.height = Some(Length::Px(8.0));
+        let track_attrs = Attrs {
+            height: Some(Length::Px(8.0)),
+            ..Attrs::default()
+        };
         let track = Element::with_attrs(track_id, ElementKind::El, Vec::new(), track_attrs);
 
-        let mut filled_attrs = Attrs::default();
-        filled_attrs.height = Some(Length::Px(8.0));
+        let filled_attrs = Attrs {
+            height: Some(Length::Px(8.0)),
+            ..Attrs::default()
+        };
         let filled = Element::with_attrs(filled_id, ElementKind::El, Vec::new(), filled_attrs);
 
-        let mut thumb_attrs = Attrs::default();
-        thumb_attrs.width = Some(Length::Px(24.0));
-        thumb_attrs.height = Some(Length::Px(24.0));
+        let thumb_attrs = fixed_box_attrs(24.0, 24.0);
         let thumb = Element::with_attrs(thumb_id, ElementKind::El, Vec::new(), thumb_attrs);
 
         tree.set_root_id(root_id);
@@ -9263,19 +10126,23 @@ mod tests {
         let mut tree = ElementTree::new();
         let menu_id = NodeId::from_term_bytes(vec![127]);
 
-        let mut root_attrs = Attrs::default();
-        root_attrs.width = Some(Length::Fill);
-        root_attrs.height = Some(Length::Fill);
-        root_attrs.clip_nearby = Some(true);
-        root_attrs.layout_rotate = Some(90.0);
+        let root_attrs = Attrs {
+            width: Some(Length::Fill),
+            height: Some(Length::Fill),
+            clip_nearby: Some(true),
+            layout_rotate: Some(90.0),
+            ..Attrs::default()
+        };
         let mut root = make_element(126, root_attrs);
         let root_id = root.id;
         root.nearby.set(NearbySlot::InFront, Some(menu_id));
 
-        let mut menu_attrs = Attrs::default();
-        menu_attrs.width = Some(Length::Px(40.0));
-        menu_attrs.height = Some(Length::Px(40.0));
-        menu_attrs.on_mouse_down = Some(true);
+        let menu_attrs = Attrs {
+            width: Some(Length::Px(40.0)),
+            height: Some(Length::Px(40.0)),
+            on_mouse_down: Some(true),
+            ..Attrs::default()
+        };
         let menu = Element::with_attrs(menu_id, ElementKind::El, Vec::new(), menu_attrs);
 
         tree.set_root_id(root_id);
@@ -9333,9 +10200,11 @@ mod tests {
 
     #[test]
     fn listeners_for_element_mouse_down_style_inactive_adds_press_activate() {
-        let mut attrs = Attrs::default();
-        attrs.mouse_down = Some(MouseOverAttrs::default());
-        attrs.mouse_down_active = Some(false);
+        let attrs = Attrs {
+            mouse_down: Some(MouseOverAttrs::default()),
+            mouse_down_active: Some(false),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(5, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -9360,17 +10229,26 @@ mod tests {
         });
         assert!(matches!(
             actions.as_slice(),
-            [ListenerAction::TreeMsg(TreeMsg::SetMouseDownActive { element_id, active })]
-                if element_id == &NodeId::from_term_bytes(vec![5]) && *active
+            [
+                ListenerAction::TreeMsg(TreeMsg::SetMouseDownActive { element_id, active }),
+                ListenerAction::RuntimeChange(RuntimeChange::StartClickPressTracker {
+                    clear_mouse_down,
+                    ..
+                }),
+            ] if element_id == &NodeId::from_term_bytes(vec![5])
+                && *active
+                && *clear_mouse_down
         ));
     }
 
     #[test]
     fn listeners_for_element_merges_mouse_down_event_and_style_into_single_press_listener() {
-        let mut attrs = Attrs::default();
-        attrs.on_mouse_down = Some(true);
-        attrs.mouse_down = Some(MouseOverAttrs::default());
-        attrs.mouse_down_active = Some(false);
+        let attrs = Attrs {
+            on_mouse_down: Some(true),
+            mouse_down: Some(MouseOverAttrs::default()),
+            mouse_down_active: Some(false),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(10, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -9390,7 +10268,7 @@ mod tests {
             y: 10.0,
         });
 
-        assert_eq!(actions.len(), 2);
+        assert_eq!(actions.len(), 3);
         assert!(matches!(
             actions[0],
             ListenerAction::ElixirEvent(ElixirEvent {
@@ -9405,15 +10283,24 @@ mod tests {
                 active,
             }) if *element_id == NodeId::from_term_bytes(vec![10]) && active
         ));
+        assert!(matches!(
+            actions[2],
+            ListenerAction::RuntimeChange(RuntimeChange::StartClickPressTracker {
+                clear_mouse_down: true,
+                ..
+            })
+        ));
     }
 
     #[test]
     fn listeners_for_element_merges_press_slot_actions_in_builder_order() {
-        let mut attrs = Attrs::default();
-        attrs.on_mouse_down = Some(true);
-        attrs.on_click = Some(true);
-        attrs.mouse_down = Some(MouseOverAttrs::default());
-        attrs.mouse_down_active = Some(false);
+        let attrs = Attrs {
+            on_mouse_down: Some(true),
+            on_click: Some(true),
+            mouse_down: Some(MouseOverAttrs::default()),
+            mouse_down_active: Some(false),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(11, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -9476,13 +10363,15 @@ mod tests {
 
     #[test]
     fn listeners_for_element_mouse_down_style_active_adds_release_and_leave_clear() {
-        let mut attrs = Attrs::default();
-        attrs.mouse_down = Some(MouseOverAttrs::default());
-        attrs.mouse_down_active = Some(true);
+        let attrs = Attrs {
+            mouse_down: Some(MouseOverAttrs::default()),
+            mouse_down_active: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(6, attrs), true);
 
         let listeners = listeners_for_element(&element);
-        assert_eq!(listeners.len(), 5);
+        assert_eq!(listeners.len(), 6);
 
         let release_listener = listener_matching(&listeners, |listener| {
             matches!(
@@ -9537,10 +10426,12 @@ mod tests {
 
     #[test]
     fn registry_for_elements_keeps_mouse_up_targeted_and_mouse_down_clear_anywhere() {
-        let mut attrs = Attrs::default();
-        attrs.on_mouse_up = Some(true);
-        attrs.mouse_down = Some(MouseOverAttrs::default());
-        attrs.mouse_down_active = Some(true);
+        let attrs = Attrs {
+            on_mouse_up: Some(true),
+            mouse_down: Some(MouseOverAttrs::default()),
+            mouse_down_active: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(60, attrs), true);
         let registry = registry_for_elements(&[element]);
 
@@ -9597,8 +10488,7 @@ mod tests {
         host.nearby
             .set(NearbySlot::InFront, Some(NodeId::from_term_bytes(vec![82])));
 
-        let mut underlying_attrs = Attrs::default();
-        underlying_attrs.on_mouse_down = Some(true);
+        let underlying_attrs = on_mouse_down_attrs();
         let underlying = with_interaction_rect(
             make_element(81, underlying_attrs),
             true,
@@ -9669,8 +10559,7 @@ mod tests {
         host.nearby
             .set(NearbySlot::InFront, Some(NodeId::from_term_bytes(vec![85])));
 
-        let mut underlying_attrs = Attrs::default();
-        underlying_attrs.on_mouse_down = Some(true);
+        let underlying_attrs = on_mouse_down_attrs();
         let underlying = with_interaction_rect(
             make_element(84, underlying_attrs),
             true,
@@ -9682,8 +10571,7 @@ mod tests {
             },
         );
 
-        let mut overlay_attrs = Attrs::default();
-        overlay_attrs.on_mouse_down = Some(true);
+        let overlay_attrs = on_mouse_down_attrs();
         let overlay = with_interaction_rect(
             make_element(85, overlay_attrs),
             true,
@@ -9717,8 +10605,10 @@ mod tests {
 
     #[test]
     fn registry_for_elements_clip_nearby_clips_escape_overlay_interaction() {
-        let mut host_attrs = Attrs::default();
-        host_attrs.clip_nearby = Some(true);
+        let host_attrs = Attrs {
+            clip_nearby: Some(true),
+            ..Attrs::default()
+        };
         let mut host = with_interaction_rect(
             make_element(86, host_attrs),
             true,
@@ -9732,8 +10622,7 @@ mod tests {
         host.nearby
             .set(NearbySlot::Above, Some(NodeId::from_term_bytes(vec![87])));
 
-        let mut overlay_attrs = Attrs::default();
-        overlay_attrs.on_mouse_down = Some(true);
+        let overlay_attrs = on_mouse_down_attrs();
         let overlay = with_interaction_rect(
             make_element(87, overlay_attrs),
             true,
@@ -9791,8 +10680,7 @@ mod tests {
         );
         host.nearby.set(NearbySlot::Below, Some(overlay_id));
 
-        let mut later_attrs = Attrs::default();
-        later_attrs.on_mouse_down = Some(true);
+        let later_attrs = on_mouse_down_attrs();
         let later = with_interaction_rect(
             make_element(142, later_attrs),
             true,
@@ -9804,8 +10692,7 @@ mod tests {
             },
         );
 
-        let mut overlay_attrs = Attrs::default();
-        overlay_attrs.on_mouse_down = Some(true);
+        let overlay_attrs = on_mouse_down_attrs();
         let overlay = with_interaction_rect(
             make_element(143, overlay_attrs),
             true,
@@ -9871,8 +10758,7 @@ mod tests {
             .nearby
             .set(NearbySlot::Below, Some(descendant_overlay_id));
 
-        let mut ancestor_overlay_attrs = Attrs::default();
-        ancestor_overlay_attrs.on_mouse_down = Some(true);
+        let ancestor_overlay_attrs = on_mouse_down_attrs();
         let ancestor_overlay = with_interaction_rect(
             make_element(146, ancestor_overlay_attrs),
             true,
@@ -9884,8 +10770,7 @@ mod tests {
             },
         );
 
-        let mut descendant_overlay_attrs = Attrs::default();
-        descendant_overlay_attrs.on_mouse_down = Some(true);
+        let descendant_overlay_attrs = on_mouse_down_attrs();
         let descendant_overlay = with_interaction_rect(
             make_element(147, descendant_overlay_attrs),
             true,
@@ -9936,9 +10821,11 @@ mod tests {
         );
         root.children = vec![host_id, sibling_id];
 
-        let mut host_attrs = Attrs::default();
-        host_attrs.on_focus = Some(true);
-        host_attrs.focused_active = Some(true);
+        let host_attrs = Attrs {
+            on_focus: Some(true),
+            focused_active: Some(true),
+            ..Attrs::default()
+        };
         let mut host = with_interaction_rect(
             make_element(150, host_attrs),
             true,
@@ -9951,8 +10838,7 @@ mod tests {
         );
         host.nearby.set(NearbySlot::Below, Some(overlay_id));
 
-        let mut sibling_attrs = Attrs::default();
-        sibling_attrs.on_focus = Some(true);
+        let sibling_attrs = on_focus_attrs();
         let sibling = with_interaction_rect(
             make_element(151, sibling_attrs),
             true,
@@ -9964,8 +10850,7 @@ mod tests {
             },
         );
 
-        let mut overlay_attrs = Attrs::default();
-        overlay_attrs.on_focus = Some(true);
+        let overlay_attrs = on_focus_attrs();
         let overlay = with_interaction_rect(
             make_element(152, overlay_attrs),
             true,
@@ -10034,8 +10919,7 @@ mod tests {
         host.nearby
             .set(NearbySlot::InFront, Some(NodeId::from_term_bytes(vec![88])));
 
-        let mut underlying_attrs = Attrs::default();
-        underlying_attrs.on_mouse_move = Some(true);
+        let underlying_attrs = on_mouse_move_attrs();
         let underlying = with_interaction_rect(
             make_element(87, underlying_attrs),
             true,
@@ -10095,8 +10979,7 @@ mod tests {
         host.nearby
             .set(NearbySlot::InFront, Some(NodeId::from_term_bytes(vec![91])));
 
-        let mut underlying_attrs = Attrs::default();
-        underlying_attrs.on_mouse_move = Some(true);
+        let underlying_attrs = on_mouse_move_attrs();
         let underlying = with_interaction_rect(
             make_element(90, underlying_attrs),
             true,
@@ -10108,9 +10991,11 @@ mod tests {
             },
         );
 
-        let mut overlay_attrs = Attrs::default();
-        overlay_attrs.on_mouse_move = Some(true);
-        overlay_attrs.mouse_over = Some(MouseOverAttrs::default());
+        let overlay_attrs = Attrs {
+            on_mouse_move: Some(true),
+            mouse_over: Some(MouseOverAttrs::default()),
+            ..Attrs::default()
+        };
         let overlay = with_interaction_rect(
             make_element(91, overlay_attrs),
             true,
@@ -10154,8 +11039,7 @@ mod tests {
         host.children = vec![under_id];
         host.nearby.set(NearbySlot::InFront, Some(overlay_id));
 
-        let mut under_attrs = Attrs::default();
-        under_attrs.on_mouse_move = Some(true);
+        let under_attrs = on_mouse_move_attrs();
         let underlying = with_frame(
             make_element(111, under_attrs),
             Frame {
@@ -10168,9 +11052,11 @@ mod tests {
             },
         );
 
-        let mut overlay_attrs = Attrs::default();
-        overlay_attrs.on_mouse_move = Some(true);
-        overlay_attrs.mouse_over = Some(MouseOverAttrs::default());
+        let overlay_attrs = Attrs {
+            on_mouse_move: Some(true),
+            mouse_over: Some(MouseOverAttrs::default()),
+            ..Attrs::default()
+        };
         let overlay = with_frame(
             make_element(112, overlay_attrs),
             Frame {
@@ -10224,9 +11110,11 @@ mod tests {
         );
         host.nearby.set(NearbySlot::InFront, Some(overlay_id));
 
-        let mut overlay_attrs = Attrs::default();
-        overlay_attrs.on_mouse_move = Some(true);
-        overlay_attrs.mouse_over = Some(MouseOverAttrs::default());
+        let overlay_attrs = Attrs {
+            on_mouse_move: Some(true),
+            mouse_over: Some(MouseOverAttrs::default()),
+            ..Attrs::default()
+        };
         let mut overlay = with_frame(
             make_element(141, overlay_attrs),
             Frame {
@@ -10308,9 +11196,11 @@ mod tests {
         );
         wrapper.children = vec![target_id];
 
-        let mut target_attrs = Attrs::default();
-        target_attrs.on_mouse_move = Some(true);
-        target_attrs.mouse_over = Some(MouseOverAttrs::default());
+        let target_attrs = Attrs {
+            on_mouse_move: Some(true),
+            mouse_over: Some(MouseOverAttrs::default()),
+            ..Attrs::default()
+        };
         let target = with_frame(
             make_element(152, target_attrs),
             Frame {
@@ -10424,8 +11314,7 @@ mod tests {
 
     #[test]
     fn listeners_for_element_on_click_starts_click_and_drag_trackers() {
-        let mut attrs = Attrs::default();
-        attrs.on_click = Some(true);
+        let attrs = on_click_attrs();
         let element = with_interaction(make_element(7, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -10454,6 +11343,7 @@ mod tests {
                 matcher_kind: kind,
                 emit_click,
                 emit_press_pointer,
+                ..
             }) if *element_id == NodeId::from_term_bytes(vec![7])
                 && kind == matcher_kind
                 && emit_click
@@ -10483,10 +11373,12 @@ mod tests {
 
     #[test]
     fn listeners_for_scrollable_element_start_drag_tracker_without_click_handlers() {
-        let mut attrs = Attrs::default();
-        attrs.scrollbar_y = Some(true);
-        attrs.scroll_y = Some(10.0);
-        attrs.scroll_y_max = Some(100.0);
+        let attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(10.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(70, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -10515,18 +11407,19 @@ mod tests {
                 matcher_kind: kind,
                 origin_x,
                 origin_y,
+                scroll_candidate,
                 ..
             })] if element_id == &NodeId::from_term_bytes(vec![70])
                 && *kind == matcher_kind
                 && *origin_x == 10.0
                 && *origin_y == 10.0
+                && *scroll_candidate
         ));
     }
 
     #[test]
     fn runtime_listeners_for_overlay_orders_runtime_followups_before_release_followup() {
-        let mut attrs = Attrs::default();
-        attrs.on_click = Some(true);
+        let attrs = on_click_attrs();
         let element = with_interaction(make_element(30, attrs), true);
         let base = registry_for_elements(&[element]);
 
@@ -10536,6 +11429,7 @@ mod tests {
                 matcher_kind: ListenerMatcherKind::CursorButtonLeftPressInside,
                 emit_click: true,
                 emit_press_pointer: false,
+                clear_mouse_down: false,
             }),
             virtual_key: None,
             key_presses: Vec::new(),
@@ -10545,6 +11439,7 @@ mod tests {
                 origin_x: 10.0,
                 origin_y: 10.0,
                 swipe_handlers: SwipeHandlers::default(),
+                scroll_candidate: false,
             },
             swipe: None,
             scrollbar: None,
@@ -10584,8 +11479,7 @@ mod tests {
 
     #[test]
     fn compose_combined_registry_click_release_followup_redispatches_base_release() {
-        let mut attrs = Attrs::default();
-        attrs.on_click = Some(true);
+        let attrs = on_click_attrs();
         let element = with_interaction(make_element(27, attrs), true);
         let base = registry_for_elements(&[element]);
 
@@ -10595,6 +11489,7 @@ mod tests {
                 matcher_kind: ListenerMatcherKind::CursorButtonLeftPressInside,
                 emit_click: true,
                 emit_press_pointer: false,
+                clear_mouse_down: false,
             }),
             virtual_key: None,
             key_presses: Vec::new(),
@@ -10639,8 +11534,7 @@ mod tests {
 
     #[test]
     fn compose_combined_registry_drops_click_followup_when_source_listener_missing() {
-        let mut attrs = Attrs::default();
-        attrs.on_click = Some(true);
+        let attrs = on_click_attrs();
         let element = with_interaction(make_element(28, attrs), true);
         let base = registry_for_elements(&[element]);
 
@@ -10650,6 +11544,7 @@ mod tests {
                 matcher_kind: ListenerMatcherKind::CursorButtonLeftPressInside,
                 emit_click: true,
                 emit_press_pointer: false,
+                clear_mouse_down: false,
             }),
             virtual_key: None,
             key_presses: Vec::new(),
@@ -10683,10 +11578,12 @@ mod tests {
 
     #[test]
     fn compose_combined_registry_on_press_release_includes_base_mouse_down_clear() {
-        let mut attrs = Attrs::default();
-        attrs.on_press = Some(true);
-        attrs.mouse_down = Some(MouseOverAttrs::default());
-        attrs.mouse_down_active = Some(true);
+        let attrs = Attrs {
+            on_press: Some(true),
+            mouse_down: Some(MouseOverAttrs::default()),
+            mouse_down_active: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(91, attrs), true);
         let base = registry_for_elements(&[element]);
 
@@ -10696,6 +11593,7 @@ mod tests {
                 matcher_kind: ListenerMatcherKind::CursorButtonLeftPressInside,
                 emit_click: false,
                 emit_press_pointer: true,
+                clear_mouse_down: true,
             }),
             virtual_key: None,
             key_presses: Vec::new(),
@@ -10739,8 +11637,7 @@ mod tests {
 
     #[test]
     fn compose_combined_registry_drag_active_release_precedes_and_suppresses_click_followup() {
-        let mut attrs = Attrs::default();
-        attrs.on_click = Some(true);
+        let attrs = on_click_attrs();
         let element = with_interaction(make_element(29, attrs), true);
         let base = registry_for_elements(&[element]);
 
@@ -10750,6 +11647,7 @@ mod tests {
                 matcher_kind: ListenerMatcherKind::CursorButtonLeftPressInside,
                 emit_click: true,
                 emit_press_pointer: false,
+                clear_mouse_down: false,
             }),
             virtual_key: None,
             key_presses: Vec::new(),
@@ -10759,6 +11657,7 @@ mod tests {
                 last_x: 10.0,
                 last_y: 10.0,
                 locked_axis: GestureAxis::Horizontal,
+                scroll_mode: DragScrollMode::Locked,
             },
             swipe: None,
             scrollbar: None,
@@ -10796,8 +11695,7 @@ mod tests {
 
     #[test]
     fn compose_combined_registry_drag_candidate_threshold_without_scroll_match_clears_drag_only() {
-        let mut attrs = Attrs::default();
-        attrs.on_click = Some(true);
+        let attrs = on_click_attrs();
         let element = with_interaction(make_element(31, attrs), true);
         let base = registry_for_elements(&[element]);
 
@@ -10807,6 +11705,7 @@ mod tests {
                 matcher_kind: ListenerMatcherKind::CursorButtonLeftPressInside,
                 emit_click: true,
                 emit_press_pointer: false,
+                clear_mouse_down: false,
             }),
             virtual_key: None,
             key_presses: Vec::new(),
@@ -10816,6 +11715,7 @@ mod tests {
                 origin_x: 10.0,
                 origin_y: 10.0,
                 swipe_handlers: SwipeHandlers::default(),
+                scroll_candidate: false,
             },
             swipe: None,
             scrollbar: None,
@@ -10845,11 +11745,13 @@ mod tests {
 
     #[test]
     fn compose_combined_registry_drag_candidate_threshold_promotes_drag_when_scroll_matches() {
-        let mut attrs = Attrs::default();
-        attrs.on_click = Some(true);
-        attrs.scrollbar_x = Some(true);
-        attrs.scroll_x = Some(10.0);
-        attrs.scroll_x_max = Some(100.0);
+        let attrs = Attrs {
+            on_click: Some(true),
+            scrollbar_x: Some(true),
+            scroll_x: Some(10.0),
+            scroll_x_max: Some(100.0),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(31, attrs), true);
         let base = registry_for_elements(&[element]);
 
@@ -10859,6 +11761,7 @@ mod tests {
                 matcher_kind: ListenerMatcherKind::CursorButtonLeftPressInside,
                 emit_click: true,
                 emit_press_pointer: false,
+                clear_mouse_down: false,
             }),
             virtual_key: None,
             key_presses: Vec::new(),
@@ -10868,6 +11771,7 @@ mod tests {
                 origin_x: 10.0,
                 origin_y: 10.0,
                 swipe_handlers: SwipeHandlers::default(),
+                scroll_candidate: true,
             },
             swipe: None,
             scrollbar: None,
@@ -10905,11 +11809,13 @@ mod tests {
 
     #[test]
     fn compose_combined_registry_drag_scroll_uses_rotated_local_axis() {
-        let mut attrs = Attrs::default();
-        attrs.scrollbar_y = Some(true);
-        attrs.scroll_y = Some(20.0);
-        attrs.scroll_y_max = Some(100.0);
-        attrs.layout_rotate = Some(90.0);
+        let attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(20.0),
+            scroll_y_max: Some(100.0),
+            layout_rotate: Some(90.0),
+            ..Attrs::default()
+        };
         let element = with_frame(
             make_element(32, attrs),
             Frame {
@@ -10933,6 +11839,7 @@ mod tests {
                 origin_x: 50.0,
                 origin_y: 50.0,
                 swipe_handlers: SwipeHandlers::default(),
+                scroll_candidate: true,
             },
             swipe: None,
             scrollbar: None,
@@ -10972,6 +11879,7 @@ mod tests {
                 last_x: 35.0,
                 last_y: 50.0,
                 locked_axis: GestureAxis::Vertical,
+                scroll_mode: DragScrollMode::Locked,
             },
             ..candidate_runtime
         };
@@ -11012,8 +11920,10 @@ mod tests {
 
     #[test]
     fn listeners_for_element_on_swipe_starts_drag_tracker_without_click_press_tracker() {
-        let mut attrs = Attrs::default();
-        attrs.on_swipe_right = Some(true);
+        let attrs = Attrs {
+            on_swipe_right: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(71, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -11041,6 +11951,7 @@ mod tests {
                 origin_x,
                 origin_y,
                 swipe_handlers,
+                scroll_candidate,
             })] if element_id == &NodeId::from_term_bytes(vec![71])
                 && *kind == matcher_kind
                 && *origin_x == 10.0
@@ -11049,6 +11960,7 @@ mod tests {
                 && !swipe_handlers.down
                 && !swipe_handlers.left
                 && swipe_handlers.right
+                && !scroll_candidate
         ));
         assert_eq!(
             cursor_actions(
@@ -11063,8 +11975,10 @@ mod tests {
 
     #[test]
     fn compose_combined_registry_drag_candidate_threshold_starts_swipe_when_enabled() {
-        let mut attrs = Attrs::default();
-        attrs.on_swipe_right = Some(true);
+        let attrs = Attrs {
+            on_swipe_right: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(72, attrs), true);
         let base = registry_for_elements(&[element]);
 
@@ -11081,6 +11995,7 @@ mod tests {
                     right: true,
                     ..SwipeHandlers::default()
                 },
+                scroll_candidate: false,
             },
             swipe: None,
             scrollbar: None,
@@ -11117,8 +12032,10 @@ mod tests {
 
     #[test]
     fn compose_combined_registry_drag_candidate_threshold_waits_for_clear_axis_intent() {
-        let mut attrs = Attrs::default();
-        attrs.on_swipe_right = Some(true);
+        let attrs = Attrs {
+            on_swipe_right: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(75, attrs), true);
         let base = registry_for_elements(&[element]);
 
@@ -11135,6 +12052,7 @@ mod tests {
                     right: true,
                     ..SwipeHandlers::default()
                 },
+                scroll_candidate: false,
             },
             swipe: None,
             scrollbar: None,
@@ -11177,10 +12095,12 @@ mod tests {
     #[test]
     fn compose_combined_registry_drag_candidate_threshold_prefers_horizontal_swipe_over_vertical_parent_scroll()
      {
-        let mut parent_attrs = Attrs::default();
-        parent_attrs.scrollbar_y = Some(true);
-        parent_attrs.scroll_y = Some(10.0);
-        parent_attrs.scroll_y_max = Some(100.0);
+        let parent_attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(10.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
         let mut parent = with_frame(
             with_interaction(make_element(76, parent_attrs), true),
             Frame {
@@ -11194,9 +12114,11 @@ mod tests {
         );
         parent.children = vec![NodeId::from_term_bytes(vec![77])];
 
-        let mut child_attrs = Attrs::default();
-        child_attrs.on_swipe_left = Some(true);
-        child_attrs.on_swipe_right = Some(true);
+        let child_attrs = Attrs {
+            on_swipe_left: Some(true),
+            on_swipe_right: Some(true),
+            ..Attrs::default()
+        };
         let child = with_frame(
             with_interaction(make_element(77, child_attrs), true),
             Frame {
@@ -11224,6 +12146,7 @@ mod tests {
                     right: true,
                     ..SwipeHandlers::default()
                 },
+                scroll_candidate: false,
             },
             swipe: None,
             scrollbar: None,
@@ -11259,10 +12182,12 @@ mod tests {
     #[test]
     fn compose_combined_registry_drag_candidate_threshold_prefers_vertical_parent_scroll_over_horizontal_swipe()
      {
-        let mut parent_attrs = Attrs::default();
-        parent_attrs.scrollbar_y = Some(true);
-        parent_attrs.scroll_y = Some(10.0);
-        parent_attrs.scroll_y_max = Some(100.0);
+        let parent_attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(10.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
         let mut parent = with_frame(
             with_interaction(make_element(78, parent_attrs), true),
             Frame {
@@ -11276,9 +12201,11 @@ mod tests {
         );
         parent.children = vec![NodeId::from_term_bytes(vec![79])];
 
-        let mut child_attrs = Attrs::default();
-        child_attrs.on_swipe_left = Some(true);
-        child_attrs.on_swipe_right = Some(true);
+        let child_attrs = Attrs {
+            on_swipe_left: Some(true),
+            on_swipe_right: Some(true),
+            ..Attrs::default()
+        };
         let child = with_frame(
             with_interaction(make_element(79, child_attrs), true),
             Frame {
@@ -11306,6 +12233,7 @@ mod tests {
                     right: true,
                     ..SwipeHandlers::default()
                 },
+                scroll_candidate: false,
             },
             swipe: None,
             scrollbar: None,
@@ -11343,9 +12271,11 @@ mod tests {
 
     #[test]
     fn compose_combined_registry_swipe_release_emits_direction_and_base_mouse_up() {
-        let mut attrs = Attrs::default();
-        attrs.on_swipe_right = Some(true);
-        attrs.on_mouse_up = Some(true);
+        let attrs = Attrs {
+            on_swipe_right: Some(true),
+            on_mouse_up: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(73, attrs), true);
         let base = registry_for_elements(&[element]);
 
@@ -11407,8 +12337,10 @@ mod tests {
 
     #[test]
     fn compose_combined_registry_swipe_release_uses_locked_axis_even_with_large_off_axis_delta() {
-        let mut attrs = Attrs::default();
-        attrs.on_swipe_right = Some(true);
+        let attrs = Attrs {
+            on_swipe_right: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(74, attrs), true);
         let base = registry_for_elements(&[element]);
 
@@ -11466,8 +12398,10 @@ mod tests {
 
     #[test]
     fn compose_combined_registry_swipe_release_ignores_short_locked_axis_displacement() {
-        let mut attrs = Attrs::default();
-        attrs.on_swipe_right = Some(true);
+        let attrs = Attrs {
+            on_swipe_right: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(80, attrs), true);
         let base = registry_for_elements(&[element]);
 
@@ -11520,8 +12454,7 @@ mod tests {
 
     #[test]
     fn listeners_for_element_on_press_starts_pointer_press_and_drag_trackers() {
-        let mut attrs = Attrs::default();
-        attrs.on_press = Some(true);
+        let attrs = on_press_attrs();
         let element = with_interaction(make_element(8, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -11565,6 +12498,7 @@ mod tests {
                 matcher_kind: kind,
                 emit_click,
                 emit_press_pointer,
+                ..
             }) if *element_id == NodeId::from_term_bytes(vec![8])
                 && kind == matcher_kind
                 && !emit_click
@@ -11594,9 +12528,11 @@ mod tests {
 
     #[test]
     fn listeners_for_element_on_press_focused_adds_key_enter_listener() {
-        let mut attrs = Attrs::default();
-        attrs.on_press = Some(true);
-        attrs.focused_active = Some(true);
+        let attrs = Attrs {
+            on_press: Some(true),
+            focused_active: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(12, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -11625,9 +12561,11 @@ mod tests {
 
     #[test]
     fn listeners_for_element_on_press_not_focused_omits_key_enter_listener() {
-        let mut attrs = Attrs::default();
-        attrs.on_press = Some(true);
-        attrs.focused_active = Some(false);
+        let attrs = Attrs {
+            on_press: Some(true),
+            focused_active: Some(false),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(13, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -11639,14 +12577,16 @@ mod tests {
 
     #[test]
     fn listeners_for_element_virtual_key_starts_tracker_and_never_focuses() {
-        let mut attrs = Attrs::default();
-        attrs.on_focus = Some(true);
-        attrs.virtual_key = Some(VirtualKeySpec {
-            tap: VirtualKeyTapAction::Text("a".to_string()),
-            hold: VirtualKeyHoldMode::None,
-            hold_ms: 350,
-            repeat_ms: 40,
-        });
+        let attrs = Attrs {
+            on_focus: Some(true),
+            virtual_key: Some(VirtualKeySpec {
+                tap: VirtualKeyTapAction::Text("a".to_string()),
+                hold: VirtualKeyHoldMode::None,
+                hold_ms: 350,
+                repeat_ms: 40,
+            }),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(73, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -11774,20 +12714,22 @@ mod tests {
 
     #[test]
     fn listeners_for_element_focused_key_bindings_emit_key_events() {
-        let mut attrs = Attrs::default();
-        attrs.focused_active = Some(true);
-        attrs.on_key_down = Some(vec![KeyBindingSpec {
-            route: "key_down:enter:exact:0".to_string(),
-            key: CanonicalKey::Enter,
-            mods: 0,
-            match_mode: KeyBindingMatch::Exact,
-        }]);
-        attrs.on_key_up = Some(vec![KeyBindingSpec {
-            route: "key_up:escape:exact:2".to_string(),
-            key: CanonicalKey::Escape,
-            mods: MOD_CTRL,
-            match_mode: KeyBindingMatch::Exact,
-        }]);
+        let attrs = Attrs {
+            focused_active: Some(true),
+            on_key_down: Some(vec![KeyBindingSpec {
+                route: "key_down:enter:exact:0".to_string(),
+                key: CanonicalKey::Enter,
+                mods: 0,
+                match_mode: KeyBindingMatch::Exact,
+            }]),
+            on_key_up: Some(vec![KeyBindingSpec {
+                route: "key_up:escape:exact:2".to_string(),
+                key: CanonicalKey::Escape,
+                mods: MOD_CTRL,
+                match_mode: KeyBindingMatch::Exact,
+            }]),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(37, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -11857,17 +12799,19 @@ mod tests {
 
     #[test]
     fn listeners_for_focused_text_input_enter_key_down_arms_text_commit_suppression() {
-        let mut attrs = Attrs::default();
-        attrs.content = Some("task".to_string());
-        attrs.text_input_focused = Some(true);
-        attrs.text_input_cursor = Some(4);
-        attrs.focused_active = Some(true);
-        attrs.on_key_down = Some(vec![KeyBindingSpec {
-            route: "key_down:enter:exact:0".to_string(),
-            key: CanonicalKey::Enter,
-            mods: 0,
-            match_mode: KeyBindingMatch::Exact,
-        }]);
+        let attrs = Attrs {
+            content: Some("task".to_string()),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(4),
+            focused_active: Some(true),
+            on_key_down: Some(vec![KeyBindingSpec {
+                route: "key_down:enter:exact:0".to_string(),
+                key: CanonicalKey::Enter,
+                mods: 0,
+                match_mode: KeyBindingMatch::Exact,
+            }]),
+            ..Attrs::default()
+        };
         let element = make_text_input_element(137, attrs);
 
         let listeners = listeners_for_element(&element);
@@ -11907,14 +12851,16 @@ mod tests {
 
     #[test]
     fn listeners_for_element_unfocused_key_bindings_are_omitted() {
-        let mut attrs = Attrs::default();
-        attrs.focused_active = Some(false);
-        attrs.on_key_down = Some(vec![KeyBindingSpec {
-            route: "key_down:enter:exact:0".to_string(),
-            key: CanonicalKey::Enter,
-            mods: 0,
-            match_mode: KeyBindingMatch::Exact,
-        }]);
+        let attrs = Attrs {
+            focused_active: Some(false),
+            on_key_down: Some(vec![KeyBindingSpec {
+                route: "key_down:enter:exact:0".to_string(),
+                key: CanonicalKey::Enter,
+                mods: 0,
+                match_mode: KeyBindingMatch::Exact,
+            }]),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(38, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -11925,20 +12871,22 @@ mod tests {
 
     #[test]
     fn listeners_for_element_key_down_and_key_press_share_one_slot() {
-        let mut attrs = Attrs::default();
-        attrs.focused_active = Some(true);
-        attrs.on_key_down = Some(vec![KeyBindingSpec {
-            route: "key_down:space:exact:0".to_string(),
-            key: CanonicalKey::Space,
-            mods: 0,
-            match_mode: KeyBindingMatch::Exact,
-        }]);
-        attrs.on_key_press = Some(vec![KeyBindingSpec {
-            route: "key_press:space:exact:0".to_string(),
-            key: CanonicalKey::Space,
-            mods: 0,
-            match_mode: KeyBindingMatch::Exact,
-        }]);
+        let attrs = Attrs {
+            focused_active: Some(true),
+            on_key_down: Some(vec![KeyBindingSpec {
+                route: "key_down:space:exact:0".to_string(),
+                key: CanonicalKey::Space,
+                mods: 0,
+                match_mode: KeyBindingMatch::Exact,
+            }]),
+            on_key_press: Some(vec![KeyBindingSpec {
+                route: "key_press:space:exact:0".to_string(),
+                key: CanonicalKey::Space,
+                mods: 0,
+                match_mode: KeyBindingMatch::Exact,
+            }]),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(39, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -11986,20 +12934,22 @@ mod tests {
 
     #[test]
     fn key_press_release_followup_redispatches_key_up_before_key_press() {
-        let mut attrs = Attrs::default();
-        attrs.focused_active = Some(true);
-        attrs.on_key_up = Some(vec![KeyBindingSpec {
-            route: "key_up:space:exact:0".to_string(),
-            key: CanonicalKey::Space,
-            mods: 0,
-            match_mode: KeyBindingMatch::Exact,
-        }]);
-        attrs.on_key_press = Some(vec![KeyBindingSpec {
-            route: "key_press:space:exact:0".to_string(),
-            key: CanonicalKey::Space,
-            mods: 0,
-            match_mode: KeyBindingMatch::Exact,
-        }]);
+        let attrs = Attrs {
+            focused_active: Some(true),
+            on_key_up: Some(vec![KeyBindingSpec {
+                route: "key_up:space:exact:0".to_string(),
+                key: CanonicalKey::Space,
+                mods: 0,
+                match_mode: KeyBindingMatch::Exact,
+            }]),
+            on_key_press: Some(vec![KeyBindingSpec {
+                route: "key_press:space:exact:0".to_string(),
+                key: CanonicalKey::Space,
+                mods: 0,
+                match_mode: KeyBindingMatch::Exact,
+            }]),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(40, attrs), true);
         let base = registry_for_elements(&[element]);
 
@@ -12069,9 +13019,11 @@ mod tests {
 
     #[test]
     fn listeners_for_focusable_pointer_press_emits_focus_to() {
-        let mut attrs = Attrs::default();
-        attrs.on_focus = Some(true);
-        attrs.focused_active = Some(false);
+        let attrs = Attrs {
+            on_focus: Some(true),
+            focused_active: Some(false),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(24, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -12100,13 +13052,14 @@ mod tests {
 
     #[test]
     fn registry_for_elements_adds_concrete_tab_focus_transitions() {
-        let mut focused_attrs = Attrs::default();
-        focused_attrs.on_focus = Some(true);
-        focused_attrs.focused_active = Some(true);
+        let focused_attrs = Attrs {
+            on_focus: Some(true),
+            focused_active: Some(true),
+            ..Attrs::default()
+        };
         let focused = with_interaction(make_element(25, focused_attrs), true);
 
-        let mut next_attrs = Attrs::default();
-        next_attrs.on_focus = Some(true);
+        let next_attrs = on_focus_attrs();
         let next = with_interaction(make_element(26, next_attrs), true);
 
         let registry = registry_for_elements(&[focused, next]);
@@ -12185,8 +13138,10 @@ mod tests {
         root.lifecycle.mounted_at_revision = 1;
         root.children = vec![field_id];
 
-        let mut field_attrs = Attrs::default();
-        field_attrs.focus_on_mount = Some(true);
+        let field_attrs = Attrs {
+            focus_on_mount: Some(true),
+            ..Attrs::default()
+        };
         let mut field = with_frame(
             make_text_input_element(28, field_attrs),
             Frame {
@@ -12235,8 +13190,10 @@ mod tests {
         root.lifecycle.mounted_at_revision = 1;
         root.children = vec![existing_id, new_id];
 
-        let mut existing_attrs = Attrs::default();
-        existing_attrs.focus_on_mount = Some(true);
+        let existing_attrs = Attrs {
+            focus_on_mount: Some(true),
+            ..Attrs::default()
+        };
         let mut existing = with_frame(
             make_text_input_element(30, existing_attrs),
             Frame {
@@ -12250,8 +13207,10 @@ mod tests {
         );
         existing.lifecycle.mounted_at_revision = 1;
 
-        let mut new_attrs = Attrs::default();
-        new_attrs.focus_on_mount = Some(true);
+        let new_attrs = Attrs {
+            focus_on_mount: Some(true),
+            ..Attrs::default()
+        };
         let mut new_field = with_frame(
             make_text_input_element(31, new_attrs),
             Frame {
@@ -12302,8 +13261,10 @@ mod tests {
         root.lifecycle.mounted_at_revision = 1;
         root.children = vec![first_id, second_id];
 
-        let mut first_attrs = Attrs::default();
-        first_attrs.focus_on_mount = Some(true);
+        let first_attrs = Attrs {
+            focus_on_mount: Some(true),
+            ..Attrs::default()
+        };
         let mut first = with_frame(
             make_text_input_element(33, first_attrs),
             Frame {
@@ -12317,8 +13278,10 @@ mod tests {
         );
         first.lifecycle.mounted_at_revision = 3;
 
-        let mut second_attrs = Attrs::default();
-        second_attrs.focus_on_mount = Some(true);
+        let second_attrs = Attrs {
+            focus_on_mount: Some(true),
+            ..Attrs::default()
+        };
         let mut second = with_frame(
             make_text_input_element(34, second_attrs),
             Frame {
@@ -12348,12 +13311,10 @@ mod tests {
 
     #[test]
     fn registry_for_elements_without_focus_adds_global_tab_fallbacks() {
-        let mut first_attrs = Attrs::default();
-        first_attrs.on_focus = Some(true);
+        let first_attrs = on_focus_attrs();
         let first = with_interaction(make_element(27, first_attrs), true);
 
-        let mut last_attrs = Attrs::default();
-        last_attrs.on_focus = Some(true);
+        let last_attrs = on_focus_attrs();
         let last = with_interaction(make_element(28, last_attrs), true);
 
         let registry = registry_for_elements(&[first, last]);
@@ -12592,11 +13553,13 @@ mod tests {
 
     #[test]
     fn listeners_for_focused_text_input_add_text_edit_slots() {
-        let mut attrs = Attrs::default();
-        attrs.content = Some("ab".to_string());
-        attrs.text_input_focused = Some(true);
-        attrs.text_input_cursor = Some(2);
-        attrs.on_change = Some(true);
+        let attrs = Attrs {
+            content: Some("ab".to_string()),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(2),
+            on_change: Some(true),
+            ..Attrs::default()
+        };
         let element = make_text_input_element(17, attrs);
 
         let listeners = listeners_for_element(&element);
@@ -12948,11 +13911,13 @@ mod tests {
 
     #[test]
     fn listeners_for_focused_text_input_without_on_change_emits_no_change_event() {
-        let mut attrs = Attrs::default();
-        attrs.content = Some("ab".to_string());
-        attrs.text_input_focused = Some(true);
-        attrs.text_input_cursor = Some(2);
-        attrs.on_change = Some(false);
+        let attrs = Attrs {
+            content: Some("ab".to_string()),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(2),
+            on_change: Some(false),
+            ..Attrs::default()
+        };
         let element = make_text_input_element(18, attrs);
 
         let listeners = listeners_for_element(&element);
@@ -13015,11 +13980,13 @@ mod tests {
 
     #[test]
     fn listeners_for_unfocused_text_input_omit_text_edit_slots() {
-        let mut attrs = Attrs::default();
-        attrs.content = Some("ab".to_string());
-        attrs.text_input_focused = Some(false);
-        attrs.text_input_cursor = Some(2);
-        attrs.on_change = Some(true);
+        let attrs = Attrs {
+            content: Some("ab".to_string()),
+            text_input_focused: Some(false),
+            text_input_cursor: Some(2),
+            on_change: Some(true),
+            ..Attrs::default()
+        };
         let element = make_text_input_element(19, attrs);
 
         let listeners = listeners_for_element(&element);
@@ -13045,9 +14012,11 @@ mod tests {
 
     #[test]
     fn listeners_for_text_input_left_press_sets_cursor_and_starts_text_drag() {
-        let mut attrs = Attrs::default();
-        attrs.content = Some("ab".to_string());
-        attrs.text_input_focused = Some(false);
+        let attrs = Attrs {
+            content: Some("ab".to_string()),
+            text_input_focused: Some(false),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_text_input_element(32, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -13103,10 +14072,12 @@ mod tests {
 
     #[test]
     fn listeners_for_text_input_with_interaction_add_middle_paste_primary_listener() {
-        let mut attrs = Attrs::default();
-        attrs.content = Some("ab".to_string());
-        attrs.text_input_focused = Some(false);
-        attrs.on_change = Some(true);
+        let attrs = Attrs {
+            content: Some("ab".to_string()),
+            text_input_focused: Some(false),
+            on_change: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_text_input_element(21, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -13155,8 +14126,10 @@ mod tests {
 
     #[test]
     fn runtime_listeners_for_overlay_text_drag_adds_move_and_clear_followups() {
-        let mut attrs = Attrs::default();
-        attrs.content = Some("ab".to_string());
+        let attrs = Attrs {
+            content: Some("ab".to_string()),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_text_input_element(33, attrs), true);
         let base = registry_for_elements(&[element]);
 
@@ -13256,7 +14229,8 @@ mod tests {
         let actions = resize_listener.compute_actions(&InputEvent::Resized {
             width: 800,
             height: 600,
-            scale_factor: 1.5,
+            scale_factor: 2.0,
+            layout_scale: 1.5,
         });
         assert!(matches!(
             actions.as_slice(),
@@ -13264,6 +14238,16 @@ mod tests {
                 if (*width - 800.0).abs() < f32::EPSILON
                     && (*height - 600.0).abs() < f32::EPSILON
                     && (*scale - 1.5).abs() < f32::EPSILON
+        ));
+
+        let physical_actions =
+            resize_listener.compute_actions(&InputEvent::resized_physical(1080, 2400, 3.0));
+        assert!(matches!(
+            physical_actions.as_slice(),
+            [ListenerAction::TreeMsg(TreeMsg::Resize { width, height, scale })]
+                if (*width - 1080.0).abs() < f32::EPSILON
+                    && (*height - 2400.0).abs() < f32::EPSILON
+                    && (*scale - 1.0).abs() < f32::EPSILON
         ));
         assert!(matches!(
             cursor_listener
@@ -13275,13 +14259,15 @@ mod tests {
 
     #[test]
     fn listeners_for_element_adds_key_scroll_listeners_from_scroll_position() {
-        let mut attrs = Attrs::default();
-        attrs.scrollbar_x = Some(true);
-        attrs.scroll_x = Some(10.0);
-        attrs.scroll_x_max = Some(50.0);
-        attrs.scrollbar_y = Some(true);
-        attrs.scroll_y = Some(0.0);
-        attrs.scroll_y_max = Some(40.0);
+        let attrs = Attrs {
+            scrollbar_x: Some(true),
+            scroll_x: Some(10.0),
+            scroll_x_max: Some(50.0),
+            scrollbar_y: Some(true),
+            scroll_y: Some(0.0),
+            scroll_y_max: Some(40.0),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(40, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -13338,9 +14324,11 @@ mod tests {
 
     #[test]
     fn listeners_for_element_scrollbar_hover_uses_move_and_active_leave_only() {
-        let mut attrs = Attrs::default();
-        attrs.scrollbar_y = Some(true);
-        attrs.scroll_y = Some(10.0);
+        let attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(10.0),
+            ..Attrs::default()
+        };
         let element = with_frame(
             with_interaction(make_element(45, attrs), true),
             Frame {
@@ -13373,10 +14361,12 @@ mod tests {
         ));
         assert_eq!(cursor_actions(&move_actions), vec![CursorIcon::Default]);
 
-        let mut hovered_attrs = Attrs::default();
-        hovered_attrs.scrollbar_y = Some(true);
-        hovered_attrs.scroll_y = Some(10.0);
-        hovered_attrs.scrollbar_hover_axis = Some(ScrollbarHoverAxis::Y);
+        let hovered_attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(10.0),
+            scrollbar_hover_axis: Some(ScrollbarHoverAxis::Y),
+            ..Attrs::default()
+        };
         let hovered_element = with_frame(
             with_interaction(make_element(46, hovered_attrs), true),
             Frame {
@@ -13412,10 +14402,12 @@ mod tests {
         let wrapper_id = NodeId::from_term_bytes(vec![92]);
         let target_id = NodeId::from_term_bytes(vec![93]);
 
-        let mut parent_attrs = Attrs::default();
-        parent_attrs.scrollbar_y = Some(true);
-        parent_attrs.scroll_y = Some(20.0);
-        parent_attrs.scroll_y_max = Some(120.0);
+        let parent_attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(20.0),
+            scroll_y_max: Some(120.0),
+            ..Attrs::default()
+        };
         let mut parent = with_frame(
             make_element(91, parent_attrs),
             Frame {
@@ -13442,8 +14434,7 @@ mod tests {
         );
         wrapper.children = vec![target_id];
 
-        let mut target_attrs = Attrs::default();
-        target_attrs.on_mouse_move = Some(true);
+        let target_attrs = on_mouse_move_attrs();
         let target = with_frame(
             make_element(93, target_attrs),
             Frame {
@@ -13476,11 +14467,65 @@ mod tests {
     }
 
     #[test]
+    fn registry_for_elements_culls_offscreen_virtual_key_subtree() {
+        let key_id = NodeId::from_term_bytes(vec![95]);
+        let parent_attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(0.0),
+            scroll_y_max: Some(120.0),
+            ..Attrs::default()
+        };
+        let mut parent = with_frame(
+            make_element(94, parent_attrs),
+            Frame {
+                x: 0.0,
+                y: 0.0,
+                width: 120.0,
+                height: 60.0,
+                content_width: 120.0,
+                content_height: 180.0,
+            },
+        );
+        parent.children = vec![key_id];
+
+        let key_attrs = Attrs {
+            virtual_key: Some(VirtualKeySpec {
+                tap: VirtualKeyTapAction::Text("a".to_string()),
+                hold: VirtualKeyHoldMode::None,
+                hold_ms: 350,
+                repeat_ms: 40,
+            }),
+            ..Attrs::default()
+        };
+        let key = with_frame(
+            make_element(95, key_attrs),
+            Frame {
+                x: 0.0,
+                y: 100.0,
+                width: 120.0,
+                height: 40.0,
+                content_width: 120.0,
+                content_height: 40.0,
+            },
+        );
+
+        let registry = registry_for_elements(&[parent, key]);
+        assert!(
+            registry
+                .view()
+                .iter_precedence()
+                .all(|listener| { !matches!(listener.element_id, Some(id) if id == key_id) })
+        );
+    }
+
+    #[test]
     fn registry_for_elements_translated_hover_uses_visual_position() {
-        let mut attrs = Attrs::default();
-        attrs.on_mouse_move = Some(true);
-        attrs.move_x = Some(40.0);
-        attrs.move_y = Some(15.0);
+        let attrs = Attrs {
+            on_mouse_move: Some(true),
+            move_x: Some(40.0),
+            move_y: Some(15.0),
+            ..Attrs::default()
+        };
         let element = with_frame(
             make_element(96, attrs),
             Frame {
@@ -13515,9 +14560,11 @@ mod tests {
 
     #[test]
     fn registry_for_elements_rotated_hover_uses_visual_rotation() {
-        let mut attrs = Attrs::default();
-        attrs.on_mouse_move = Some(true);
-        attrs.rotate = Some(90.0);
+        let attrs = Attrs {
+            on_mouse_move: Some(true),
+            rotate: Some(90.0),
+            ..Attrs::default()
+        };
         let element = with_frame(
             make_element(97, attrs),
             Frame {
@@ -13554,10 +14601,12 @@ mod tests {
     fn registry_for_elements_scrolled_child_scrollbar_hover_uses_screen_space_thumb_rect() {
         let child_id = NodeId::from_term_bytes(vec![95]);
 
-        let mut parent_attrs = Attrs::default();
-        parent_attrs.scrollbar_y = Some(true);
-        parent_attrs.scroll_y = Some(40.0);
-        parent_attrs.scroll_y_max = Some(160.0);
+        let parent_attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(40.0),
+            scroll_y_max: Some(160.0),
+            ..Attrs::default()
+        };
         let mut parent = with_frame(
             make_element(94, parent_attrs),
             Frame {
@@ -13571,10 +14620,12 @@ mod tests {
         );
         parent.children = vec![child_id];
 
-        let mut child_attrs = Attrs::default();
-        child_attrs.scrollbar_y = Some(true);
-        child_attrs.scroll_y = Some(10.0);
-        child_attrs.scroll_y_max = Some(100.0);
+        let child_attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(10.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
         let child = with_frame(
             make_element(95, child_attrs),
             Frame {
@@ -13624,12 +14675,14 @@ mod tests {
 
     #[test]
     fn registry_for_elements_transformed_scrollbar_hover_uses_visual_thumb_rect() {
-        let mut attrs = Attrs::default();
-        attrs.scrollbar_y = Some(true);
-        attrs.scroll_y = Some(10.0);
-        attrs.scroll_y_max = Some(100.0);
-        attrs.move_x = Some(30.0);
-        attrs.rotate = Some(90.0);
+        let attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(10.0),
+            scroll_y_max: Some(100.0),
+            move_x: Some(30.0),
+            rotate: Some(90.0),
+            ..Attrs::default()
+        };
         let element = with_frame(
             make_element(98, attrs),
             Frame {
@@ -13672,9 +14725,11 @@ mod tests {
 
     #[test]
     fn listeners_for_element_scrollbar_press_slots_start_drag_runtime() {
-        let mut attrs = Attrs::default();
-        attrs.scrollbar_y = Some(true);
-        attrs.scroll_y = Some(20.0);
+        let attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(20.0),
+            ..Attrs::default()
+        };
         let element = with_frame(
             with_interaction(make_element(47, attrs), true),
             Frame {
@@ -13747,10 +14802,12 @@ mod tests {
 
     #[test]
     fn scrollbar_thumb_press_precedes_generic_left_press_listener() {
-        let mut attrs = Attrs::default();
-        attrs.on_click = Some(true);
-        attrs.scrollbar_y = Some(true);
-        attrs.scroll_y = Some(20.0);
+        let attrs = Attrs {
+            on_click: Some(true),
+            scrollbar_y: Some(true),
+            scroll_y: Some(20.0),
+            ..Attrs::default()
+        };
         let element = with_frame(
             with_interaction(make_element(92, attrs), true),
             Frame {
@@ -13785,11 +14842,13 @@ mod tests {
 
     #[test]
     fn compose_combined_registry_drag_active_scroll_move_emits_scroll_and_updates_pointer() {
-        let mut attrs = Attrs::default();
-        attrs.on_click = Some(true);
-        attrs.scrollbar_x = Some(true);
-        attrs.scroll_x = Some(10.0);
-        attrs.scroll_x_max = Some(100.0);
+        let attrs = Attrs {
+            on_click: Some(true),
+            scrollbar_x: Some(true),
+            scroll_x: Some(10.0),
+            scroll_x_max: Some(100.0),
+            ..Attrs::default()
+        };
         let element = with_frame(
             with_interaction(make_element(48, attrs), true),
             Frame {
@@ -13812,6 +14871,7 @@ mod tests {
                 last_x: 10.0,
                 last_y: 10.0,
                 locked_axis: GestureAxis::Horizontal,
+                scroll_mode: DragScrollMode::Locked,
             },
             swipe: None,
             scrollbar: None,
@@ -13847,12 +14907,291 @@ mod tests {
     }
 
     #[test]
+    fn compose_combined_registry_drag_active_biaxial_scroll_move_emits_both_axes() {
+        let attrs = Attrs {
+            on_click: Some(true),
+            scrollbar_x: Some(true),
+            scrollbar_y: Some(true),
+            scroll_x: Some(10.0),
+            scroll_y: Some(20.0),
+            scroll_x_max: Some(100.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
+        let element = with_frame(
+            with_interaction(make_element(82, attrs), true),
+            Frame {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 40.0,
+                content_width: 220.0,
+                content_height: 180.0,
+            },
+        );
+        let base = registry_for_elements(&[element]);
+        let runtime = RuntimeOverlayState {
+            click_press: None,
+            virtual_key: None,
+            key_presses: Vec::new(),
+            drag: DragTrackerState::Active {
+                element_id: NodeId::from_term_bytes(vec![82]),
+                matcher_kind: ListenerMatcherKind::CursorButtonLeftPressInside,
+                last_x: 10.0,
+                last_y: 10.0,
+                locked_axis: GestureAxis::Horizontal,
+                scroll_mode: DragScrollMode::Biaxial,
+            },
+            swipe: None,
+            scrollbar: None,
+            text_drag: None,
+            slider_drag: None,
+        };
+        let combined = compose_combined_registry(&base, &runtime);
+        let mut ctx = TestComputeCtx {
+            base_registry: Some(base.clone()),
+            ..Default::default()
+        };
+        let actions = first_matching_actions_with_ctx(
+            &combined,
+            &InputEvent::CursorPos { x: 24.0, y: 22.0 },
+            &mut ctx,
+        );
+
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                ListenerAction::TreeMsg(TreeMsg::ScrollRequest {
+                    element_id,
+                    dx,
+                    dy,
+                }),
+                ListenerAction::TreeMsg(TreeMsg::ScrollRequest {
+                    element_id: second_id,
+                    dx: dx2,
+                    dy: dy2,
+                }),
+                ListenerAction::RuntimeChange(RuntimeChange::UpdateDragTrackerPointer {
+                    last_x,
+                    last_y,
+                    axis_delta,
+                }),
+            ] if *element_id == NodeId::from_term_bytes(vec![82])
+                && *second_id == NodeId::from_term_bytes(vec![82])
+                && (*dx - 14.0).abs() < f32::EPSILON
+                && dy.abs() < f32::EPSILON
+                && dx2.abs() < f32::EPSILON
+                && (*dy2 - 12.0).abs() < f32::EPSILON
+                && (*last_x - 24.0).abs() < f32::EPSILON
+                && (*last_y - 22.0).abs() < f32::EPSILON
+                && matches!(axis_delta, Some(delta) if (*delta - 14.0).abs() < f32::EPSILON)
+        ));
+    }
+
+    #[test]
+    fn compose_combined_registry_drag_candidate_threshold_promotes_biaxial_scroll() {
+        let attrs = Attrs {
+            on_click: Some(true),
+            scrollbar_x: Some(true),
+            scrollbar_y: Some(true),
+            scroll_x: Some(10.0),
+            scroll_y: Some(20.0),
+            scroll_x_max: Some(100.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
+        let element = with_interaction(make_element(83, attrs), true);
+        let base = registry_for_elements(&[element]);
+
+        let runtime = RuntimeOverlayState {
+            click_press: Some(ClickPressTracker {
+                element_id: NodeId::from_term_bytes(vec![83]),
+                matcher_kind: ListenerMatcherKind::CursorButtonLeftPressInside,
+                emit_click: true,
+                emit_press_pointer: false,
+                clear_mouse_down: false,
+            }),
+            virtual_key: None,
+            key_presses: Vec::new(),
+            drag: DragTrackerState::Candidate {
+                element_id: NodeId::from_term_bytes(vec![83]),
+                matcher_kind: ListenerMatcherKind::CursorButtonLeftPressInside,
+                origin_x: 10.0,
+                origin_y: 10.0,
+                swipe_handlers: SwipeHandlers::default(),
+                scroll_candidate: true,
+            },
+            swipe: None,
+            scrollbar: None,
+            text_drag: None,
+            slider_drag: None,
+        };
+        let combined = compose_combined_registry(&base, &runtime);
+        let mut ctx = TestComputeCtx {
+            base_registry: Some(base.clone()),
+            combined_registry: Some(combined.clone()),
+            ..Default::default()
+        };
+
+        let actions = first_matching_actions_with_ctx(
+            &combined,
+            &InputEvent::CursorPos { x: 25.0, y: 24.0 },
+            &mut ctx,
+        );
+
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                ListenerAction::RuntimeChange(RuntimeChange::PromoteDragTracker {
+                    element_id,
+                    matcher_kind,
+                    locked_axis,
+                    scroll_mode,
+                    ..
+                }),
+                ListenerAction::RuntimeChange(RuntimeChange::ClearClickPressTracker),
+            ] if *element_id == NodeId::from_term_bytes(vec![83])
+                && *matcher_kind == ListenerMatcherKind::CursorButtonLeftPressInside
+                && *locked_axis == GestureAxis::Horizontal
+                && *scroll_mode == DragScrollMode::Biaxial
+        ));
+    }
+
+    #[test]
+    fn compose_combined_registry_drag_candidate_threshold_promotes_biaxial_at_blocked_edge() {
+        let attrs = Attrs {
+            on_click: Some(true),
+            scrollbar_x: Some(true),
+            scrollbar_y: Some(true),
+            scroll_x: Some(0.0),
+            scroll_y: Some(0.0),
+            scroll_x_max: Some(100.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
+        let element = with_interaction(make_element(84, attrs), true);
+        let base = registry_for_elements(&[element]);
+
+        let runtime = RuntimeOverlayState {
+            click_press: Some(ClickPressTracker {
+                element_id: NodeId::from_term_bytes(vec![84]),
+                matcher_kind: ListenerMatcherKind::CursorButtonLeftPressInside,
+                emit_click: true,
+                emit_press_pointer: false,
+                clear_mouse_down: false,
+            }),
+            virtual_key: None,
+            key_presses: Vec::new(),
+            drag: DragTrackerState::Candidate {
+                element_id: NodeId::from_term_bytes(vec![84]),
+                matcher_kind: ListenerMatcherKind::CursorButtonLeftPressInside,
+                origin_x: 0.0,
+                origin_y: 0.0,
+                swipe_handlers: SwipeHandlers::default(),
+                scroll_candidate: true,
+            },
+            swipe: None,
+            scrollbar: None,
+            text_drag: None,
+            slider_drag: None,
+        };
+        let combined = compose_combined_registry(&base, &runtime);
+        let mut ctx = TestComputeCtx {
+            base_registry: Some(base.clone()),
+            combined_registry: Some(combined.clone()),
+            ..Default::default()
+        };
+
+        let actions = first_matching_actions_with_ctx(
+            &combined,
+            &InputEvent::CursorPos { x: 15.0, y: 14.0 },
+            &mut ctx,
+        );
+
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                ListenerAction::RuntimeChange(RuntimeChange::PromoteDragTracker {
+                    element_id,
+                    matcher_kind,
+                    locked_axis,
+                    scroll_mode,
+                    ..
+                }),
+                ListenerAction::RuntimeChange(RuntimeChange::ClearClickPressTracker),
+            ] if *element_id == NodeId::from_term_bytes(vec![84])
+                && *matcher_kind == ListenerMatcherKind::CursorButtonLeftPressInside
+                && *locked_axis == GestureAxis::Horizontal
+                && *scroll_mode == DragScrollMode::Biaxial
+        ));
+    }
+
+    #[test]
+    fn compose_combined_registry_drag_candidate_threshold_keeps_swipe_edge_behavior() {
+        let attrs = Attrs {
+            on_swipe_right: Some(true),
+            scrollbar_x: Some(true),
+            scroll_x: Some(0.0),
+            scroll_x_max: Some(100.0),
+            ..Attrs::default()
+        };
+        let element = with_interaction(make_element(85, attrs), true);
+        let base = registry_for_elements(&[element]);
+
+        let runtime = RuntimeOverlayState {
+            click_press: None,
+            virtual_key: None,
+            key_presses: Vec::new(),
+            drag: DragTrackerState::Candidate {
+                element_id: NodeId::from_term_bytes(vec![85]),
+                matcher_kind: ListenerMatcherKind::CursorButtonLeftPressInside,
+                origin_x: 10.0,
+                origin_y: 10.0,
+                swipe_handlers: SwipeHandlers {
+                    right: true,
+                    ..SwipeHandlers::default()
+                },
+                scroll_candidate: true,
+            },
+            swipe: None,
+            scrollbar: None,
+            text_drag: None,
+            slider_drag: None,
+        };
+        let combined = compose_combined_registry(&base, &runtime);
+        let mut ctx = TestComputeCtx {
+            base_registry: Some(base.clone()),
+            combined_registry: Some(combined.clone()),
+            ..Default::default()
+        };
+
+        let actions = first_matching_actions_with_ctx(
+            &combined,
+            &InputEvent::CursorPos { x: 25.0, y: 10.0 },
+            &mut ctx,
+        );
+
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                ListenerAction::RuntimeChange(RuntimeChange::ClearClickPressTracker),
+                ListenerAction::RuntimeChange(RuntimeChange::ClearDragTracker),
+                ListenerAction::RuntimeChange(RuntimeChange::StartSwipeTracker { tracker }),
+            ] if tracker.element_id == NodeId::from_term_bytes(vec![85])
+                && tracker.locked_axis == GestureAxis::Horizontal
+                && tracker.handlers.right
+        ));
+    }
+
+    #[test]
     fn compose_combined_registry_drag_active_scroll_move_ignores_off_axis_delta_after_lock() {
-        let mut attrs = Attrs::default();
-        attrs.on_click = Some(true);
-        attrs.scrollbar_x = Some(true);
-        attrs.scroll_x = Some(10.0);
-        attrs.scroll_x_max = Some(100.0);
+        let attrs = Attrs {
+            on_click: Some(true),
+            scrollbar_x: Some(true),
+            scroll_x: Some(10.0),
+            scroll_x_max: Some(100.0),
+            ..Attrs::default()
+        };
         let element = with_frame(
             with_interaction(make_element(81, attrs), true),
             Frame {
@@ -13875,6 +15214,7 @@ mod tests {
                 last_x: 10.0,
                 last_y: 10.0,
                 locked_axis: GestureAxis::Horizontal,
+                scroll_mode: DragScrollMode::Locked,
             },
             swipe: None,
             scrollbar: None,
@@ -13953,11 +15293,13 @@ mod tests {
 
     #[test]
     fn backspace_listener_emits_no_actions_when_cursor_at_start_without_selection() {
-        let mut attrs = Attrs::default();
-        attrs.content = Some("ab".to_string());
-        attrs.text_input_focused = Some(true);
-        attrs.text_input_cursor = Some(0);
-        attrs.on_change = Some(true);
+        let attrs = Attrs {
+            content: Some("ab".to_string()),
+            text_input_focused: Some(true),
+            text_input_cursor: Some(0),
+            on_change: Some(true),
+            ..Attrs::default()
+        };
         let element = make_text_input_element(20, attrs);
 
         let listeners = listeners_for_element(&element);
@@ -13980,9 +15322,11 @@ mod tests {
 
     #[test]
     fn registry_for_elements_with_focused_node_adds_window_blur_focus_clear_listener() {
-        let mut attrs = Attrs::default();
-        attrs.on_focus = Some(true);
-        attrs.focused_active = Some(true);
+        let attrs = Attrs {
+            on_focus: Some(true),
+            focused_active: Some(true),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(15, attrs), true);
 
         let registry = registry_for_elements(&[element]);
@@ -14009,9 +15353,11 @@ mod tests {
 
     #[test]
     fn registry_for_elements_without_focused_node_omits_window_blur_focus_clear_listener() {
-        let mut attrs = Attrs::default();
-        attrs.focused = Some(MouseOverAttrs::default());
-        attrs.focused_active = Some(false);
+        let attrs = Attrs {
+            focused: Some(MouseOverAttrs::default()),
+            focused_active: Some(false),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(16, attrs), true);
 
         let registry = registry_for_elements(&[element]);
@@ -14025,11 +15371,13 @@ mod tests {
 
     #[test]
     fn listeners_for_element_scrollable_adds_cursor_scroll_listener() {
-        let mut attrs = Attrs::default();
-        attrs.scrollbar_x = Some(true);
-        attrs.scrollbar_y = Some(true);
-        attrs.scroll_x_max = Some(50.0);
-        attrs.scroll_y_max = Some(40.0);
+        let attrs = Attrs {
+            scrollbar_x: Some(true),
+            scrollbar_y: Some(true),
+            scroll_x_max: Some(50.0),
+            scroll_y_max: Some(40.0),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(9, attrs), true);
 
         let listeners = listeners_for_element(&element);
@@ -14104,13 +15452,15 @@ mod tests {
 
     #[test]
     fn listeners_for_element_omits_blocked_scroll_directions() {
-        let mut attrs = Attrs::default();
-        attrs.scrollbar_x = Some(true);
-        attrs.scrollbar_y = Some(true);
-        attrs.scroll_x = Some(10.0);
-        attrs.scroll_x_max = Some(10.0);
-        attrs.scroll_y = Some(0.0);
-        attrs.scroll_y_max = Some(20.0);
+        let attrs = Attrs {
+            scrollbar_x: Some(true),
+            scrollbar_y: Some(true),
+            scroll_x: Some(10.0),
+            scroll_x_max: Some(10.0),
+            scroll_y: Some(0.0),
+            scroll_y_max: Some(20.0),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(90, attrs), true);
 
         let directions: Vec<_> = listeners_for_element(&element)
@@ -14129,17 +15479,21 @@ mod tests {
 
     #[test]
     fn registry_for_elements_nested_child_scroll_listener_precedes_parent() {
-        let mut parent_attrs = Attrs::default();
-        parent_attrs.scrollbar_y = Some(true);
-        parent_attrs.scroll_y = Some(10.0);
-        parent_attrs.scroll_y_max = Some(100.0);
+        let parent_attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(10.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
         let mut parent = with_interaction(make_element(71, parent_attrs), true);
         parent.children = vec![NodeId::from_term_bytes(vec![72])];
 
-        let mut child_attrs = Attrs::default();
-        child_attrs.scrollbar_y = Some(true);
-        child_attrs.scroll_y = Some(20.0);
-        child_attrs.scroll_y_max = Some(100.0);
+        let child_attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(20.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
         let child = with_interaction(make_element(72, child_attrs), true);
 
         let registry = registry_for_elements(&[parent, child]);
@@ -14195,11 +15549,13 @@ mod tests {
 
     #[test]
     fn runtime_scroll_splitter_redispatches_both_components() {
-        let mut attrs = Attrs::default();
-        attrs.scrollbar_x = Some(true);
-        attrs.scrollbar_y = Some(true);
-        attrs.scroll_x_max = Some(50.0);
-        attrs.scroll_y_max = Some(40.0);
+        let attrs = Attrs {
+            scrollbar_x: Some(true),
+            scrollbar_y: Some(true),
+            scroll_x_max: Some(50.0),
+            scroll_y_max: Some(40.0),
+            ..Attrs::default()
+        };
         let element = with_interaction(make_element(91, attrs), true);
         let base = registry_for_elements(&[element]);
         let listeners = runtime_listeners_for_overlay(&base, &RuntimeOverlayState::default());

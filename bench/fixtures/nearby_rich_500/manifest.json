@@ -6,6 +6,24 @@
     "height": 4.0e3,
     "scale": 1.0
   },
+  "scenario": "nearby_rich",
+  "item_count": 100,
+  "node_count": 1406,
+  "text_node_count": 602,
+  "full_emrg_bytes": 87101,
+  "element_types": {
+    "none": 100,
+    "text": 602,
+    "column": 1,
+    "el": 702,
+    "wrapped_row": 1
+  },
+  "attr_families": {
+    "layout": 2309,
+    "nearby": 601,
+    "paint": 2005,
+    "measure": 702
+  },
   "patches": {
     "noop": {
       "byte_size": 0,
@@ -104,7 +122,7 @@
     },
     "nearby_slot_change": {
       "byte_size": 20,
-      "expected_invalidation": "structure",
+      "expected_invalidation": "resolve",
       "op_count": 1,
       "operation_counts": {
         "set_nearby_mounts": 1
@@ -115,7 +133,7 @@
     },
     "nearby_reorder": {
       "byte_size": 6500,
-      "expected_invalidation": "structure",
+      "expected_invalidation": "resolve",
       "op_count": 100,
       "operation_counts": {
         "set_nearby_mounts": 100
@@ -124,23 +142,5 @@
         "set_nearby_mounts"
       ]
     }
-  },
-  "node_count": 1406,
-  "scenario": "nearby_rich",
-  "item_count": 100,
-  "text_node_count": 602,
-  "full_emrg_bytes": 87101,
-  "element_types": {
-    "none": 100,
-    "text": 602,
-    "column": 1,
-    "el": 702,
-    "wrapped_row": 1
-  },
-  "attr_families": {
-    "nearby": 601,
-    "layout": 2309,
-    "paint": 2005,
-    "measure": 702
   }
 }

@@ -5,7 +5,7 @@ defmodule Emerge.UITest do
   import ExUnit.CaptureIO
 
   alias Emerge.Engine.Reconcile
-  alias EmergeSkia.VideoTarget
+  alias Emerge.VideoTarget
 
   defmodule UsingEmergeUIComponent do
     use Emerge.UI
@@ -971,8 +971,8 @@ defmodule Emerge.UITest do
     assert element.children == []
   end
 
-  test "video creates a video element" do
-    target = %VideoTarget{id: "preview", width: 640, height: 360, mode: :prime, ref: make_ref()}
+  test "video creates a video element from Emerge.VideoTarget" do
+    target = VideoTarget.new(id: "preview", width: 640, height: 360, ref: make_ref())
 
     element = video([width(px(160)), image_fit(:cover)], target)
 
@@ -982,6 +982,22 @@ defmodule Emerge.UITest do
     assert element.attrs.image_fit == :cover
     assert element.attrs.width == {:px, 160}
     assert element.children == []
+  end
+
+  test "video accepts legacy EmergeSkia.VideoTarget values" do
+    legacy = %EmergeSkia.VideoTarget{
+      id: "legacy",
+      width: 320,
+      height: 180,
+      mode: :prime,
+      ref: make_ref()
+    }
+
+    element = video([], legacy)
+
+    assert element.attrs.video_target == "legacy"
+    assert element.attrs.image_size == {320, 180}
+    assert element.attrs.image_fit == :contain
   end
 
   test "on_change helper returns attr tuple" do
@@ -1186,7 +1202,7 @@ defmodule Emerge.UITest do
   end
 
   test "video/2 validates attrs are first" do
-    target = %VideoTarget{id: "preview", width: 640, height: 360, mode: :prime, ref: make_ref()}
+    target = VideoTarget.new(id: "preview", width: 640, height: 360, ref: make_ref())
 
     assert_raise ArgumentError,
                  ~r/video\/2 expects the first argument to be a list of attributes, got:/,

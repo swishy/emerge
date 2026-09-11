@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use smithay_client_toolkit::shell::{WaylandSurface, xdg::window::Window};
 use wayland_client::QueueHandle;
@@ -27,11 +27,39 @@ pub(super) enum DrawDecision {
     Draw(DrawKind),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FrameCallbackRequest {
+    pub(super) sequence: u64,
+    pub(super) requested_at: Instant,
+    pub(super) wall_requested_at: SystemTime,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PresentSnapshot {
+    pub(super) configured: bool,
+    pub(super) redraw_requested: bool,
+    pub(super) frame_callback_state: FrameCallbackState,
+    pub(super) requested_frame_callback_sequence: Option<u64>,
+    pub(super) requested_frame_callback_age: Option<Duration>,
+    pub(super) requested_frame_callback_wall_age: Option<Duration>,
+    pub(super) latest_received_render_version: Option<u64>,
+    pub(super) latest_received_from_patch: bool,
+    pub(super) latest_received_animation_active: bool,
+    pub(super) last_submitted_render_version: Option<u64>,
+    pub(super) late_replacement_used: bool,
+    pub(super) has_newer_received_scene: bool,
+    pub(super) can_late_replace: bool,
+    pub(super) ready_frame_callback_buffered: bool,
+    pub(super) estimated_frame_interval: Duration,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PresentState {
     pub(super) configured: bool,
     redraw_requested: bool,
     frame_callback_state: FrameCallbackState,
+    next_frame_callback_request_sequence: u64,
+    requested_frame_callback: Option<FrameCallbackRequest>,
     last_frame_callback_at: Option<Instant>,
     last_frame_callback_time_ms: Option<u32>,
     ready_frame_callback_at: Option<Instant>,
@@ -49,6 +77,8 @@ impl Default for PresentState {
             configured: false,
             redraw_requested: false,
             frame_callback_state: FrameCallbackState::None,
+            next_frame_callback_request_sequence: 0,
+            requested_frame_callback: None,
             last_frame_callback_at: None,
             last_frame_callback_time_ms: None,
             ready_frame_callback_at: None,
@@ -63,6 +93,14 @@ impl Default for PresentState {
 }
 
 impl PresentState {
+    #[cfg(test)]
+    pub(super) fn configured_for_test() -> Self {
+        Self {
+            configured: true,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn queue_redraw(&mut self) {
         self.redraw_requested = true;
     }
@@ -99,20 +137,35 @@ impl PresentState {
         kind: DrawKind,
         window: &Window,
         qh: &QueueHandle<WaylandApp>,
-    ) {
+    ) -> Option<FrameCallbackRequest> {
         if kind == DrawKind::Normal {
-            self.request_frame_callback(window, qh);
+            self.request_frame_callback(window, qh)
+        } else {
+            None
         }
     }
 
-    fn request_frame_callback(&mut self, window: &Window, qh: &QueueHandle<WaylandApp>) {
+    fn request_frame_callback(
+        &mut self,
+        window: &Window,
+        qh: &QueueHandle<WaylandApp>,
+    ) -> Option<FrameCallbackRequest> {
         match self.frame_callback_state {
             FrameCallbackState::None | FrameCallbackState::Received => {
                 window.wl_surface().frame(qh, window.wl_surface().clone());
+                let request = FrameCallbackRequest {
+                    sequence: self.next_frame_callback_request_sequence,
+                    requested_at: Instant::now(),
+                    wall_requested_at: SystemTime::now(),
+                };
+                self.next_frame_callback_request_sequence =
+                    self.next_frame_callback_request_sequence.wrapping_add(1);
+                self.requested_frame_callback = Some(request);
                 self.frame_callback_state = FrameCallbackState::Requested;
                 self.late_replacement_used = false;
+                Some(request)
             }
-            FrameCallbackState::Requested => {}
+            FrameCallbackState::Requested => None,
         }
     }
 
@@ -140,6 +193,7 @@ impl PresentState {
         self.last_frame_callback_time_ms = Some(callback_time_ms);
         self.ready_frame_callback_at = Some(received_at);
         self.frame_callback_state = FrameCallbackState::Received;
+        self.requested_frame_callback = None;
         self.late_replacement_used = false;
     }
 
@@ -152,6 +206,12 @@ impl PresentState {
         self.last_submitted_render_version = Some(render_version);
         self.late_replacement_used = kind == DrawKind::LateReplacement;
         self.redraw_requested = video_needs_cleanup;
+    }
+
+    pub(super) fn finish_noop_present(&mut self, render_version: u64) {
+        self.last_submitted_render_version = Some(render_version);
+        self.late_replacement_used = false;
+        self.redraw_requested = false;
     }
 
     pub(super) fn present_timing_for_normal_draw(
@@ -177,6 +237,35 @@ impl PresentState {
             self.ready_frame_callback_at = None;
             self.last_frame_callback_at = None;
             self.last_frame_callback_time_ms = None;
+        }
+    }
+
+    pub(super) fn snapshot(&self, now: Instant, wall_now: SystemTime) -> PresentSnapshot {
+        let requested_frame_callback_age = self
+            .requested_frame_callback
+            .map(|request| now.saturating_duration_since(request.requested_at));
+        let requested_frame_callback_wall_age = self
+            .requested_frame_callback
+            .and_then(|request| wall_now.duration_since(request.wall_requested_at).ok());
+
+        PresentSnapshot {
+            configured: self.configured,
+            redraw_requested: self.redraw_requested,
+            frame_callback_state: self.frame_callback_state,
+            requested_frame_callback_sequence: self
+                .requested_frame_callback
+                .map(|request| request.sequence),
+            requested_frame_callback_age,
+            requested_frame_callback_wall_age,
+            latest_received_render_version: self.latest_received_render_version,
+            latest_received_from_patch: self.latest_received_from_patch,
+            latest_received_animation_active: self.latest_received_animation_active,
+            last_submitted_render_version: self.last_submitted_render_version,
+            late_replacement_used: self.late_replacement_used,
+            has_newer_received_scene: self.has_newer_received_scene(),
+            can_late_replace: self.can_late_replace(),
+            ready_frame_callback_buffered: self.ready_frame_callback_at.is_some(),
+            estimated_frame_interval: self.estimated_frame_interval(),
         }
     }
 
@@ -206,8 +295,10 @@ mod tests {
 
     #[test]
     fn pending_frame_waits_when_no_new_patch_scene_arrived() {
-        let mut present = PresentState::default();
-        present.configured = true;
+        let mut present = PresentState {
+            configured: true,
+            ..PresentState::default()
+        };
         present.queue_redraw();
         present.frame_callback_state = FrameCallbackState::Requested;
         present.last_submitted_render_version = Some(1);
@@ -217,8 +308,10 @@ mod tests {
 
     #[test]
     fn allows_one_patch_late_replacement_when_swap_is_nonblocking() {
-        let mut present = PresentState::default();
-        present.configured = true;
+        let mut present = PresentState {
+            configured: true,
+            ..PresentState::default()
+        };
         present.queue_redraw();
         present.frame_callback_state = FrameCallbackState::Requested;
         present.last_submitted_render_version = Some(1);
@@ -238,8 +331,10 @@ mod tests {
 
     #[test]
     fn skips_late_replacement_when_swap_may_block() {
-        let mut present = PresentState::default();
-        present.configured = true;
+        let mut present = PresentState {
+            configured: true,
+            ..PresentState::default()
+        };
         present.queue_redraw();
         present.frame_callback_state = FrameCallbackState::Requested;
         present.last_submitted_render_version = Some(1);
@@ -250,8 +345,10 @@ mod tests {
 
     #[test]
     fn ignores_animation_only_scene_updates() {
-        let mut present = PresentState::default();
-        present.configured = true;
+        let mut present = PresentState {
+            configured: true,
+            ..PresentState::default()
+        };
         present.queue_redraw();
         present.frame_callback_state = FrameCallbackState::Requested;
         present.last_submitted_render_version = Some(1);
@@ -262,8 +359,10 @@ mod tests {
 
     #[test]
     fn skips_late_replacement_for_animation_active_patch_scene() {
-        let mut present = PresentState::default();
-        present.configured = true;
+        let mut present = PresentState {
+            configured: true,
+            ..PresentState::default()
+        };
         present.queue_redraw();
         present.frame_callback_state = FrameCallbackState::Requested;
         present.last_submitted_render_version = Some(1);
@@ -274,8 +373,10 @@ mod tests {
 
     #[test]
     fn normal_draw_requests_after_callback_even_when_replacement_was_used() {
-        let mut present = PresentState::default();
-        present.configured = true;
+        let mut present = PresentState {
+            configured: true,
+            ..PresentState::default()
+        };
         present.queue_redraw();
         present.frame_callback_state = FrameCallbackState::Requested;
         present.last_submitted_render_version = Some(1);

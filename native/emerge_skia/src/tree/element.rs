@@ -1,18 +1,21 @@
 //! Element types for Emerge UI trees.
 
 use super::animation::AnimationSpec;
-#[cfg(test)]
-use super::attrs::MouseOverAttrs;
 use super::attrs::{
     AlignX, AlignY, Attrs, BorderWidth, Font, FontStyle, FontWeight, ImageFit, ImageSource, Length,
-    Padding, ScrollbarHoverAxis, TextAlign, TextFragment, supports_mouse_over_tracking,
+    MouseOverAttrs, Padding, ScrollbarHoverAxis, TextAlign, TextFragment,
+    supports_mouse_over_tracking,
 };
-use super::invalidation::{TreeInvalidation, classify_interaction_style};
+use super::geometry::Rect;
+use super::invalidation::{
+    TreeInvalidation, classify_interaction_style, content_box_is_layout_independent,
+};
 use crate::events::registry_builder::RegistrySubtreeCache;
-use crate::render_scene::RenderNode;
+use crate::render_scene::{RenderNode, RenderPaintLayer};
 use crate::stats::LayoutCacheStats;
 #[cfg(test)]
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 
@@ -252,44 +255,6 @@ pub struct TopologyDependencyKey {
     pub nearby_count: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RenderTopologyDependencyKey {
-    pub children_version: u64,
-    pub paint_children_version: u64,
-    pub nearby_version: u64,
-    pub child_count: usize,
-    pub paint_child_count: usize,
-    pub nearby_count: usize,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct RenderSubtreeKey {
-    pub kind: ElementKind,
-    pub attrs_hash: u64,
-    pub runtime_hash: u64,
-    pub frame: Option<Frame>,
-    pub render_frame: Option<Frame>,
-    pub scroll_x: f32,
-    pub scroll_y: f32,
-    pub scroll_x_max: f32,
-    pub scroll_y_max: f32,
-    pub inherited_hash: u64,
-    pub scene_context_hash: u64,
-    pub render_context_hash: u64,
-    pub asset_status_generation: u64,
-    pub topology: RenderTopologyDependencyKey,
-    pub paragraph_fragments_hash: u64,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct RenderSubtreeCache {
-    pub key: RenderSubtreeKey,
-    pub local: Vec<RenderNode>,
-    pub escapes: Vec<RenderNode>,
-    pub text_input_focused: bool,
-    pub text_input_cursor_area: Option<(f32, f32, f32, f32)>,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubtreeMeasureAttrs {
     pub width: Option<Length>,
@@ -318,10 +283,6 @@ pub struct SubtreeMeasureAttrs {
     pub image_src: Option<ImageSource>,
     pub image_fit: Option<ImageFit>,
     pub image_size: Option<(f64, f64)>,
-    pub slider_min: Option<f64>,
-    pub slider_max: Option<f64>,
-    pub slider_value: Option<f64>,
-    pub slider_step: Option<f64>,
     pub text_align: Option<TextAlign>,
     pub snap_layout: Option<bool>,
     pub snap_text_metrics: Option<bool>,
@@ -378,6 +339,13 @@ pub enum NearbySlot {
 }
 
 impl NearbySlot {
+    /// True for nearby slots painted above normal content. Overlay roots emit
+    /// pointer blockers even when their subtree has no explicit listeners, so
+    /// mounting/unmounting them is event-registry relevant.
+    pub fn is_overlay(self) -> bool {
+        !matches!(self, Self::BehindContent)
+    }
+
     pub fn from_tag(tag: u8) -> Option<Self> {
         match tag {
             1 => Some(Self::BehindContent),
@@ -647,8 +615,47 @@ pub struct NodeRefreshState {
     pub render_descendant_dirty: bool,
     pub registry_dirty: bool,
     pub registry_descendant_dirty: bool,
-    pub render_cache: Option<RenderSubtreeCache>,
     pub registry_cache: Option<RegistrySubtreeCache>,
+    pub render_layer_cache: RefCell<Option<RenderLayerCache>>,
+    pub render_fragment_cache: RefCell<Option<RenderFragmentCache>>,
+    pub registry_subtree_affects: bool,
+    pub paint_generation: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct RenderLayerCache {
+    pub key: RenderLayerCacheKey,
+    pub layer: RenderPaintLayer,
+}
+
+#[derive(Clone, Debug)]
+pub struct RenderFragmentCache {
+    pub key: RenderFragmentCacheKey,
+    pub local: Vec<RenderNode>,
+    pub escapes: Vec<RenderNode>,
+    pub text_input_focused: bool,
+    pub text_input_cursor_area: Option<(f32, f32, f32, f32)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderFragmentCacheKind {
+    Nearby,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderFragmentCacheKey {
+    pub kind: RenderFragmentCacheKind,
+    pub paint_generation: u64,
+    pub topology: TopologyDependencyKey,
+    pub bounds: Rect,
+    pub context: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderLayerCacheKey {
+    pub paint_generation: u64,
+    pub topology: TopologyDependencyKey,
+    pub bounds: Rect,
 }
 
 impl Default for NodeRefreshState {
@@ -658,13 +665,22 @@ impl Default for NodeRefreshState {
             render_descendant_dirty: false,
             registry_dirty: true,
             registry_descendant_dirty: false,
-            render_cache: None,
             registry_cache: None,
+            render_layer_cache: RefCell::new(None),
+            render_fragment_cache: RefCell::new(None),
+            registry_subtree_affects: false,
+            paint_generation: 1,
         }
     }
 }
 
 impl NodeRefreshState {
+    fn mark_render_changed(&mut self) {
+        if !self.has_render_damage() {
+            self.paint_generation = self.paint_generation.saturating_add(1).max(1);
+        }
+    }
+
     fn clear_render(&mut self) {
         self.render_dirty = false;
         self.render_descendant_dirty = false;
@@ -910,8 +926,13 @@ impl Element {
                 render_descendant_dirty: self.refresh.render_descendant_dirty,
                 registry_dirty: self.refresh.registry_dirty,
                 registry_descendant_dirty: self.refresh.registry_descendant_dirty,
-                render_cache: None,
                 registry_cache: None,
+                render_layer_cache: RefCell::new(self.refresh.render_layer_cache.borrow().clone()),
+                render_fragment_cache: RefCell::new(
+                    self.refresh.render_fragment_cache.borrow().clone(),
+                ),
+                registry_subtree_affects: self.refresh.registry_subtree_affects,
+                paint_generation: self.refresh.paint_generation,
             },
             lifecycle: self.lifecycle.clone(),
             #[cfg(test)]
@@ -1172,6 +1193,8 @@ pub struct ElementTree {
     layout_cache_stats: LayoutCacheStats,
     layout_cache_stats_enabled: bool,
     detached_layout_cache: Vec<DetachedLayoutSubtreeCache>,
+    scroll_refresh_dirty: bool,
+    scroll_cache_context_active: bool,
 
     pending_root_id: Option<NodeId>,
 
@@ -1197,6 +1220,8 @@ impl Default for ElementTree {
             layout_cache_stats: LayoutCacheStats::default(),
             layout_cache_stats_enabled: false,
             detached_layout_cache: Vec::new(),
+            scroll_refresh_dirty: false,
+            scroll_cache_context_active: false,
             pending_root_id: None,
             #[cfg(test)]
             topology: RefCell::new(TreeTopology::default()),
@@ -1444,9 +1469,10 @@ impl ElementTree {
             TreeInvalidation::None => {}
             TreeInvalidation::Registry => self.mark_registry_refresh_dirty_ix(ix),
             TreeInvalidation::Paint => self.mark_render_refresh_dirty_ix(ix),
-            TreeInvalidation::Resolve | TreeInvalidation::Measure | TreeInvalidation::Structure => {
-                self.mark_render_and_registry_refresh_dirty_ix(ix)
+            TreeInvalidation::Resolve | TreeInvalidation::Measure => {
+                self.mark_render_refresh_dirty_ix(ix)
             }
+            TreeInvalidation::Structure => self.mark_render_and_registry_refresh_dirty_ix(ix),
         }
     }
 
@@ -1463,18 +1489,51 @@ impl ElementTree {
     }
 
     pub fn has_render_refresh_damage(&self) -> bool {
-        self.iter_nodes()
-            .any(|element| element.refresh.has_render_damage())
+        self.root
+            .and_then(|root_ix| self.get_ix(root_ix))
+            .is_some_and(|element| element.refresh.has_render_damage())
     }
 
     pub fn has_registry_refresh_damage(&self) -> bool {
-        self.iter_nodes()
-            .any(|element| element.refresh.has_registry_damage())
+        self.root
+            .and_then(|root_ix| self.get_ix(root_ix))
+            .is_some_and(|element| element.refresh.has_registry_damage())
     }
 
-    pub fn has_render_subtree_cache(&self) -> bool {
+    #[cfg(any(test, feature = "bench-diagnostics"))]
+    pub(crate) fn registry_refresh_damage_count(&self) -> usize {
         self.iter_nodes()
-            .any(|element| element.refresh.render_cache.is_some())
+            .filter(|element| {
+                element.refresh.registry_dirty || element.refresh.registry_descendant_dirty
+            })
+            .count()
+    }
+
+    pub fn has_scroll_refresh_damage(&self) -> bool {
+        self.scroll_refresh_dirty
+    }
+
+    pub fn has_scroll_cache_context(&self) -> bool {
+        self.scroll_refresh_dirty || self.scroll_cache_context_active
+    }
+
+    pub(crate) fn reset_scroll_cache_context_for_layout(&mut self) {
+        self.scroll_cache_context_active = false;
+    }
+
+    pub(crate) fn mark_scroll_cache_context_active(&mut self) {
+        self.scroll_cache_context_active = true;
+    }
+
+    fn any_active_scroll_offset(&self) -> bool {
+        self.iter_nodes()
+            .any(Self::element_has_active_scroll_offset)
+    }
+
+    fn element_has_active_scroll_offset(element: &Element) -> bool {
+        (element.layout.scroll_x > f32::EPSILON || element.layout.scroll_y > f32::EPSILON)
+            && (element.layout.scroll_x_max > f32::EPSILON
+                || element.layout.scroll_y_max > f32::EPSILON)
     }
 
     pub fn has_registry_subtree_cache(&self) -> bool {
@@ -1485,6 +1544,7 @@ impl ElementTree {
     pub fn clear_render_refresh_dirty(&mut self) {
         self.iter_nodes_mut()
             .for_each(|element| element.refresh.clear_render());
+        self.scroll_refresh_dirty = false;
     }
 
     pub fn clear_registry_refresh_dirty(&mut self) {
@@ -1497,6 +1557,7 @@ impl ElementTree {
             element.refresh.clear_render();
             element.refresh.clear_registry();
         });
+        self.scroll_refresh_dirty = false;
     }
 
     #[cfg(test)]
@@ -1621,6 +1682,23 @@ impl ElementTree {
         }
     }
 
+    pub(crate) fn is_inside_nearby_subtree(&self, id: &NodeId) -> bool {
+        self.ix_of(id)
+            .and_then(|ix| self.nearby_boundary_for_ix(ix))
+            .is_some()
+    }
+
+    fn nearby_boundary_for_ix(&self, ix: NodeIx) -> Option<(NodeIx, NodeIx)> {
+        let mut current = ix;
+        while let Some(parent_link) = self.parent_link_of(current) {
+            match parent_link {
+                ParentLink::Child { parent } => current = parent,
+                ParentLink::Nearby { host, .. } => return Some((host, current)),
+            }
+        }
+        None
+    }
+
     pub fn child_ixs(&self, ix: NodeIx) -> Vec<NodeIx> {
         #[cfg(test)]
         {
@@ -1722,6 +1800,11 @@ impl ElementTree {
             .collect()
     }
 
+    pub(crate) fn subtree_affects_registry(&self, id: &NodeId) -> bool {
+        self.ix_of(id)
+            .is_some_and(|ix| self.subtree_affects_registry_ix(ix))
+    }
+
     pub fn has_escape_nearby_mounts(&self) -> bool {
         #[cfg(test)]
         {
@@ -1742,9 +1825,34 @@ impl ElementTree {
         }
     }
 
-    pub(crate) fn subtree_affects_registry(&self, id: &NodeId) -> bool {
+    pub(crate) fn refresh_registry_subtree_affects_cache(&mut self) {
+        self.ensure_topology();
+        if let Some(root_ix) = self.root {
+            self.refresh_registry_subtree_affects_cache_ix(root_ix);
+        }
+    }
+
+    pub(crate) fn cached_subtree_affects_registry(&self, id: &NodeId) -> bool {
         self.ix_of(id)
-            .is_some_and(|ix| self.subtree_affects_registry_ix(ix))
+            .and_then(|ix| self.get_ix(ix))
+            .is_some_and(|element| element.refresh.registry_subtree_affects)
+    }
+
+    pub(crate) fn root_cached_subtree_affects_registry(&self) -> bool {
+        self.root_ix()
+            .and_then(|ix| self.get_ix(ix))
+            .is_some_and(|element| element.refresh.registry_subtree_affects)
+    }
+
+    pub(crate) fn nearby_mount_change_affects_registry(
+        &self,
+        host_id: &NodeId,
+        new_mounts: &[NearbyMount],
+    ) -> bool {
+        self.nearby_mounts_for(host_id)
+            .iter()
+            .chain(new_mounts.iter())
+            .any(|mount| mount.slot.is_overlay() || self.subtree_affects_registry(&mount.id))
     }
 
     pub(crate) fn nearby_subtree_can_skip_layout(&self, id: &NodeId) -> bool {
@@ -1854,9 +1962,35 @@ impl ElementTree {
                 .child_ixs(ix)
                 .into_iter()
                 .any(|child_ix| self.subtree_affects_registry_ix(child_ix))
-            || self.nearby_ixs(ix).into_iter().any(|mount| {
-                mount.slot == NearbySlot::InFront || self.subtree_affects_registry_ix(mount.ix)
-            })
+            || self
+                .nearby_ixs(ix)
+                .into_iter()
+                .any(|mount| mount.slot.is_overlay() || self.subtree_affects_registry_ix(mount.ix))
+    }
+
+    #[allow(clippy::unnecessary_fold)]
+    fn refresh_registry_subtree_affects_cache_ix(&mut self, ix: NodeIx) -> bool {
+        let Some(own_affects) = self.get_ix(ix).map(element_affects_registry) else {
+            return false;
+        };
+        let child_affects = self
+            .child_ixs(ix)
+            .into_iter()
+            .fold(false, |affects, child_ix| {
+                self.refresh_registry_subtree_affects_cache_ix(child_ix) || affects
+            });
+        let nearby_affects = self
+            .nearby_ixs(ix)
+            .into_iter()
+            .fold(false, |affects, mount| {
+                let subtree_affects = self.refresh_registry_subtree_affects_cache_ix(mount.ix);
+                affects || mount.slot.is_overlay() || subtree_affects
+            });
+        let affects = own_affects || child_affects || nearby_affects;
+        if let Some(element) = self.get_ix_mut(ix) {
+            element.refresh.registry_subtree_affects = affects;
+        }
+        affects
     }
 
     fn nearby_registry_dirty_for_change(
@@ -1864,9 +1998,10 @@ impl ElementTree {
         old_mounts: &[NearbyMountIx],
         new_mounts: &[NearbyMountIx],
     ) -> bool {
-        old_mounts.iter().chain(new_mounts.iter()).any(|mount| {
-            mount.slot == NearbySlot::InFront || self.subtree_affects_registry_ix(mount.ix)
-        })
+        old_mounts
+            .iter()
+            .chain(new_mounts.iter())
+            .any(|mount| mount.slot.is_overlay() || self.subtree_affects_registry_ix(mount.ix))
     }
 
     pub fn iter_nodes(&self) -> impl Iterator<Item = &Element> {
@@ -1899,7 +2034,12 @@ impl ElementTree {
     /// Insert or update an element.
     pub fn insert(&mut self, element: Element) {
         let element_id = element.id;
+        let new_scroll_active = Self::element_has_active_scroll_offset(&element);
+        let mut removed_scroll_active = false;
         if let Some(&ix) = self.id_to_ix.get(&element.id) {
+            removed_scroll_active = self.nodes[ix]
+                .as_ref()
+                .is_some_and(Self::element_has_active_scroll_offset);
             self.nodes[ix] = Some(element);
             self.mark_measure_dirty_ix(ix);
         } else if let Some(ix) = self.free_list.pop() {
@@ -1911,6 +2051,11 @@ impl ElementTree {
             self.id_to_ix.insert(element.id, ix);
             self.nodes.push(Some(element));
             self.ensure_topology_capacity(ix);
+        }
+        if new_scroll_active {
+            self.scroll_cache_context_active = true;
+        } else if removed_scroll_active {
+            self.scroll_cache_context_active = self.any_active_scroll_offset();
         }
 
         if self.pending_root_id == Some(element_id) {
@@ -1927,6 +2072,9 @@ impl ElementTree {
 
     pub fn remove_node(&mut self, id: &NodeId) -> Option<Element> {
         let ix = self.id_to_ix.remove(id)?;
+        let removed_scroll_active = self.nodes[ix]
+            .as_ref()
+            .is_some_and(Self::element_has_active_scroll_offset);
         let dirty_parent = self
             .parent_link_of(ix)
             .map(|parent_link| match parent_link {
@@ -1951,6 +2099,9 @@ impl ElementTree {
 
         if let Some(parent_ix) = dirty_parent {
             self.mark_measure_dirty_ix(parent_ix);
+        }
+        if removed_scroll_active {
+            self.scroll_cache_context_active = self.any_active_scroll_offset();
         }
         removed
     }
@@ -1994,14 +2145,31 @@ impl ElementTree {
         id: &NodeId,
         invalidation: TreeInvalidation,
     ) {
+        let Some(ix) = self.ix_of(id) else {
+            return;
+        };
+
+        if let Some((host_ix, nearby_root_ix)) = self.nearby_boundary_for_ix(ix)
+            && invalidation.requires_resolve()
+        {
+            self.mark_nearby_layout_dirty_ix(
+                ix,
+                nearby_root_ix,
+                host_ix,
+                invalidation.requires_measure(),
+                invalidation != TreeInvalidation::Paint,
+            );
+            return;
+        }
+
         self.mark_refresh_dirty_for_invalidation(id, invalidation);
 
         if invalidation == TreeInvalidation::Structure {
-            self.mark_measure_dirty(id);
+            self.mark_measure_dirty_ix(ix);
         } else if invalidation.requires_measure() {
-            self.mark_measure_dirty_with_boundaries(id);
+            self.mark_measure_dirty_with_boundaries_ix(ix);
         } else if invalidation.requires_resolve() {
-            self.mark_resolve_dirty(id);
+            self.mark_resolve_dirty_ix(ix);
         }
     }
 
@@ -2017,9 +2185,9 @@ impl ElementTree {
             element.layout.measure_descendant_dirty = false;
             element.layout.resolve_dirty = true;
             element.layout.resolve_descendant_dirty = false;
+            element.refresh.mark_render_changed();
             element.refresh.render_dirty = true;
             element.refresh.render_descendant_dirty = false;
-            element.refresh.render_cache = None;
             element.refresh.registry_dirty = true;
             element.refresh.registry_descendant_dirty = false;
             element.refresh.registry_cache = None;
@@ -2034,13 +2202,51 @@ impl ElementTree {
         }
     }
 
+    pub(crate) fn mark_layout_scale_dirty_for_animation(&mut self, id: &NodeId) {
+        if let Some(ix) = self.ix_of(id) {
+            self.mark_measure_dirty_with_boundaries_ix(ix);
+            self.mark_measure_dirty_subtree_layout_only_ix(ix);
+        }
+    }
+
+    pub(crate) fn mark_layout_dirty_for_invalidation(
+        &mut self,
+        id: &NodeId,
+        invalidation: TreeInvalidation,
+    ) {
+        let Some(ix) = self.ix_of(id) else {
+            return;
+        };
+
+        if let Some((host_ix, nearby_root_ix)) = self.nearby_boundary_for_ix(ix)
+            && invalidation.requires_resolve()
+        {
+            self.mark_nearby_layout_dirty_ix(
+                ix,
+                nearby_root_ix,
+                host_ix,
+                invalidation.requires_measure(),
+                invalidation != TreeInvalidation::Paint,
+            );
+            return;
+        }
+
+        if invalidation == TreeInvalidation::Structure {
+            self.mark_dirty_ix(ix, true);
+        } else if invalidation.requires_measure() {
+            self.mark_measure_dirty_with_boundaries_ix(ix);
+        } else if invalidation.requires_resolve() {
+            self.mark_dirty_ix(ix, false);
+        }
+    }
+
     pub fn mark_all_resolve_dirty(&mut self) {
         self.iter_nodes_mut().for_each(|element| {
             element.layout.resolve_dirty = true;
             element.layout.resolve_descendant_dirty = false;
+            element.refresh.mark_render_changed();
             element.refresh.render_dirty = true;
             element.refresh.render_descendant_dirty = false;
-            element.refresh.render_cache = None;
             element.refresh.registry_dirty = true;
             element.refresh.registry_descendant_dirty = false;
             element.refresh.registry_cache = None;
@@ -2052,14 +2258,8 @@ impl ElementTree {
         self.mark_dirty_ix(ix, true);
     }
 
-    fn mark_measure_dirty_with_boundaries(&mut self, id: &NodeId) {
-        if let Some(ix) = self.ix_of(id) {
-            self.mark_measure_dirty_with_boundaries_ix(ix);
-        }
-    }
-
     fn mark_resolve_dirty_ix(&mut self, ix: NodeIx) {
-        self.mark_render_and_registry_refresh_dirty_ix(ix);
+        self.mark_render_refresh_dirty_ix(ix);
         self.mark_dirty_ix(ix, false);
     }
 
@@ -2082,7 +2282,9 @@ impl ElementTree {
         while let Some(ix) = current_ix {
             if let Some(element) = self.get_ix_mut(ix) {
                 if render {
-                    element.refresh.render_cache = None;
+                    element.refresh.mark_render_changed();
+                    element.refresh.render_layer_cache.borrow_mut().take();
+                    element.refresh.render_fragment_cache.borrow_mut().take();
                     if origin {
                         element.refresh.render_dirty = true;
                         element.refresh.render_descendant_dirty = false;
@@ -2144,6 +2346,44 @@ impl ElementTree {
         }
     }
 
+    fn mark_nearby_layout_dirty_ix(
+        &mut self,
+        ix: NodeIx,
+        nearby_root_ix: NodeIx,
+        host_ix: NodeIx,
+        measure_dirty: bool,
+        registry_dirty: bool,
+    ) {
+        if registry_dirty {
+            self.mark_render_and_registry_refresh_dirty_ix(ix);
+        } else {
+            self.mark_render_refresh_dirty_ix(ix);
+        }
+
+        let mut current_ix = Some(ix);
+        while let Some(current) = current_ix {
+            if let Some(element) = self.get_ix_mut(current) {
+                if measure_dirty {
+                    element.layout.measure_dirty = true;
+                    element.layout.measure_descendant_dirty = false;
+                }
+                element.layout.resolve_dirty = true;
+                element.layout.resolve_descendant_dirty = false;
+            }
+
+            if current == nearby_root_ix {
+                break;
+            }
+
+            current_ix = match self.parent_link_of(current) {
+                Some(ParentLink::Child { parent }) => Some(parent),
+                Some(ParentLink::Nearby { .. }) | None => None,
+            };
+        }
+
+        self.mark_nearby_topology_dirty_ix(host_ix, &[], registry_dirty);
+    }
+
     fn mark_measure_dirty_local_ix(&mut self, ix: NodeIx) {
         if let Some(element) = self.get_ix_mut(ix) {
             element.layout.measure_dirty = true;
@@ -2166,9 +2406,9 @@ impl ElementTree {
             element.layout.measure_descendant_dirty = false;
             element.layout.resolve_dirty = true;
             element.layout.resolve_descendant_dirty = false;
+            element.refresh.mark_render_changed();
             element.refresh.render_dirty = true;
             element.refresh.render_descendant_dirty = false;
-            element.refresh.render_cache = None;
             element.refresh.registry_dirty = true;
             element.refresh.registry_descendant_dirty = false;
             element.refresh.registry_cache = None;
@@ -2176,6 +2416,26 @@ impl ElementTree {
 
         for child_ix in child_ixs.into_iter().chain(nearby_ixs) {
             self.mark_measure_dirty_subtree_ix(child_ix);
+        }
+    }
+
+    fn mark_measure_dirty_subtree_layout_only_ix(&mut self, ix: NodeIx) {
+        let child_ixs = self.child_ixs(ix);
+        let nearby_ixs: Vec<NodeIx> = self
+            .nearby_ixs(ix)
+            .into_iter()
+            .map(|mount| mount.ix)
+            .collect();
+
+        if let Some(element) = self.get_ix_mut(ix) {
+            element.layout.measure_dirty = true;
+            element.layout.measure_descendant_dirty = false;
+            element.layout.resolve_dirty = true;
+            element.layout.resolve_descendant_dirty = false;
+        }
+
+        for child_ix in child_ixs.into_iter().chain(nearby_ixs) {
+            self.mark_measure_dirty_subtree_layout_only_ix(child_ix);
         }
     }
 
@@ -2206,6 +2466,7 @@ impl ElementTree {
 
         let mut current_link = self.parent_link_of(ix);
         let mut measure_propagates = true;
+        let mut resolve_propagates = true;
 
         while let Some(parent_link) = current_link {
             let parent_ix = parent_ix_from_link(Some(parent_link))
@@ -2218,6 +2479,7 @@ impl ElementTree {
                 ParentLink::Nearby { .. } => true,
             };
             let mark_parent_measure_dirty = measure_propagates && parent_depends_on_child_measure;
+            let mark_parent_resolve_dirty = resolve_propagates;
 
             if let Some(parent) = self.get_ix_mut(parent_ix) {
                 if mark_parent_measure_dirty {
@@ -2226,11 +2488,17 @@ impl ElementTree {
                 } else if !parent.layout.measure_dirty {
                     parent.layout.measure_descendant_dirty = true;
                 }
-                parent.layout.resolve_dirty = true;
-                parent.layout.resolve_descendant_dirty = false;
+
+                if mark_parent_resolve_dirty {
+                    parent.layout.resolve_dirty = true;
+                    parent.layout.resolve_descendant_dirty = false;
+                } else if !parent.layout.resolve_dirty {
+                    parent.layout.resolve_descendant_dirty = true;
+                }
             }
 
             measure_propagates = mark_parent_measure_dirty;
+            resolve_propagates = mark_parent_measure_dirty;
             current_link = self.parent_link_of(parent_ix);
         }
     }
@@ -2291,6 +2559,8 @@ impl ElementTree {
         self.id_to_ix.clear();
         self.nodes.clear();
         self.free_list.clear();
+        self.scroll_refresh_dirty = false;
+        self.scroll_cache_context_active = false;
         self.reset_layout_cache_stats();
         self.reset_topology();
     }
@@ -2657,6 +2927,10 @@ impl ElementTree {
         for &child_ix in &child_ixs {
             self.ensure_topology_capacity(child_ix);
         }
+        let registry_dirty = self.subtree_affects_registry_ix(parent_ix)
+            || child_ixs
+                .iter()
+                .any(|&child_ix| self.subtree_affects_registry_ix(child_ix));
 
         let changed = {
             #[cfg(test)]
@@ -2685,7 +2959,17 @@ impl ElementTree {
             self.bump_children_version(parent_ix);
         }
 
-        self.mark_measure_dirty_ix(parent_ix);
+        if let Some((host_ix, nearby_root_ix)) = self.nearby_boundary_for_ix(parent_ix) {
+            self.mark_nearby_layout_dirty_ix(
+                parent_ix,
+                nearby_root_ix,
+                host_ix,
+                true,
+                registry_dirty,
+            );
+        } else {
+            self.mark_measure_dirty_ix(parent_ix);
+        }
     }
 
     fn set_paint_children_ix(&mut self, parent_ix: NodeIx, child_ixs: Vec<NodeIx>) {
@@ -2798,25 +3082,6 @@ impl ElementTree {
         }
     }
 
-    pub fn render_topology_dependency_key_ix(&self, ix: NodeIx) -> RenderTopologyDependencyKey {
-        self.ensure_topology();
-
-        let versions = self
-            .get_ix(ix)
-            .map(|element| element.layout.topology_versions)
-            .unwrap_or_default();
-        let (child_count, paint_child_count, nearby_count) = self.topology_dependency_counts(ix);
-
-        RenderTopologyDependencyKey {
-            children_version: versions.children,
-            paint_children_version: versions.paint_children,
-            nearby_version: versions.nearby,
-            child_count,
-            paint_child_count,
-            nearby_count,
-        }
-    }
-
     fn topology_dependency_counts(&self, ix: NodeIx) -> (usize, usize, usize) {
         #[cfg(test)]
         {
@@ -2916,23 +3181,19 @@ impl ElementTree {
             if !supports_mouse_over_tracking(&element.layout.effective) {
                 let changed = element.runtime.mouse_over_active;
                 element.runtime.mouse_over_active = false;
-                TreeInvalidation::when_changed(changed, TreeInvalidation::Registry)
+                TreeInvalidation::when_changed(changed, TreeInvalidation::None)
             } else {
                 let current = element.runtime.mouse_over_active;
                 if current == active {
                     TreeInvalidation::None
                 } else {
                     element.runtime.mouse_over_active = active;
-                    classify_interaction_style(element.layout.effective.mouse_over.as_ref())
-                        .join(TreeInvalidation::Registry)
+                    classify_interaction_runtime_state(element.layout.effective.mouse_over.as_ref())
                 }
             }
         };
 
         self.mark_measure_dirty_for_invalidation(id, invalidation);
-        if invalidation.is_dirty() {
-            self.mark_registry_refresh_dirty(id);
-        }
         invalidation
     }
 
@@ -2946,23 +3207,19 @@ impl ElementTree {
             if element.layout.effective.mouse_down.is_none() {
                 let changed = element.runtime.mouse_down_active;
                 element.runtime.mouse_down_active = false;
-                TreeInvalidation::when_changed(changed, TreeInvalidation::Registry)
+                TreeInvalidation::when_changed(changed, TreeInvalidation::None)
             } else {
                 let current = element.runtime.mouse_down_active;
                 if current == active {
                     TreeInvalidation::None
                 } else {
                     element.runtime.mouse_down_active = active;
-                    classify_interaction_style(element.layout.effective.mouse_down.as_ref())
-                        .join(TreeInvalidation::Registry)
+                    classify_interaction_runtime_state(element.layout.effective.mouse_down.as_ref())
                 }
             }
         };
 
         self.mark_measure_dirty_for_invalidation(id, invalidation);
-        if invalidation.is_dirty() {
-            self.mark_registry_refresh_dirty(id);
-        }
         invalidation
     }
 
@@ -3051,8 +3308,13 @@ impl ElementTree {
         };
 
         if changed {
-            self.mark_measure_dirty(id);
-            TreeInvalidation::Measure
+            let invalidation = self
+                .get(id)
+                .filter(|element| text_input_content_change_can_refresh_without_layout(element))
+                .map(|_| TreeInvalidation::Paint)
+                .unwrap_or(TreeInvalidation::Resolve);
+            self.mark_measure_dirty_for_invalidation(id, invalidation);
+            invalidation
         } else {
             TreeInvalidation::None
         }
@@ -3107,10 +3369,12 @@ impl ElementTree {
         };
 
         let mut changed = false;
+        let mut focus_changed = false;
 
         if element.runtime.text_input_focused != focused {
             element.runtime.text_input_focused = focused;
             changed = true;
+            focus_changed = true;
         }
 
         if element.runtime.text_input_cursor != next_cursor {
@@ -3136,14 +3400,16 @@ impl ElementTree {
         element.normalize_extracted_state();
 
         let invalidation = TreeInvalidation::when_changed(changed, TreeInvalidation::Paint);
-        if invalidation.is_dirty() {
+        if focus_changed {
             self.mark_render_and_registry_refresh_dirty(id);
+        } else if invalidation.is_dirty() {
+            self.mark_refresh_dirty_for_invalidation(id, invalidation);
         }
         invalidation
     }
 
     pub fn set_slider_value(&mut self, id: &NodeId, value: f64) -> TreeInvalidation {
-        let changed = {
+        let value_changed = {
             let Some(element) = self.get_mut(id) else {
                 return TreeInvalidation::None;
             };
@@ -3155,27 +3421,23 @@ impl ElementTree {
             let value = normalize_slider_value(&element.layout.effective, value);
             let prev_base = element.spec.declared.slider_value.unwrap_or(0.0);
             let prev_attrs = element.layout.effective.slider_value.unwrap_or(0.0);
-            let mut changed =
+            let value_changed =
                 !f64_values_equal(prev_base, value) || !f64_values_equal(prev_attrs, value);
 
             element.spec.declared.slider_value = Some(value);
             element.layout.effective.slider_value = Some(value);
-
-            if element.runtime.slider_patch_value.take().is_some() {
-                changed = true;
-            }
+            element.runtime.slider_patch_value = None;
 
             if element.runtime.slider_value_origin != SliderValueOrigin::Event {
                 element.runtime.slider_value_origin = SliderValueOrigin::Event;
-                changed = true;
             }
 
-            changed
+            value_changed
         };
 
-        if changed {
-            self.mark_measure_dirty(id);
-            TreeInvalidation::Measure
+        if value_changed {
+            self.mark_measure_dirty_for_invalidation(id, TreeInvalidation::Resolve);
+            TreeInvalidation::Resolve
         } else {
             TreeInvalidation::None
         }
@@ -3208,6 +3470,13 @@ impl ElementTree {
         match axis {
             ScrollAxis::X => element.layout.scroll_x = next,
             ScrollAxis::Y => element.layout.scroll_y = next,
+        }
+        let element_scroll_active = Self::element_has_active_scroll_offset(element);
+        self.scroll_refresh_dirty = true;
+        if element_scroll_active {
+            self.scroll_cache_context_active = true;
+        } else {
+            self.scroll_cache_context_active = self.any_active_scroll_offset();
         }
         self.mark_render_and_registry_refresh_dirty(id);
         TreeInvalidation::Paint
@@ -3261,6 +3530,7 @@ pub(crate) fn parent_ix_from_link(parent_link: Option<ParentLink>) -> Option<Nod
 fn element_affects_registry(element: &Element) -> bool {
     let attrs = &element.spec.declared;
     element.spec.kind.is_text_input_family()
+        || element.spec.kind == ElementKind::Slider
         || element.runtime.text_input_focused
         || element.runtime.mouse_over_active
         || element.runtime.mouse_down_active
@@ -3293,10 +3563,37 @@ fn element_affects_registry(element: &Element) -> bool {
         || attrs.ghost_scrollbar_y.unwrap_or(false)
 }
 
+fn classify_interaction_runtime_state(style: Option<&MouseOverAttrs>) -> TreeInvalidation {
+    match classify_interaction_style(style) {
+        TreeInvalidation::Registry => TreeInvalidation::None,
+        invalidation => invalidation,
+    }
+}
+
 fn parent_measure_depends_on_child_measure(parent: &Element) -> bool {
     !matches!(parent.spec.kind, ElementKind::El | ElementKind::None)
         || !measure_length_is_child_independent(parent.layout.effective.width.as_ref())
         || !measure_length_is_child_independent(parent.layout.effective.height.as_ref())
+}
+
+fn text_input_content_change_can_refresh_without_layout(element: &Element) -> bool {
+    if content_box_is_layout_independent(&element.layout.effective) {
+        return true;
+    }
+
+    element.spec.kind == ElementKind::TextInput
+        && !length_depends_on_text_input_content(element.layout.effective.width.as_ref())
+}
+
+fn length_depends_on_text_input_content(length: Option<&Length>) -> bool {
+    match length {
+        None | Some(Length::Content) => true,
+        Some(Length::Fill | Length::FillWeighted(_) | Length::Px(_)) => false,
+        Some(Length::Min(left, right) | Length::Max(left, right)) => {
+            length_depends_on_text_input_content(Some(left.as_ref()))
+                || length_depends_on_text_input_content(Some(right.as_ref()))
+        }
+    }
 }
 
 fn measure_length_is_child_independent(length: Option<&Length>) -> bool {
@@ -3524,17 +3821,19 @@ mod tests {
         tree.clear_refresh_dirty();
         tree.mark_refresh_dirty_for_invalidation(&child_id, TreeInvalidation::Measure);
         assert!(tree.has_render_refresh_damage());
-        assert!(tree.has_registry_refresh_damage());
+        assert!(!tree.has_registry_refresh_damage());
         assert!(tree.get(&child_id).unwrap().refresh.render_dirty);
-        assert!(tree.get(&child_id).unwrap().refresh.registry_dirty);
+        assert!(!tree.get(&child_id).unwrap().refresh.registry_dirty);
     }
 
     #[test]
     fn test_scrollbar_hover_axis_is_tri_state() {
         let id = NodeId::from_term_bytes(vec![1]);
-        let mut attrs = Attrs::default();
-        attrs.scrollbar_x = Some(true);
-        attrs.scrollbar_y = Some(true);
+        let attrs = Attrs {
+            scrollbar_x: Some(true),
+            scrollbar_y: Some(true),
+            ..Attrs::default()
+        };
         let mut element = Element::with_attrs(id, ElementKind::El, Vec::new(), attrs);
         element.layout.frame = Some(Frame {
             x: 0.0,
@@ -3548,6 +3847,7 @@ mod tests {
         let mut tree = ElementTree::new();
         tree.insert(element);
         tree.set_root_id(id);
+        tree.clear_refresh_dirty();
 
         assert!(tree.set_scrollbar_x_hover(&id, true).is_dirty());
         assert_eq!(
@@ -3569,9 +3869,11 @@ mod tests {
     #[test]
     fn test_apply_scroll_axis_helpers() {
         let id = NodeId::from_term_bytes(vec![1]);
-        let mut attrs = Attrs::default();
-        attrs.scrollbar_x = Some(true);
-        attrs.scrollbar_y = Some(true);
+        let attrs = Attrs {
+            scrollbar_x: Some(true),
+            scrollbar_y: Some(true),
+            ..Attrs::default()
+        };
         let mut element = Element::with_attrs(id, ElementKind::El, Vec::new(), attrs);
         element.layout.frame = Some(Frame {
             x: 0.0,
@@ -3585,6 +3887,7 @@ mod tests {
         let mut tree = ElementTree::new();
         tree.insert(element);
         tree.set_root_id(id);
+        tree.clear_refresh_dirty();
 
         assert!(tree.apply_scroll_x(&id, -30.0).is_dirty());
         assert_eq!(tree.get(&id).unwrap().layout.scroll_x, 30.0);
@@ -3599,9 +3902,11 @@ mod tests {
     #[test]
     fn test_apply_scroll_axis_helpers_clamp_to_bounds() {
         let id = NodeId::from_term_bytes(vec![1]);
-        let mut attrs = Attrs::default();
-        attrs.scrollbar_x = Some(true);
-        attrs.scrollbar_y = Some(true);
+        let attrs = Attrs {
+            scrollbar_x: Some(true),
+            scrollbar_y: Some(true),
+            ..Attrs::default()
+        };
         let mut element = Element::with_attrs(id, ElementKind::El, Vec::new(), attrs);
         element.layout.frame = Some(Frame {
             x: 0.0,
@@ -3674,11 +3979,13 @@ mod tests {
     #[test]
     fn test_set_mouse_over_active_toggles_state() {
         let id = NodeId::from_term_bytes(vec![1]);
-        let mut attrs = Attrs::default();
-        attrs.mouse_over = Some(MouseOverAttrs {
-            alpha: Some(0.6),
-            ..Default::default()
-        });
+        let attrs = Attrs {
+            mouse_over: Some(MouseOverAttrs {
+                alpha: Some(0.6),
+                ..Default::default()
+            }),
+            ..Attrs::default()
+        };
         let mut element = Element::with_attrs(id, ElementKind::El, Vec::new(), attrs);
         element.layout.frame = Some(Frame {
             x: 0.0,
@@ -3692,22 +3999,27 @@ mod tests {
         let mut tree = ElementTree::new();
         tree.insert(element);
         tree.set_root_id(id);
+        tree.clear_refresh_dirty();
 
         assert!(tree.set_mouse_over_active(&id, true).is_dirty());
         assert!(tree.get(&id).unwrap().runtime.mouse_over_active);
+        assert!(!tree.has_registry_refresh_damage());
 
         assert!(tree.set_mouse_over_active(&id, true).is_none());
 
         assert!(tree.set_mouse_over_active(&id, false).is_dirty());
         assert!(!tree.get(&id).unwrap().runtime.mouse_over_active);
+        assert!(!tree.has_registry_refresh_damage());
     }
 
     #[test]
     fn test_set_mouse_over_active_tracks_event_only_hover() {
         let id = NodeId::from_term_bytes(vec![2]);
-        let mut attrs = Attrs::default();
-        attrs.on_mouse_enter = Some(true);
-        attrs.on_mouse_leave = Some(true);
+        let attrs = Attrs {
+            on_mouse_enter: Some(true),
+            on_mouse_leave: Some(true),
+            ..Attrs::default()
+        };
         let mut element = Element::with_attrs(id, ElementKind::El, Vec::new(), attrs);
         element.layout.frame = Some(Frame {
             x: 0.0,
@@ -3721,14 +4033,17 @@ mod tests {
         let mut tree = ElementTree::new();
         tree.insert(element);
         tree.set_root_id(id);
+        tree.clear_refresh_dirty();
 
-        assert!(tree.set_mouse_over_active(&id, true).is_dirty());
+        assert!(tree.set_mouse_over_active(&id, true).is_none());
         assert!(tree.get(&id).unwrap().runtime.mouse_over_active);
+        assert!(!tree.has_registry_refresh_damage());
 
         assert!(tree.set_mouse_over_active(&id, true).is_none());
 
-        assert!(tree.set_mouse_over_active(&id, false).is_dirty());
+        assert!(tree.set_mouse_over_active(&id, false).is_none());
         assert!(!tree.get(&id).unwrap().runtime.mouse_over_active);
+        assert!(!tree.has_registry_refresh_damage());
     }
 
     #[test]
@@ -3755,11 +4070,13 @@ mod tests {
     #[test]
     fn test_set_mouse_down_active_toggles_state() {
         let id = NodeId::from_term_bytes(vec![12]);
-        let mut attrs = Attrs::default();
-        attrs.mouse_down = Some(MouseOverAttrs {
-            alpha: Some(0.7),
-            ..Default::default()
-        });
+        let attrs = Attrs {
+            mouse_down: Some(MouseOverAttrs {
+                alpha: Some(0.7),
+                ..Default::default()
+            }),
+            ..Attrs::default()
+        };
         let mut element = Element::with_attrs(id, ElementKind::El, Vec::new(), attrs);
         element.layout.frame = Some(Frame {
             x: 0.0,
@@ -3812,12 +4129,14 @@ mod tests {
     #[test]
     fn test_set_text_input_content_updates_and_clamps_runtime() {
         let id = NodeId::from_term_bytes(vec![2]);
-        let mut attrs = Attrs::default();
-        attrs.content = Some("hello".to_string());
-        attrs.text_input_cursor = Some(10);
-        attrs.text_input_selection_anchor = Some(10);
-        attrs.text_input_preedit = Some("pre".to_string());
-        attrs.text_input_preedit_cursor = Some((2, 2));
+        let attrs = Attrs {
+            content: Some("hello".to_string()),
+            text_input_cursor: Some(10),
+            text_input_selection_anchor: Some(10),
+            text_input_preedit: Some("pre".to_string()),
+            text_input_preedit_cursor: Some((2, 2)),
+            ..Attrs::default()
+        };
         let mut element = Element::with_attrs(id, ElementKind::TextInput, Vec::new(), attrs);
         element.layout.frame = Some(Frame {
             x: 0.0,
@@ -3855,10 +4174,55 @@ mod tests {
     }
 
     #[test]
+    fn test_set_fixed_text_input_content_is_paint_only() {
+        let id = NodeId::from_term_bytes(vec![15]);
+        let attrs = Attrs {
+            width: Some(Length::Px(180.0)),
+            height: Some(Length::Px(32.0)),
+            content: Some("hello".to_string()),
+            text_input_cursor: Some(5),
+            ..Attrs::default()
+        };
+        let element = Element::with_attrs(id, ElementKind::TextInput, Vec::new(), attrs);
+
+        let mut tree = ElementTree::new();
+        tree.insert(element);
+        tree.set_root_id(id);
+
+        assert_eq!(
+            tree.set_text_input_content(&id, "hello!".to_string()),
+            TreeInvalidation::Paint
+        );
+    }
+
+    #[test]
+    fn test_set_fill_width_text_input_content_is_paint_only() {
+        let id = NodeId::from_term_bytes(vec![16]);
+        let attrs = Attrs {
+            width: Some(Length::Fill),
+            content: Some("hello".to_string()),
+            text_input_cursor: Some(5),
+            ..Attrs::default()
+        };
+        let element = Element::with_attrs(id, ElementKind::TextInput, Vec::new(), attrs);
+
+        let mut tree = ElementTree::new();
+        tree.insert(element);
+        tree.set_root_id(id);
+
+        assert_eq!(
+            tree.set_text_input_content(&id, "hello!".to_string()),
+            TreeInvalidation::Paint
+        );
+    }
+
+    #[test]
     fn test_set_text_input_content_marks_event_origin_without_content_change() {
         let id = NodeId::from_term_bytes(vec![14]);
-        let mut attrs = Attrs::default();
-        attrs.content = Some("same".to_string());
+        let attrs = Attrs {
+            content: Some("same".to_string()),
+            ..Attrs::default()
+        };
         let element = Element::with_attrs(id, ElementKind::TextInput, Vec::new(), attrs);
 
         let mut tree = ElementTree::new();
@@ -3882,8 +4246,10 @@ mod tests {
     #[test]
     fn test_set_text_input_runtime_normalizes_focus_selection_and_preedit() {
         let id = NodeId::from_term_bytes(vec![3]);
-        let mut attrs = Attrs::default();
-        attrs.content = Some("abcd".to_string());
+        let attrs = Attrs {
+            content: Some("abcd".to_string()),
+            ..Attrs::default()
+        };
         let mut element = Element::with_attrs(id, ElementKind::TextInput, Vec::new(), attrs);
         element.layout.frame = Some(Frame {
             x: 0.0,
@@ -3990,8 +4356,10 @@ mod tests {
         let inline =
             Element::with_attrs(inline_id, ElementKind::Text, Vec::new(), Attrs::default());
 
-        let mut float_attrs = Attrs::default();
-        float_attrs.align_x = Some(AlignX::Left);
+        let float_attrs = Attrs {
+            align_x: Some(AlignX::Left),
+            ..Attrs::default()
+        };
         let float = Element::with_attrs(float_id, ElementKind::El, Vec::new(), float_attrs);
 
         let mut tree = ElementTree::new();

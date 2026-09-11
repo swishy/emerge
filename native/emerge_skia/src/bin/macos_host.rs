@@ -39,7 +39,8 @@ mod app {
         },
         keys::CanonicalKey,
         renderer::{
-            CleanSubtreeCacheConfig, RenderFrame, RenderState, RendererCacheConfig, SceneRenderer,
+            RenderFrame, RenderState, RendererCacheConfig, RendererPaintLayerCacheConfig,
+            SceneRenderer,
         },
         runtime::tree_update::{
             TreeUpdateDecodePolicy, TreeUpdateEffect, TreeUpdateEngine, TreeUpdateOptions,
@@ -1748,11 +1749,11 @@ mod app {
         )?;
         let _ = handle_runtime_input(
             session,
-            InputEvent::Resized {
-                width: session.logical_size.0,
-                height: session.logical_size.1,
-                scale_factor: session.scale_factor,
-            },
+            InputEvent::resized(
+                session.logical_size.0,
+                session.logical_size.1,
+                session.scale_factor,
+            ),
         );
 
         if draw_now {
@@ -1785,11 +1786,11 @@ mod app {
                 if !session.initial_notifications_sent {
                     let _ = handle_runtime_input(
                         session,
-                        InputEvent::Resized {
-                            width: session.logical_size.0,
-                            height: session.logical_size.1,
-                            scale_factor: session.scale_factor,
-                        },
+                        InputEvent::resized(
+                            session.logical_size.0,
+                            session.logical_size.1,
+                            session.scale_factor,
+                        ),
                     );
                     let _ = handle_runtime_input(
                         session,
@@ -1982,6 +1983,7 @@ mod app {
                     Default::default(),
                     metrics.render_size.0,
                     metrics.render_size.1,
+                    1.0,
                 ),
                 render_state: RenderState::default(),
                 logical_size: metrics.render_size,
@@ -2187,6 +2189,7 @@ mod app {
                     .expect("raster fallback surface should resize");
             }
         }
+        session.renderer.invalidate_visible_frame_fingerprint();
     }
 
     fn draw_metal_surface(
@@ -2302,6 +2305,20 @@ mod app {
 
     fn draw_session(session: &mut HostSession) -> Result<(), String> {
         let draw_started_at = Instant::now();
+        if let SessionSurface::Metal(surface) = &session.surface {
+            let size = surface.metal_layer.drawableSize();
+            let dimensions = (size.width.max(1.0) as u32, size.height.max(1.0) as u32);
+            if session
+                .renderer
+                .can_skip_unchanged_visible_frame(&session.render_state, dimensions)
+            {
+                session.render_state.pipeline_submitted_at = None;
+                session.render_state.pipeline_render_queued_at = None;
+                session.dirty = false;
+                return Ok(());
+            }
+        }
+
         let swap_done_at = match &mut session.surface {
             SessionSurface::Metal(surface) => draw_metal_surface(
                 surface,
@@ -2744,6 +2761,7 @@ mod app {
                 width,
                 height,
                 scale_factor,
+                ..
             } => notify_resized(state, session_id, (*width, *height), *scale_factor),
             InputEvent::Focused { focused } => notify_focused(state, session_id, *focused),
             InputEvent::Key { key, action, mods } => {
@@ -3766,16 +3784,22 @@ mod app {
         cursor: &mut usize,
     ) -> Option<RendererCacheConfig> {
         let max_new_payloads_per_frame = decode_u32(payload, cursor)?;
+        let enabled = decode_u8(payload, cursor)? != 0;
         let max_entries = usize::try_from(decode_u64(payload, cursor)?).ok()?;
         let max_bytes = decode_u64(payload, cursor)?;
         let max_entry_bytes = decode_u64(payload, cursor)?;
+        let min_visible_before_store = decode_u64(payload, cursor)?;
+        let max_stale_frames = decode_u64(payload, cursor)?;
 
         Some(RendererCacheConfig {
+            enabled,
             max_new_payloads_per_frame,
-            clean_subtree: CleanSubtreeCacheConfig {
+            paint_layer: RendererPaintLayerCacheConfig {
                 max_entries,
                 max_bytes,
                 max_entry_bytes,
+                min_visible_before_store,
+                max_stale_frames,
             },
         })
     }

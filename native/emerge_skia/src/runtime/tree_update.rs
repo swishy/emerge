@@ -7,16 +7,19 @@ use crate::{
     stats::{RendererStatsCollector, earliest_pipeline_instant},
     tree::{
         animation::AnimationRuntime,
-        element::ElementTree,
+        element::{ElementTree, NodeId},
         invalidation::{
             RefreshAvailability, RefreshDecision, TreeInvalidation, decide_refresh_action,
         },
         layout::{
             FrameAttrsPreparation, LayoutOutput, layout_and_refresh_default,
-            layout_and_refresh_prepared_default, prepare_animation_frame_attrs_for_update,
+            layout_and_refresh_prepared_default_reusing_clean_registry,
+            layout_and_refresh_prepared_default_reusing_clean_registry_timed,
+            prepare_animation_frame_attrs_for_update, prepare_dirty_frame_attrs_for_update,
             prepare_frame_attrs_for_update, prepared_root_has_frame,
             refresh_prepared_default_reusing_clean_registry, refresh_reusing_clean_registry,
         },
+        patch::Patch,
     },
 };
 
@@ -68,12 +71,17 @@ pub struct TreeUpdateEngine {
 }
 
 impl TreeUpdateEngine {
-    pub fn new(initial_tree: ElementTree, initial_width: u32, initial_height: u32) -> Self {
+    pub fn new(
+        initial_tree: ElementTree,
+        initial_width: u32,
+        initial_height: u32,
+        initial_scale: f32,
+    ) -> Self {
         Self {
             tree: initial_tree,
             width: (initial_width as f32).max(1.0),
             height: (initial_height as f32).max(1.0),
-            scale: 1.0,
+            scale: initial_scale.max(0.1),
             cached_rebuild: None,
             animation_runtime: AnimationRuntime::default(),
             latest_animation_sample_time: None,
@@ -119,6 +127,8 @@ impl TreeUpdateEngine {
         let mut mouse_over_active_state = HashMap::new();
         let mut mouse_down_active_state = HashMap::new();
         let mut focused_active_state = HashMap::new();
+        let mut frame_attr_dirty_ids = Vec::new();
+        let mut frame_attr_dirty_ids_complete = true;
         let mut patch_processing_started_ats = Vec::new();
         let mut pipeline_submitted_at = None;
         let mut invalidation = TreeInvalidation::None;
@@ -131,6 +141,8 @@ impl TreeUpdateEngine {
         let mut animation_sample_requested = false;
 
         for message in flat {
+            registry_requested |= message.requires_listener_registry_response();
+
             match message {
                 TreeMsg::Stop => return Ok(TreeUpdateEffect::Stop),
                 TreeMsg::Batch(_) => {
@@ -173,9 +185,17 @@ impl TreeUpdateEngine {
                             continue;
                         }
                     };
+                    let patch_frame_attr_dirty_ids = patch_set_attrs_ids(&patches);
                     match crate::tree::patch::apply_patches(&mut self.tree, patches) {
                         Ok(patch_invalidation) => {
                             invalidation.add(patch_invalidation);
+                            if patch_invalidation.can_refresh_only() {
+                                if let Some(ids) = patch_frame_attr_dirty_ids {
+                                    extend_frame_attr_dirty_ids(&mut frame_attr_dirty_ids, ids);
+                                } else {
+                                    frame_attr_dirty_ids_complete = false;
+                                }
+                            }
                         }
                         Err(err) => {
                             record_patch_process_stat(options.stats, patch_started_at);
@@ -242,7 +262,14 @@ impl TreeUpdateEngine {
                     element_id,
                     content,
                 } => {
-                    invalidation.add(self.tree.set_text_input_content(&element_id, content));
+                    let update_invalidation =
+                        self.tree.set_text_input_content(&element_id, content);
+                    record_frame_attr_dirty_id(
+                        &mut frame_attr_dirty_ids,
+                        element_id,
+                        update_invalidation,
+                    );
+                    invalidation.add(update_invalidation);
                 }
                 TreeMsg::SetTextInputRuntime {
                     element_id,
@@ -252,17 +279,29 @@ impl TreeUpdateEngine {
                     preedit,
                     preedit_cursor,
                 } => {
-                    invalidation.add(self.tree.set_text_input_runtime(
+                    let update_invalidation = self.tree.set_text_input_runtime(
                         &element_id,
                         focused,
                         cursor,
                         selection_anchor,
                         preedit,
                         preedit_cursor,
-                    ));
+                    );
+                    record_frame_attr_dirty_id(
+                        &mut frame_attr_dirty_ids,
+                        element_id,
+                        update_invalidation,
+                    );
+                    invalidation.add(update_invalidation);
                 }
                 TreeMsg::SetSliderValue { element_id, value } => {
-                    invalidation.add(self.tree.set_slider_value(&element_id, value));
+                    let update_invalidation = self.tree.set_slider_value(&element_id, value);
+                    record_frame_attr_dirty_id(
+                        &mut frame_attr_dirty_ids,
+                        element_id,
+                        update_invalidation,
+                    );
+                    invalidation.add(update_invalidation);
                 }
                 TreeMsg::AnimationPulse {
                     presented_at,
@@ -318,13 +357,19 @@ impl TreeUpdateEngine {
             invalidation.add(self.tree.set_scrollbar_y_hover(&id, hovered));
         }
         for (id, active) in &mouse_over_active_state {
-            invalidation.add(self.tree.set_mouse_over_active(id, *active));
+            let update_invalidation = self.tree.set_mouse_over_active(id, *active);
+            record_frame_attr_dirty_id(&mut frame_attr_dirty_ids, *id, update_invalidation);
+            invalidation.add(update_invalidation);
         }
         for (id, active) in mouse_down_active_state {
-            invalidation.add(self.tree.set_mouse_down_active(&id, active));
+            let update_invalidation = self.tree.set_mouse_down_active(&id, active);
+            record_frame_attr_dirty_id(&mut frame_attr_dirty_ids, id, update_invalidation);
+            invalidation.add(update_invalidation);
         }
         for (id, active) in focused_active_state {
-            invalidation.add(self.tree.set_focused_active(&id, active));
+            let update_invalidation = self.tree.set_focused_active(&id, active);
+            record_frame_attr_dirty_id(&mut frame_attr_dirty_ids, id, update_invalidation);
+            invalidation.add(update_invalidation);
         }
 
         let update_started_at = Instant::now();
@@ -361,9 +406,11 @@ impl TreeUpdateEngine {
             }
         }
 
-        let should_prepare_frame = plan.invalidation.is_dirty()
+        let should_prepare_frame = plan.invalidation.requires_recompute()
             || animation_sample_requested
-            || !self.animation_runtime.is_empty();
+            || !self.animation_runtime.is_empty()
+            || (!frame_attr_dirty_ids.is_empty() && plan.invalidation.can_refresh_only())
+            || (!frame_attr_dirty_ids_complete && plan.invalidation.can_refresh_only());
 
         if should_prepare_frame {
             self.tree.set_layout_cache_stats_enabled(
@@ -371,6 +418,9 @@ impl TreeUpdateEngine {
                     .stats
                     .is_some_and(|stats| stats.layout_cache_enabled()),
             );
+            let can_prepare_dirty_incrementally = plan.invalidation.can_refresh_only()
+                && frame_attr_dirty_ids_complete
+                && !had_transient_animations;
             let preparation = if animation_sample_requested
                 && !plan.invalidation.is_dirty()
                 && !self.animation_runtime.is_empty()
@@ -381,6 +431,14 @@ impl TreeUpdateEngine {
                     self.scale,
                     &self.animation_runtime,
                     sample_time,
+                )
+            } else if can_prepare_dirty_incrementally {
+                prepare_dirty_frame_attrs_for_update(
+                    &mut self.tree,
+                    self.scale,
+                    (!self.animation_runtime.is_empty()).then_some(&self.animation_runtime),
+                    sample_time,
+                    &frame_attr_dirty_ids,
                 )
             } else {
                 prepare_frame_attrs_for_update(
@@ -490,8 +548,10 @@ impl TreeUpdateEngine {
                     stats.record_refresh(update_started_at.elapsed());
                 }
 
+                let mut output = update.output;
+                self.force_cached_registry_publish_if_requested(registry_requested, &mut output);
                 self.layout_effect(
-                    update.output,
+                    output,
                     pipeline_submitted_at,
                     tree_batch_started_at,
                     animation_trace,
@@ -501,8 +561,27 @@ impl TreeUpdateEngine {
                 assets::ensure_tree_sources(&self.tree);
 
                 let constraint = crate::tree::layout::Constraint::new(self.width, self.height);
-                let update = if let Some(preparation) = plan.preparation {
-                    layout_and_refresh_prepared_default(&mut self.tree, constraint, preparation)
+                let (update, timed_layout) = if let Some(preparation) = plan.preparation {
+                    if options.stats.is_some() {
+                        let (update, timing) =
+                            layout_and_refresh_prepared_default_reusing_clean_registry_timed(
+                                &mut self.tree,
+                                constraint,
+                                preparation,
+                                self.cached_rebuild.as_ref(),
+                            );
+                        (update, Some(timing))
+                    } else {
+                        (
+                            layout_and_refresh_prepared_default_reusing_clean_registry(
+                                &mut self.tree,
+                                constraint,
+                                preparation,
+                                self.cached_rebuild.as_ref(),
+                            ),
+                            None,
+                        )
+                    }
                 } else {
                     self.tree.set_layout_cache_stats_enabled(
                         options
@@ -510,14 +589,23 @@ impl TreeUpdateEngine {
                             .is_some_and(|stats| stats.layout_cache_enabled()),
                     );
                     let output = layout_and_refresh_default(&mut self.tree, constraint, self.scale);
-                    crate::tree::layout::LayoutUpdateOutput {
-                        output,
-                        layout_performed: true,
-                    }
+                    (
+                        crate::tree::layout::LayoutUpdateOutput {
+                            output,
+                            layout_performed: true,
+                        },
+                        None,
+                    )
                 };
 
                 if let Some(stats) = options.stats {
-                    if update.layout_performed {
+                    if let Some(timing) = timed_layout {
+                        if update.layout_performed {
+                            stats.record_layout(timing.layout);
+                            stats.record_layout_cache(self.tree.layout_cache_stats());
+                        }
+                        stats.record_refresh(timing.refresh);
+                    } else if update.layout_performed {
                         stats.record_layout(update_started_at.elapsed());
                         stats.record_layout_cache(self.tree.layout_cache_stats());
                     } else {
@@ -525,8 +613,10 @@ impl TreeUpdateEngine {
                     }
                 }
 
+                let mut output = update.output;
+                self.force_cached_registry_publish_if_requested(registry_requested, &mut output);
                 self.layout_effect(
-                    update.output,
+                    output,
                     pipeline_submitted_at,
                     tree_batch_started_at,
                     animation_trace,
@@ -556,6 +646,21 @@ impl TreeUpdateEngine {
             pipeline_submitted_at,
             tree_batch_started_at,
             animation_trace,
+        }
+    }
+
+    fn force_cached_registry_publish_if_requested(
+        &self,
+        registry_requested: bool,
+        output: &mut LayoutOutput,
+    ) {
+        if !registry_requested || output.event_rebuild_changed {
+            return;
+        }
+
+        if let Some(rebuild) = self.cached_rebuild.as_ref() {
+            output.event_rebuild = rebuild.clone();
+            output.event_rebuild_changed = true;
         }
     }
 
@@ -598,6 +703,36 @@ fn tree_has_root_frame(tree: &ElementTree) -> bool {
     tree.root_id()
         .and_then(|root_id| tree.get(&root_id).and_then(|element| element.layout.frame))
         .is_some()
+}
+
+fn patch_set_attrs_ids(patches: &[Patch]) -> Option<Vec<NodeId>> {
+    patches
+        .iter()
+        .map(|patch| match patch {
+            Patch::SetAttrs { id, .. } => Some(*id),
+            Patch::SetChildren { .. }
+            | Patch::SetNearbyMounts { .. }
+            | Patch::InsertSubtree { .. }
+            | Patch::InsertNearbySubtree { .. }
+            | Patch::Remove { .. } => None,
+        })
+        .collect()
+}
+
+fn record_frame_attr_dirty_id(
+    frame_attr_dirty_ids: &mut Vec<NodeId>,
+    id: NodeId,
+    invalidation: TreeInvalidation,
+) {
+    if invalidation.can_refresh_only() && !frame_attr_dirty_ids.contains(&id) {
+        frame_attr_dirty_ids.push(id);
+    }
+}
+
+fn extend_frame_attr_dirty_ids(frame_attr_dirty_ids: &mut Vec<NodeId>, ids: Vec<NodeId>) {
+    ids.into_iter().for_each(|id| {
+        record_frame_attr_dirty_id(frame_attr_dirty_ids, id, TreeInvalidation::Paint)
+    });
 }
 
 fn handle_message_error(policy: TreeUpdateDecodePolicy, message: String) -> Result<(), String> {
@@ -678,4 +813,66 @@ fn trace_element_snapshots(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree::{
+        attrs::{Attrs, Length},
+        element::{Element, ElementKind, Frame},
+    };
+
+    fn scrollable_tree_at_start() -> ElementTree {
+        let id = NodeId::from_term_bytes(vec![1]);
+        let attrs = Attrs {
+            width: Some(Length::Px(100.0)),
+            height: Some(Length::Px(100.0)),
+            scrollbar_y: Some(true),
+            scroll_y: Some(0.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
+        let mut element = Element::with_attrs(id, ElementKind::El, Vec::new(), attrs);
+        element.layout.frame = Some(Frame {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+            content_width: 100.0,
+            content_height: 200.0,
+        });
+
+        let mut tree = ElementTree::new();
+        tree.insert(element);
+        tree.set_root_id(id);
+        tree
+    }
+
+    #[test]
+    fn blocked_scroll_request_publishes_cached_registry_response() {
+        let id = NodeId::from_term_bytes(vec![1]);
+        let mut engine = TreeUpdateEngine::new(scrollable_tree_at_start(), 100, 100, 1.0);
+        let options = TreeUpdateOptions::new(None, TreeUpdateDecodePolicy::ReturnErr);
+
+        assert!(matches!(
+            engine.process_messages(vec![TreeMsg::RebuildRegistry], options),
+            Ok(TreeUpdateEffect::Layout { .. })
+        ));
+
+        let options = TreeUpdateOptions::new(None, TreeUpdateDecodePolicy::ReturnErr);
+        let effect = engine.process_messages(
+            vec![TreeMsg::ScrollRequest {
+                element_id: id,
+                dx: 0.0,
+                dy: 10.0,
+            }],
+            options,
+        );
+
+        assert!(matches!(
+            effect,
+            Ok(TreeUpdateEffect::RegistryUpdate { .. })
+        ));
+    }
 }

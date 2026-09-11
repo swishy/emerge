@@ -1,0 +1,226 @@
+name: Emerge
+options:
+  bundleIdPrefix: com.Emerge
+  deploymentTarget:
+    iOS: "15.0"
+  xcodeVersion: "16.0"
+
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: 1
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: 
+    CODE_SIGN_STYLE: Automatic
+    OTHER_LDFLAGS:
+      - "-lz"
+      - "-lm"
+      - "-ldl"
+      - "-lc++"
+      - "-Wl,-U,_dispatch_main_q"
+      - "-force_load"
+      - "$(SRCROOT)/Frameworks/liberlang_combined.a"
+    FRAMEWORK_SEARCH_PATHS:
+      - "$(SRCROOT)/Frameworks"
+    HEADER_SEARCH_PATHS:
+      - "$(SRCROOT)/Emerge"
+
+targets:
+  Emerge:
+    type: application
+    platform: iOS
+    sources:
+      - path: Emerge
+        excludes:
+          - "erlang"
+    settings:
+      base:
+        INFOPLIST_FILE: Emerge/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.Emerge.ios
+        SWIFT_OBJC_BRIDGING_HEADER: Emerge/Emerge-Bridging-Header.h
+    dependencies:
+      - sdk: UIKit.framework
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: CoreGraphics.framework
+      - sdk: CoreText.framework
+      - sdk: Foundation.framework
+      - sdk: IOSurface.framework
+      - sdk: ImageIO.framework
+    preBuildScripts:
+      - name: Prepare Frameworks (combined ERTS + emerge_skia)
+        outputFiles:
+          - "$(SRCROOT)/Frameworks/liberlang_combined.a"
+        script: |
+          set -e
+          EMERGE_DIR=".."
+          CACHE_DIR="$HOME/.cache/emerge/ios"
+          mkdir -p "$SRCROOT/Frameworks"
+
+          # Resolve EMERGE_DIR relative to SRCROOT
+          if [ "${EMERGE_DIR:0:1}" != "/" ] && [ "${EMERGE_DIR:0:1}" != "~" ]; then
+            EMERGE_DIR="$SRCROOT/$EMERGE_DIR"
+          fi
+
+          # --- liberlang_combined.a ---
+          APP_ROOT="$SRCROOT/../.."
+          APP_BUILD_OUTPUT="$APP_ROOT/_build/ios_otp_output"
+          EMERGE_BUILD_OUTPUT="$EMERGE_DIR/_build/ios_otp_output"
+          OTP_SRC="$APP_ROOT/_build/ios_otp/otp_src"
+          TARGET="aarch64-apple-darwin"
+          VARIANT="opt"
+
+          # Prefer app's build output, fall back to emerge repo
+          if [ -d "$APP_BUILD_OUTPUT" ]; then
+            BUILD_OUTPUT="$APP_BUILD_OUTPUT"
+          else
+            BUILD_OUTPUT="$EMERGE_BUILD_OUTPUT"
+          fi
+
+          if [ -f "$CACHE_DIR/liberlang_combined.a" ]; then
+            echo "Using cached liberlang_combined.a"
+            cp "$CACHE_DIR/liberlang_combined.a" "$SRCROOT/Frameworks/liberlang_combined.a"
+          elif [ -f "$CACHE_DIR/liberlang.a" ]; then
+            echo "Using cached liberlang.a (renamed to liberlang_combined.a)"
+            cp "$CACHE_DIR/liberlang.a" "$SRCROOT/Frameworks/liberlang_combined.a"
+          elif [ -d "$OTP_SRC" ]; then
+            # Merge ERTS-dependent static libs into one archive
+            LIBS=()
+            for lib in \
+              "$BUILD_OUTPUT/liberlang.xcframework/ios-arm64/libbeam.a" \
+              "$OTP_SRC/erts/lib/internal/$TARGET/liberts_internal_r.a" \
+              "$OTP_SRC/erts/lib/internal/$TARGET/libethread.a" \
+              "$OTP_SRC/erts/emulator/pcre/obj/$TARGET/$VARIANT/libepcre.a" \
+              "$OTP_SRC/erts/emulator/zstd/obj/$TARGET/$VARIANT/libzstd.a" \
+              "$OTP_SRC/erts/emulator/openssl/obj/$TARGET/$VARIANT/micro-openssl.a" \
+              "$OTP_SRC/erts/emulator/ryu/obj/$TARGET/$VARIANT/libryu.a" \
+               "$OTP_SRC/lib/asn1/priv/lib/aarch64-apple-ios/asn1rt_nif.a" \
+               "$BUILD_OUTPUT"/otp_release/erts-*/lib/libemerge_skia.a; do
+              if [ -f "$lib" ]; then
+                LIBS+=("$lib")
+              fi
+            done
+            if [ ${#LIBS[@]} -gt 0 ]; then
+              echo "Merging ${#LIBS[@]} ERTS archives into liberlang_combined.a"
+              libtool -static -o "$SRCROOT/Frameworks/liberlang_combined.a" "${LIBS[@]}"
+            else
+              echo "error: no ERTS library files found to merge"
+              exit 1
+            fi
+          else
+            echo "error: no OTP build artifacts or cache found — run 'mix ios.setup' first"
+            exit 1
+          fi
+
+          # --- OTP release (erlang/) ---
+          OTP_DST="$SRCROOT/Emerge/erlang"
+          # Check for flat release layout (otp_release/ with erts at top level)
+          # as well as nested layout (otp_release/usr/local/lib/erlang/)
+          if [ -d "$CACHE_DIR/otp_release/erts-"* ]; then
+            echo "Using cached OTP release (flat layout)"
+            OTP_SRC="$CACHE_DIR/otp_release"
+          elif [ -d "$CACHE_DIR/otp_release/usr/local/lib/erlang" ]; then
+            echo "Using cached OTP release (nested layout)"
+            OTP_SRC="$CACHE_DIR/otp_release/usr/local/lib/erlang"
+          elif [ -d "$APP_BUILD_OUTPUT/otp_release/erts-"* ]; then
+            echo "Using app OTP release (flat layout)"
+            OTP_SRC="$APP_BUILD_OUTPUT/otp_release"
+          elif [ -d "$APP_BUILD_OUTPUT/otp_release/usr/local/lib/erlang" ]; then
+            echo "Using app OTP release (nested layout)"
+            OTP_SRC="$APP_BUILD_OUTPUT/otp_release/usr/local/lib/erlang"
+          elif [ -d "$EMERGE_BUILD_OUTPUT/otp_release/erts-"* ]; then
+            echo "Using emerge OTP release (flat layout)"
+            OTP_SRC="$EMERGE_BUILD_OUTPUT/otp_release"
+          elif [ -d "$EMERGE_BUILD_OUTPUT/otp_release/usr/local/lib/erlang" ]; then
+            echo "Using emerge OTP release (nested layout)"
+            OTP_SRC="$EMERGE_BUILD_OUTPUT/otp_release/usr/local/lib/erlang"
+          else
+            echo "warning: OTP release not found — app may not boot without erlang/ directory"
+            OTP_SRC=""
+          fi
+          if [ -n "$OTP_SRC" ]; then
+            mkdir -p "$OTP_DST"
+            # Copy OTP release files without deleting existing app beams
+            for d in releases bin erts-*; do
+              if [ -d "$OTP_SRC/$d" ]; then
+                cp -r "$OTP_SRC/$d" "$OTP_DST/"
+              fi
+            done
+            # Copy OTP lib apps (skip ebin if already present to preserve app beams)
+            if [ -d "$OTP_SRC/lib" ]; then
+              mkdir -p "$OTP_DST/lib"
+              for appdir in "$OTP_SRC/lib/"*/; do
+                appname=$(basename "$appdir")
+                if [ ! -d "$OTP_DST/lib/$appname" ]; then
+                  cp -r "$appdir" "$OTP_DST/lib/"
+                else
+                  # App exists - copy priv/ and other non-ebin dirs
+                  for subdir in "$appdir"*/; do
+                    subname=$(basename "$subdir")
+                    if [ "$subname" != "ebin" ] && [ ! -d "$OTP_DST/lib/$appname/$subname" ]; then
+                      cp -r "$subdir" "$OTP_DST/lib/$appname/"
+                    fi
+                  done
+                fi
+              done
+              # Remove any .so/.dylib files — iOS uses static linking for NIFs.
+              # Host-platform shared libraries will crash on iOS.
+              find "$OTP_DST/lib" -type f \( -name "*.so" -o -name "*.dylib" \) -delete 2>/dev/null || true
+            fi
+          fi
+        basedOnDependencyAnalysis: false
+      - name: Bundle app beams
+        script: |
+          APP_ROOT="$SRCROOT/../.."
+          ERLANG_DIR="$SRCROOT/Emerge/erlang"
+          EMERGE_DIR="$SRCROOT/.."
+          if [ -d "$APP_ROOT/_build/dev/lib" ]; then
+            for libdir in "$APP_ROOT/_build/dev/lib/"*/; do
+              appname=$(basename "$libdir")
+              ebin_src="$libdir/ebin"
+              if [ -d "$ebin_src" ]; then
+                mkdir -p "$ERLANG_DIR/lib/$appname/ebin"
+                cp "$ebin_src"/*.beam "$ERLANG_DIR/lib/$appname/ebin/" 2>/dev/null || true
+                cp "$ebin_src"/*.app "$ERLANG_DIR/lib/$appname/ebin/" 2>/dev/null || true
+              fi
+            done
+          fi
+          # Copy emerge dependency beams
+          EMERGE_EBIN="$EMERGE_DIR/_build/dev/lib/emerge/ebin"
+          if [ -d "$EMERGE_EBIN" ]; then
+            mkdir -p "$ERLANG_DIR/lib/emerge/ebin"
+            cp "$EMERGE_EBIN"/*.beam "$ERLANG_DIR/lib/emerge/ebin/" 2>/dev/null || true
+            cp "$EMERGE_EBIN"/*.app "$ERLANG_DIR/lib/emerge/ebin/" 2>/dev/null || true
+          fi
+        basedOnDependencyAnalysis: false
+    postBuildScripts:
+      - name: Copy OTP release into app bundle
+        script: |
+          ERLANG_SRC="$SRCROOT/Emerge/erlang"
+          ERLANG_DST="$BUILT_PRODUCTS_DIR/$CONTENTS_FOLDER_PATH/erlang"
+          if [ -d "$ERLANG_SRC" ]; then
+            rm -rf "$ERLANG_DST"
+            mkdir -p "$ERLANG_DST"
+            cp -r "$ERLANG_SRC/releases" "$ERLANG_DST/"
+            cp -r "$ERLANG_SRC/bin" "$ERLANG_DST/"
+            for d in "$ERLANG_SRC"/erts-*; do
+              cp -r "$d" "$ERLANG_DST/"
+            done
+            mkdir -p "$ERLANG_DST/lib"
+            for appdir in "$ERLANG_SRC/lib/"*/; do
+              if [ -d "$appdir/ebin" ]; then
+                mkdir -p "$ERLANG_DST/lib/$(basename "$appdir")/ebin"
+                cp "$appdir"/ebin/*.{beam,app} "$ERLANG_DST/lib/$(basename "$appdir")/ebin/" 2>/dev/null || true
+              fi
+              # Copy priv/ directory for NIF libraries, but exclude .so/.dylib files.
+              # iOS uses static linking — host shared libraries will crash.
+              if [ -d "$appdir/priv" ]; then
+                mkdir -p "$ERLANG_DST/lib/$(basename "$appdir")/priv"
+                # Copy priv/ contents but exclude native shared libraries
+                (cd "$appdir/priv" && find . -type f ! -name "*.so" ! -name "*.dylib" -exec cp --parents {} "$ERLANG_DST/lib/$(basename "$appdir")/priv/" \;) 2>/dev/null || true
+                # Also copy any subdirectories (like priv/ssl/certs/)
+                (cd "$appdir/priv" && find . -type d ! -name "." -exec mkdir -p "$ERLANG_DST/lib/$(basename "$appdir")/priv/{}" \;) 2>/dev/null || true
+              fi
+            done
+          fi
+        basedOnDependencyAnalysis: false

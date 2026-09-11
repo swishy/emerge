@@ -1,0 +1,468 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0C455885DBDF7CCBB2AE03A2 /* CoreText.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = ABD9B8F1233D1875B62B66D8 /* CoreText.framework */; };
+		0F4C4D5853B2844802973466 /* IOSurface.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 281D3FB246FD73D83920E169 /* IOSurface.framework */; };
+		37F51D53AD944EED21F4D428 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 2CAFEF73D6F413AC4011B593 /* Foundation.framework */; };
+		407E55BF4950642F91A46BCF /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 65D8600AD43D4C07A448DD93 /* MetalKit.framework */; };
+		40C8BB41A427D0714CB8AE53 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = EB46D721124677E430892F90 /* LaunchScreen.storyboard */; };
+		72E444A205C179836DD89FE2 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71248D0D48B4E3CA5795FB23 /* AppDelegate.swift */; };
+		948B1D41F10534529DC01816 /* BeamBridge.c in Sources */ = {isa = PBXBuildFile; fileRef = 7A57BA8928627514F08BAD3B /* BeamBridge.c */; };
+		9ACE57B8B4EF33A8BDB0DB00 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 025C082AC04F37A72F119DCD /* CoreGraphics.framework */; };
+		A344B97505C450E0769317C1 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 96FE9404E4E269609AF23BE9 /* UIKit.framework */; };
+		D577A38E9F8B2AFB44BA9B6B /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C3FBE8F665658386C28EBB93 /* Metal.framework */; };
+		EDFF4EC22BD521F2F49DD525 /* ImageIO.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3E5ACA494D95CA3432ECE47B /* ImageIO.framework */; };
+		F85856AB11A1B438319E9B6F /* EmergeNifInit.c in Sources */ = {isa = PBXBuildFile; fileRef = 622AED1A9A2853D1B0BAFAB5 /* EmergeNifInit.c */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		025C082AC04F37A72F119DCD /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+		281D3FB246FD73D83920E169 /* IOSurface.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOSurface.framework; path = System/Library/Frameworks/IOSurface.framework; sourceTree = SDKROOT; };
+		2CAFEF73D6F413AC4011B593 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
+		3E5ACA494D95CA3432ECE47B /* ImageIO.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ImageIO.framework; path = System/Library/Frameworks/ImageIO.framework; sourceTree = SDKROOT; };
+		411A1E55756F80765A36233D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		42F491D204C558DDE243D343 /* BeamBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = BeamBridge.h; sourceTree = "<group>"; };
+		472B0844A48219E7F0C09487 /* Emerge-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Emerge-Bridging-Header.h"; sourceTree = "<group>"; };
+		622AED1A9A2853D1B0BAFAB5 /* EmergeNifInit.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = EmergeNifInit.c; sourceTree = "<group>"; };
+		65D8600AD43D4C07A448DD93 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
+		71248D0D48B4E3CA5795FB23 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		7A57BA8928627514F08BAD3B /* BeamBridge.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = BeamBridge.c; sourceTree = "<group>"; };
+		96FE9404E4E269609AF23BE9 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		AA961E94B757F30090BDE0C5 /* Emerge.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = Emerge.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		ABD9B8F1233D1875B62B66D8 /* CoreText.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreText.framework; path = System/Library/Frameworks/CoreText.framework; sourceTree = SDKROOT; };
+		C3FBE8F665658386C28EBB93 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		EB46D721124677E430892F90 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		2C00D4CB9F2F4001DB0330E6 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A344B97505C450E0769317C1 /* UIKit.framework in Frameworks */,
+				D577A38E9F8B2AFB44BA9B6B /* Metal.framework in Frameworks */,
+				407E55BF4950642F91A46BCF /* MetalKit.framework in Frameworks */,
+				9ACE57B8B4EF33A8BDB0DB00 /* CoreGraphics.framework in Frameworks */,
+				0C455885DBDF7CCBB2AE03A2 /* CoreText.framework in Frameworks */,
+				37F51D53AD944EED21F4D428 /* Foundation.framework in Frameworks */,
+				0F4C4D5853B2844802973466 /* IOSurface.framework in Frameworks */,
+				EDFF4EC22BD521F2F49DD525 /* ImageIO.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		62731E424F3BD23EE52F41C6 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				025C082AC04F37A72F119DCD /* CoreGraphics.framework */,
+				ABD9B8F1233D1875B62B66D8 /* CoreText.framework */,
+				2CAFEF73D6F413AC4011B593 /* Foundation.framework */,
+				3E5ACA494D95CA3432ECE47B /* ImageIO.framework */,
+				281D3FB246FD73D83920E169 /* IOSurface.framework */,
+				C3FBE8F665658386C28EBB93 /* Metal.framework */,
+				65D8600AD43D4C07A448DD93 /* MetalKit.framework */,
+				96FE9404E4E269609AF23BE9 /* UIKit.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		82F7A01DB5C38A239E69A0C9 /* Emerge */ = {
+			isa = PBXGroup;
+			children = (
+				71248D0D48B4E3CA5795FB23 /* AppDelegate.swift */,
+				7A57BA8928627514F08BAD3B /* BeamBridge.c */,
+				42F491D204C558DDE243D343 /* BeamBridge.h */,
+				472B0844A48219E7F0C09487 /* Emerge-Bridging-Header.h */,
+				622AED1A9A2853D1B0BAFAB5 /* EmergeNifInit.c */,
+				411A1E55756F80765A36233D /* Info.plist */,
+				EB46D721124677E430892F90 /* LaunchScreen.storyboard */,
+			);
+			path = Emerge;
+			sourceTree = "<group>";
+		};
+		880A315CB029A05A50C92E3F /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				AA961E94B757F30090BDE0C5 /* Emerge.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		D999955713AED23B4838567E = {
+			isa = PBXGroup;
+			children = (
+				82F7A01DB5C38A239E69A0C9 /* Emerge */,
+				62731E424F3BD23EE52F41C6 /* Frameworks */,
+				880A315CB029A05A50C92E3F /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		EB974A3A9701B674B636819C /* Emerge */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 4C077A9100F7A04AE609FAFF /* Build configuration list for PBXNativeTarget "Emerge" */;
+			buildPhases = (
+				D69AB997D287ACF490089CCC /* Prepare Frameworks (combined ERTS + emerge_skia) */,
+				2CFAB07DF27D961473767C4A /* Bundle app beams */,
+				5F1408A4B20A4034D9C3C2E8 /* Sources */,
+				3A69FE24D1CDBFA9B86DE2AD /* Resources */,
+				2C00D4CB9F2F4001DB0330E6 /* Frameworks */,
+				47088504473A87B70696920B /* Copy OTP release into app bundle */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Emerge;
+			packageProductDependencies = (
+			);
+			productName = Emerge;
+			productReference = AA961E94B757F30090BDE0C5 /* Emerge.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		E2DE16B1BC9B792AF9A89795 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					EB974A3A9701B674B636819C = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 2E01AC13510A9F039422D095 /* Build configuration list for PBXProject "Emerge" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = D999955713AED23B4838567E;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 880A315CB029A05A50C92E3F /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				EB974A3A9701B674B636819C /* Emerge */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		3A69FE24D1CDBFA9B86DE2AD /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				40C8BB41A427D0714CB8AE53 /* LaunchScreen.storyboard in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		2CFAB07DF27D961473767C4A /* Bundle app beams */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Bundle app beams";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "APP_ROOT=\"$SRCROOT/../..\"\nERLANG_DIR=\"$SRCROOT/Emerge/erlang\"\nEMERGE_DIR=\"$SRCROOT/..\"\nif [ -d \"$APP_ROOT/_build/dev/lib\" ]; then\n  for libdir in \"$APP_ROOT/_build/dev/lib/\"*/; do\n    appname=$(basename \"$libdir\")\n    ebin_src=\"$libdir/ebin\"\n    if [ -d \"$ebin_src\" ]; then\n      mkdir -p \"$ERLANG_DIR/lib/$appname/ebin\"\n      cp \"$ebin_src\"/*.beam \"$ERLANG_DIR/lib/$appname/ebin/\" 2>/dev/null || true\n      cp \"$ebin_src\"/*.app \"$ERLANG_DIR/lib/$appname/ebin/\" 2>/dev/null || true\n    fi\n  done\nfi\n# Copy emerge dependency beams\nEMERGE_EBIN=\"$EMERGE_DIR/_build/dev/lib/emerge/ebin\"\nif [ -d \"$EMERGE_EBIN\" ]; then\n  mkdir -p \"$ERLANG_DIR/lib/emerge/ebin\"\n  cp \"$EMERGE_EBIN\"/*.beam \"$ERLANG_DIR/lib/emerge/ebin/\" 2>/dev/null || true\n  cp \"$EMERGE_EBIN\"/*.app \"$ERLANG_DIR/lib/emerge/ebin/\" 2>/dev/null || true\nfi\n";
+		};
+		47088504473A87B70696920B /* Copy OTP release into app bundle */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Copy OTP release into app bundle";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "ERLANG_SRC=\"$SRCROOT/Emerge/erlang\"\nERLANG_DST=\"$BUILT_PRODUCTS_DIR/$CONTENTS_FOLDER_PATH/erlang\"\nif [ -d \"$ERLANG_SRC\" ]; then\n  rm -rf \"$ERLANG_DST\"\n  mkdir -p \"$ERLANG_DST\"\n  cp -r \"$ERLANG_SRC/releases\" \"$ERLANG_DST/\"\n  cp -r \"$ERLANG_SRC/bin\" \"$ERLANG_DST/\"\n  for d in \"$ERLANG_SRC\"/erts-*; do\n    cp -r \"$d\" \"$ERLANG_DST/\"\n  done\n  mkdir -p \"$ERLANG_DST/lib\"\n  for appdir in \"$ERLANG_SRC/lib/\"*/; do\n    if [ -d \"$appdir/ebin\" ]; then\n      mkdir -p \"$ERLANG_DST/lib/$(basename \"$appdir\")/ebin\"\n      cp \"$appdir\"/ebin/*.{beam,app} \"$ERLANG_DST/lib/$(basename \"$appdir\")/ebin/\" 2>/dev/null || true\n    fi\n    # Copy priv/ directory for NIF libraries, but exclude .so/.dylib files.\n    # iOS uses static linking — host shared libraries will crash.\n    if [ -d \"$appdir/priv\" ]; then\n      mkdir -p \"$ERLANG_DST/lib/$(basename \"$appdir\")/priv\"\n      # Copy priv/ contents but exclude native shared libraries\n      (cd \"$appdir/priv\" && find . -type f ! -name \"*.so\" ! -name \"*.dylib\" -exec cp --parents {} \"$ERLANG_DST/lib/$(basename \"$appdir\")/priv/\" \\;) 2>/dev/null || true\n      # Also copy any subdirectories (like priv/ssl/certs/)\n      (cd \"$appdir/priv\" && find . -type d ! -name \".\" -exec mkdir -p \"$ERLANG_DST/lib/$(basename \"$appdir\")/priv/{}\" \\;) 2>/dev/null || true\n    fi\n  done\nfi\n";
+		};
+		D69AB997D287ACF490089CCC /* Prepare Frameworks (combined ERTS + emerge_skia) */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Prepare Frameworks (combined ERTS + emerge_skia)";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(SRCROOT)/Frameworks/liberlang_combined.a",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\nEMERGE_DIR=\"..\"\nCACHE_DIR=\"$HOME/.cache/emerge/ios\"\nmkdir -p \"$SRCROOT/Frameworks\"\n\n# Resolve EMERGE_DIR relative to SRCROOT\nif [ \"${EMERGE_DIR:0:1}\" != \"/\" ] && [ \"${EMERGE_DIR:0:1}\" != \"~\" ]; then\n  EMERGE_DIR=\"$SRCROOT/$EMERGE_DIR\"\nfi\n\n# --- liberlang_combined.a ---\nAPP_ROOT=\"$SRCROOT/../..\"\nAPP_BUILD_OUTPUT=\"$APP_ROOT/_build/ios_otp_output\"\nEMERGE_BUILD_OUTPUT=\"$EMERGE_DIR/_build/ios_otp_output\"\nOTP_SRC=\"$APP_ROOT/_build/ios_otp/otp_src\"\nTARGET=\"aarch64-apple-darwin\"\nVARIANT=\"opt\"\n\n# Prefer app's build output, fall back to emerge repo\nif [ -d \"$APP_BUILD_OUTPUT\" ]; then\n  BUILD_OUTPUT=\"$APP_BUILD_OUTPUT\"\nelse\n  BUILD_OUTPUT=\"$EMERGE_BUILD_OUTPUT\"\nfi\n\nif [ -f \"$CACHE_DIR/liberlang_combined.a\" ]; then\n  echo \"Using cached liberlang_combined.a\"\n  cp \"$CACHE_DIR/liberlang_combined.a\" \"$SRCROOT/Frameworks/liberlang_combined.a\"\nelif [ -f \"$CACHE_DIR/liberlang.a\" ]; then\n  echo \"Using cached liberlang.a (renamed to liberlang_combined.a)\"\n  cp \"$CACHE_DIR/liberlang.a\" \"$SRCROOT/Frameworks/liberlang_combined.a\"\nelif [ -d \"$OTP_SRC\" ]; then\n  # Merge ERTS-dependent static libs into one archive\n  LIBS=()\n  for lib in \\\n    \"$BUILD_OUTPUT/liberlang.xcframework/ios-arm64/libbeam.a\" \\\n    \"$OTP_SRC/erts/lib/internal/$TARGET/liberts_internal_r.a\" \\\n    \"$OTP_SRC/erts/lib/internal/$TARGET/libethread.a\" \\\n    \"$OTP_SRC/erts/emulator/pcre/obj/$TARGET/$VARIANT/libepcre.a\" \\\n    \"$OTP_SRC/erts/emulator/zstd/obj/$TARGET/$VARIANT/libzstd.a\" \\\n    \"$OTP_SRC/erts/emulator/openssl/obj/$TARGET/$VARIANT/micro-openssl.a\" \\\n    \"$OTP_SRC/erts/emulator/ryu/obj/$TARGET/$VARIANT/libryu.a\" \\\n     \"$OTP_SRC/lib/asn1/priv/lib/aarch64-apple-ios/asn1rt_nif.a\" \\\n     \"$BUILD_OUTPUT\"/otp_release/erts-*/lib/libemerge_skia.a; do\n    if [ -f \"$lib\" ]; then\n      LIBS+=(\"$lib\")\n    fi\n  done\n  if [ ${#LIBS[@]} -gt 0 ]; then\n    echo \"Merging ${#LIBS[@]} ERTS archives into liberlang_combined.a\"\n    libtool -static -o \"$SRCROOT/Frameworks/liberlang_combined.a\" \"${LIBS[@]}\"\n  else\n    echo \"error: no ERTS library files found to merge\"\n    exit 1\n  fi\nelse\n  echo \"error: no OTP build artifacts or cache found — run 'mix ios.setup' first\"\n  exit 1\nfi\n\n# --- OTP release (erlang/) ---\nOTP_DST=\"$SRCROOT/Emerge/erlang\"\n# Check for flat release layout (otp_release/ with erts at top level)\n# as well as nested layout (otp_release/usr/local/lib/erlang/)\nif [ -d \"$CACHE_DIR/otp_release/erts-\"* ]; then\n  echo \"Using cached OTP release (flat layout)\"\n  OTP_SRC=\"$CACHE_DIR/otp_release\"\nelif [ -d \"$CACHE_DIR/otp_release/usr/local/lib/erlang\" ]; then\n  echo \"Using cached OTP release (nested layout)\"\n  OTP_SRC=\"$CACHE_DIR/otp_release/usr/local/lib/erlang\"\nelif [ -d \"$APP_BUILD_OUTPUT/otp_release/erts-\"* ]; then\n  echo \"Using app OTP release (flat layout)\"\n  OTP_SRC=\"$APP_BUILD_OUTPUT/otp_release\"\nelif [ -d \"$APP_BUILD_OUTPUT/otp_release/usr/local/lib/erlang\" ]; then\n  echo \"Using app OTP release (nested layout)\"\n  OTP_SRC=\"$APP_BUILD_OUTPUT/otp_release/usr/local/lib/erlang\"\nelif [ -d \"$EMERGE_BUILD_OUTPUT/otp_release/erts-\"* ]; then\n  echo \"Using emerge OTP release (flat layout)\"\n  OTP_SRC=\"$EMERGE_BUILD_OUTPUT/otp_release\"\nelif [ -d \"$EMERGE_BUILD_OUTPUT/otp_release/usr/local/lib/erlang\" ]; then\n  echo \"Using emerge OTP release (nested layout)\"\n  OTP_SRC=\"$EMERGE_BUILD_OUTPUT/otp_release/usr/local/lib/erlang\"\nelse\n  echo \"warning: OTP release not found — app may not boot without erlang/ directory\"\n  OTP_SRC=\"\"\nfi\nif [ -n \"$OTP_SRC\" ]; then\n  mkdir -p \"$OTP_DST\"\n  # Copy OTP release files without deleting existing app beams\n  for d in releases bin erts-*; do\n    if [ -d \"$OTP_SRC/$d\" ]; then\n      cp -r \"$OTP_SRC/$d\" \"$OTP_DST/\"\n    fi\n  done\n  # Copy OTP lib apps (skip ebin if already present to preserve app beams)\n  if [ -d \"$OTP_SRC/lib\" ]; then\n    mkdir -p \"$OTP_DST/lib\"\n    for appdir in \"$OTP_SRC/lib/\"*/; do\n      appname=$(basename \"$appdir\")\n      if [ ! -d \"$OTP_DST/lib/$appname\" ]; then\n        cp -r \"$appdir\" \"$OTP_DST/lib/\"\n      else\n        # App exists - copy priv/ and other non-ebin dirs\n        for subdir in \"$appdir\"*/; do\n          subname=$(basename \"$subdir\")\n          if [ \"$subname\" != \"ebin\" ] && [ ! -d \"$OTP_DST/lib/$appname/$subname\" ]; then\n            cp -r \"$subdir\" \"$OTP_DST/lib/$appname/\"\n          fi\n        done\n      fi\n    done\n    # Remove any .so/.dylib files — iOS uses static linking for NIFs.\n    # Host-platform shared libraries will crash on iOS.\n    find \"$OTP_DST/lib\" -type f \\( -name \"*.so\" -o -name \"*.dylib\" \\) -delete 2>/dev/null || true\n  fi\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		5F1408A4B20A4034D9C3C2E8 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				72E444A205C179836DD89FE2 /* AppDelegate.swift in Sources */,
+				948B1D41F10534529DC01816 /* BeamBridge.c in Sources */,
+				F85856AB11A1B438319E9B6F /* EmergeNifInit.c in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		7BFA88CCD9C6B7BF9AE1718E /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				INFOPLIST_FILE = Emerge/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.Emerge.ios;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "Emerge/Emerge-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		7CFB6FC238BE849129511E57 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				INFOPLIST_FILE = Emerge/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.Emerge.ios;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "Emerge/Emerge-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		D28301052F6BAFA434D524DC /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = "";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(SRCROOT)/Frameworks",
+				);
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/Emerge",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 0.1.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				OTHER_LDFLAGS = (
+					"-lz",
+					"-lm",
+					"-ldl",
+					"-lc++",
+					"-Wl,-U,_dispatch_main_q",
+					"-force_load",
+					"$(SRCROOT)/Frameworks/liberlang_combined.a",
+				);
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.9;
+			};
+			name = Release;
+		};
+		F7E6181357CD414A7FF4CDDB /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(SRCROOT)/Frameworks",
+				);
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/Emerge",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 0.1.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				OTHER_LDFLAGS = (
+					"-lz",
+					"-lm",
+					"-ldl",
+					"-lc++",
+					"-Wl,-U,_dispatch_main_q",
+					"-force_load",
+					"$(SRCROOT)/Frameworks/liberlang_combined.a",
+				);
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.9;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		2E01AC13510A9F039422D095 /* Build configuration list for PBXProject "Emerge" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F7E6181357CD414A7FF4CDDB /* Debug */,
+				D28301052F6BAFA434D524DC /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		4C077A9100F7A04AE609FAFF /* Build configuration list for PBXNativeTarget "Emerge" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				7BFA88CCD9C6B7BF9AE1718E /* Debug */,
+				7CFB6FC238BE849129511E57 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = E2DE16B1BC9B792AF9A89795 /* Project object */;
+}
